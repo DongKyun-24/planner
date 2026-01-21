@@ -1,0 +1,17 @@
+html,
+body,
+#root {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden; /* 앱이 자체 스크롤 관리 */
+}
+
+/* Vite 기본 템플릿 등에 있을 수 있는 max-width/center 정렬 흔적 제거 */
+#root {
+  max-width: none;
+  padding: 0;
+}
