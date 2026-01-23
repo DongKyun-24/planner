@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
+﻿import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 
 // ===== 달력 보조 =====
 function daysInMonth(year, month) {
@@ -16,6 +16,104 @@ function keyToYMD(key) {
 }
 function keyToTime(key) {
   return new Date(key).getTime()
+}
+const groupLineRegex = /^\s*@([^(]+)\(([^)]*)\)\s*$/
+const groupLineStartRegex = /^\s*@([^(]+)\s*\(\s*$/
+const groupLineTitleOnlyRegex = /^\s*@([^()]+)\s*$/
+const groupLineCloseRegex = /^\s*\)\s*$/
+
+function normalizeGroupLineNewlines(text) {
+  const s = (text ?? "").replace(/\r\n/g, "\n")
+  const tightened = s.replace(/@([^(]+)\s*\(\s*/g, (full, title) => `@${String(title).trim()}(`)
+  return tightened.replace(/@([^(]+)\(([\s\S]*?)\)/g, (full, title, inner) => {
+    const normalizedInner = inner
+      .replace(/\r?\n+/g, ";")
+      .replace(/\s+/g, " ")
+      .trim()
+    return `@${String(title).trim()}(${normalizedInner})`
+  })
+}
+
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function findRawGroupLineText(body, title) {
+  if (!body || !title) return null
+  const pattern = new RegExp(`[ \\t]*@${escapeRegex(title)}\\s*\\(([\\s\\S]*?)\\)`, "g")
+  const match = pattern.exec(body)
+  if (!match) return null
+  return match[0]
+}
+function findRawGroupLineMatch(body, title) {
+  if (!body || !title) return null
+  const pattern = new RegExp(`[ \\t]*@${escapeRegex(title)}\\s*\\(([\\s\\S]*?)\\)`, "g")
+  const match = pattern.exec(body)
+  return match || null
+}
+function getGroupLineCaretOffset(groupLineText) {
+  const openIdx = groupLineText.indexOf("(")
+  if (openIdx === -1) return 0
+  let offset = openIdx + 1
+  if (groupLineText[offset] === "\n") offset += 1
+  return offset
+}
+function getGroupLineParts(line) {
+  const trimmed = (line ?? "").trim()
+  if (!trimmed) return null
+  const indent = (line ?? "").match(/^\s*/)?.[0] ?? ""
+  let m = trimmed.match(groupLineRegex)
+  if (m) {
+    const title = m[1].trim()
+    if (!title) return null
+    return { prefix: `${indent}@${title}`, suffix: `(${m[2]})` }
+  }
+  m = trimmed.match(groupLineStartRegex)
+  if (m) {
+    const title = m[1].trim()
+    if (!title) return null
+    return { prefix: `${indent}@${title}`, suffix: "(" }
+  }
+  m = trimmed.match(groupLineTitleOnlyRegex)
+  if (m) {
+    const title = m[1].trim()
+    if (!title) return null
+    return { prefix: `${indent}@${title}`, suffix: "" }
+  }
+  return null
+}
+
+function parseDashboardBlockContent(body) {
+  const general = []
+  const groups = []
+  const groupIndex = new Map()
+  const lines = normalizeGroupLineNewlines(body).split("\n")
+  for (const raw of lines) {
+    const trimmed = raw.trim()
+    if (!trimmed) continue
+    const match = trimmed.match(groupLineRegex)
+    if (match) {
+      const title = match[1].trim()
+      const inner = match[2]
+      if (!title) continue
+      const items = inner
+        .split(";")
+        .map((x) => x.trim())
+        .filter((x) => x !== "")
+      if (items.length > 0) {
+        const existing = groupIndex.get(title)
+        if (existing) existing.items.push(...items)
+        else {
+          const entry = { title, items: [...items] }
+          groupIndex.set(title, entry)
+          groups.push(entry)
+        }
+      }
+      continue
+    }
+    general.push(trimmed)
+  }
+  return { general, groups }
 }
 function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n))
@@ -156,10 +254,15 @@ function isMemoHeaderLine(line) {
 }
 
 function buildMemoOverlayLines(text) {
-  return (text ?? "").split("\n").map((line) => ({
-    text: line,
-    isHeader: isMemoHeaderLine(line)
-  }))
+  const lines = (text ?? "").split("\n")
+  const overlay = []
+
+  for (const line of lines) {
+    let isHeader = isMemoHeaderLine(line)
+    overlay.push({ text: line, isHeader, groupParts: getGroupLineParts(line) })
+  }
+
+  return overlay
 }
 
 function syncOverlayScroll(textarea, overlayInner) {
@@ -269,121 +372,6 @@ function getDateKeyFromLine(line, baseYear) {
   return null
 }
 
-function renderItemsToLines(items) {
-  if (!items || items.length === 0) return []
-  return items.map((it) => (it.time ? `${it.time} ${it.text}` : it.text))
-}
-
-function buildTextFromDateLines(dateLines, baseYear) {
-  if (!dateLines || dateLines.size === 0) return ""
-  const keys = Array.from(dateLines.keys()).sort((a, b) => keyToTime(a) - keyToTime(b))
-  const blocks = []
-  for (const key of keys) {
-    const lines = dateLines.get(key) || []
-    const { m, d } = keyToYMD(key)
-    const header = buildHeaderLine(baseYear, m, d)
-    if (lines.length === 0) {
-      blocks.push(header)
-    } else {
-      blocks.push(`${header}\n${lines.join("\n")}`.trimEnd())
-    }
-  }
-  return blocks.join("\n\n").trimEnd()
-}
-
-function buildCombinedText(baseYear, commonText, windows, filters, windowTexts) {
-  const commonParsed = parseBlocksAndItems(commonText, baseYear)
-  const commonItems = commonParsed.items
-
-  const dateKeys = new Set(Object.keys(commonItems))
-  const windowItemsById = new Map()
-
-  for (const w of windows) {
-    if (filters && filters[w.id] === false) continue
-    const raw = windowTexts[w.id] ?? ""
-    const parsed = parseBlocksAndItems(raw, baseYear)
-    windowItemsById.set(w.id, parsed.items)
-    Object.keys(parsed.items).forEach((k) => dateKeys.add(k))
-  }
-
-  const sortedKeys = Array.from(dateKeys).sort((a, b) => keyToTime(a) - keyToTime(b))
-  const blocks = []
-
-  for (const key of sortedKeys) {
-    const { m, d } = keyToYMD(key)
-    const header = buildHeaderLine(baseYear, m, d)
-    const lines = []
-
-    lines.push(...renderItemsToLines(commonItems[key]))
-
-    for (const w of windows) {
-      if (filters && filters[w.id] === false) continue
-      const items = windowItemsById.get(w.id)?.[key] || []
-      if (items.length === 0) continue
-      lines.push(`[${w.title}]`)
-      lines.push(...renderItemsToLines(items))
-    }
-
-    if (lines.length === 0) blocks.push(header)
-    else blocks.push(`${header}\n${lines.join("\n")}`.trimEnd())
-  }
-
-  return blocks.join("\n\n").trimEnd()
-}
-
-function splitCombinedTextByWindow(text, baseYear, windows) {
-  const titleToId = new Map(windows.map((w) => [w.title, w.id]))
-  const allLinesByDate = new Map()
-  const windowLinesById = new Map(windows.map((w) => [w.id, new Map()]))
-  const seenWindowIds = new Set()
-
-  let currentKey = null
-  let currentSection = "all"
-
-  const lines = (text ?? "").split("\n")
-  for (const rawLine of lines) {
-    const dateKey = getDateKeyFromLine(rawLine, baseYear)
-    if (dateKey) {
-      currentKey = dateKey
-      currentSection = "all"
-      continue
-    }
-
-    if (!currentKey) continue
-
-    const trimmed = rawLine.trim()
-    if (!trimmed) continue
-
-    const labelMatch = trimmed.match(/^\[(.+)\]$/)
-    if (labelMatch) {
-      const title = labelMatch[1]
-      const id = titleToId.get(title)
-      if (id) {
-        currentSection = id
-        seenWindowIds.add(id)
-        continue
-      }
-    }
-
-    if (currentSection === "all") {
-      const bucket = allLinesByDate.get(currentKey) ?? []
-      bucket.push(rawLine)
-      allLinesByDate.set(currentKey, bucket)
-      continue
-    }
-
-    if (!windowLinesById.has(currentSection)) {
-      windowLinesById.set(currentSection, new Map())
-    }
-    const byDate = windowLinesById.get(currentSection)
-    const bucket = byDate.get(currentKey) ?? []
-    bucket.push(rawLine)
-    byDate.set(currentKey, bucket)
-  }
-
-  return { allLinesByDate, windowLinesById, seenWindowIds }
-}
-
 function buildCombinedRightText(commonText, windows, filters, windowTexts) {
   const lines = []
   if ((commonText ?? "").trim()) lines.push(commonText.trimEnd())
@@ -439,51 +427,6 @@ function splitCombinedRightText(text, windows) {
   return { commonLines, windowLinesById, seenWindowIds }
 }
 
-function extractTabTitlesFromText(text) {
-  const titles = new Set()
-  const lines = (text ?? "").split("\n")
-  for (const raw of lines) {
-    const trimmed = raw.trim()
-    const match = trimmed.match(/^\[(.+)\]$/)
-    if (!match) continue
-    const title = match[1].trim()
-    if (title) titles.add(title)
-  }
-  return Array.from(titles)
-}
-
-function pruneEmptyLabelSections(bodyText) {
-  const lines = (bodyText ?? "").replace(/\r\n/g, "\n").split("\n")
-  const out = []
-  let currentLabel = null
-  let buffer = []
-
-  function flush() {
-    const hasContent = buffer.some((line) => line.trim() !== "")
-    if (currentLabel) {
-      if (hasContent) {
-        out.push(currentLabel)
-        out.push(...buffer)
-      }
-    } else if (hasContent) {
-      out.push(...buffer)
-    }
-    buffer = []
-  }
-
-  for (const line of lines) {
-    const trimmed = line.trim()
-    if (tabTitleRegex.test(trimmed)) {
-      flush()
-      currentLabel = trimmed
-      continue
-    }
-    buffer.push(line)
-  }
-  flush()
-  return out.join("\n").trimEnd()
-}
-
 function getDateBlockBodyText(text, baseYear, dateKey) {
   const parsed = parseBlocksAndItems(text, baseYear)
   const block = parsed.blocks.find((b) => b.dateKey === dateKey)
@@ -524,26 +467,6 @@ function updateDateBlockBody(text, baseYear, dateKey, bodyText) {
   return text.slice(0, block.bodyStartPos) + body + after
 }
 
-function getIntegratedLabels(windows, filters) {
-  return windows.filter((w) => !filters || filters[w.id] !== false).map((w) => `[${w.title}]`)
-}
-
-function injectIntegratedLabels(text, baseYear, windows, filters) {
-  return (text ?? "").trimEnd()
-}
-
-function isIntegratedBlockBodyEmpty(text, block, labels) {
-  const body = text.slice(block.bodyStartPos, block.blockEndPos)
-  const lines = body.split("\n")
-  for (const line of lines) {
-    const t = line.trim()
-    if (!t) continue
-    if (labels.includes(t)) continue
-    return false
-  }
-  return true
-}
-
 function syncMirrorStyleFromTextarea(ta, mirror) {
   const cs = window.getComputedStyle(ta)
   mirror.style.width = cs.width
@@ -560,6 +483,23 @@ function syncMirrorStyleFromTextarea(ta, mirror) {
   mirror.style.wordBreak = cs.wordBreak
   mirror.style.overflowWrap = cs.overflowWrap
   mirror.style.tabSize = cs.tabSize
+}
+function clampMemoCaretBelowHeader(text, caretPos) {
+  if (caretPos <= 0) return 0
+  const beforeLineBreak = text.lastIndexOf("\n", caretPos - 1)
+  const lineStart = beforeLineBreak === -1 ? 0 : beforeLineBreak + 1
+  const lineEnd = text.indexOf("\n", lineStart)
+  const line = text.slice(lineStart, lineEnd === -1 ? text.length : lineEnd)
+  if (isMemoHeaderLine(line)) {
+    return lineEnd === -1 ? text.length : lineEnd + 1
+  }
+  return caretPos
+}
+function normalizeCaretForTextarea(ta, caretPos) {
+  if (!ta) return caretPos ?? 0
+  const text = ta.value ?? ""
+  const safePos = Math.max(0, Math.min(text.length, caretPos ?? 0))
+  return clampMemoCaretBelowHeader(text, safePos)
 }
 function getLineHeightPx(ta) {
   const lh = window.getComputedStyle(ta).lineHeight
@@ -580,6 +520,21 @@ function measureCharTopPx(ta, mirror, marker, s, charPos) {
   mirror.appendChild(document.createTextNode(after))
 
   return marker.offsetTop
+}
+function measureCharPosPx(ta, mirror, marker, s, charPos) {
+  const pos = Math.max(0, Math.min(charPos ?? 0, s.length))
+  syncMirrorStyleFromTextarea(ta, mirror)
+
+  const before = s.slice(0, pos)
+  const after = s.slice(pos)
+
+  mirror.innerHTML = ""
+  mirror.appendChild(document.createTextNode(before))
+  marker.textContent = "\u200b"
+  mirror.appendChild(marker)
+  mirror.appendChild(document.createTextNode(after))
+
+  return { top: marker.offsetTop, left: marker.offsetLeft }
 }
 function scrollCharPosToTopOffset(ta, mirror, marker, s, charPos, topOffsetLines = 1) {
   const topPx = measureCharTopPx(ta, mirror, marker, s, charPos)
@@ -652,11 +607,75 @@ function ensureOneBlankLineAtBlockEnd(text, block) {
   const caretPos = Math.max(0, newEndPos - 1)
   return { newText, caretPos }
 }
+function ensureBodyLineForBlock(text, block) {
+  const body = text.slice(block.bodyStartPos, block.blockEndPos)
+  if (body.trim().length > 0) {
+    return ensureOneBlankLineAtBlockEnd(text, block)
+  }
+  const insertPos = block.bodyStartPos
+  if (text[insertPos] === "\n") {
+    return { newText: text, caretPos: insertPos }
+  }
+  const newText = text.slice(0, insertPos) + "\n" + text.slice(insertPos)
+  return { newText, caretPos: insertPos }
+}
+function ensureBodyLineForTab(text, block) {
+  return ensureBodyLineForBlock(text, block)
+}
+
+function ensureTabGroupLineAtDate(text, dateKey, title, year = baseYear) {
+  const source = text ?? ""
+  const parsed = parseBlocksAndItems(source, year)
+  const block = parsed.blocks.find((b) => b.dateKey === dateKey)
+  if (!block || !title) return { newText: source, caretPos: null, headerPos: null }
+
+  const body = source.slice(block.bodyStartPos, block.blockEndPos)
+  const match = findRawGroupLineMatch(body, title)
+  if (match) {
+    const inner = match[1] ?? ""
+    const innerHasText = inner.trim().length > 0
+    const caretPos = innerHasText
+      ? block.bodyStartPos + match.index + match[0].length
+      : block.bodyStartPos + match.index + getGroupLineCaretOffset(match[0])
+    return { newText: source, caretPos, headerPos: block.headerStartPos }
+  }
+
+  const trimmedBody = body.replace(/^\n+/, "").replace(/\n+$/, "")
+  const groupLine = `@${title}(\n\n)`
+  const nextBody = trimmedBody ? `${groupLine}\n${trimmedBody}` : groupLine
+  const newText = updateDateBlockBody(source, year, dateKey, nextBody)
+
+  const reparsed = parseBlocksAndItems(newText, year)
+  const nextBlock = reparsed.blocks.find((b) => b.dateKey === dateKey)
+  if (!nextBlock) return { newText, caretPos: null, headerPos: null }
+  const nextBodyText = newText.slice(nextBlock.bodyStartPos, nextBlock.blockEndPos)
+  const nextMatch = findRawGroupLineMatch(nextBodyText, title)
+  const caretPos = nextMatch
+    ? nextBlock.bodyStartPos + nextMatch.index + getGroupLineCaretOffset(nextMatch[0])
+    : nextBlock.bodyStartPos
+  return { newText, caretPos, headerPos: nextBlock.headerStartPos }
+}
 
 // ===== (추가) 빈 날짜 블록 삭제 유틸 =====
-function isBlockBodyEmpty(text, block) {
+function blockHasMeaningfulBody(text, block) {
   const body = text.slice(block.bodyStartPos, block.blockEndPos)
-  return body.trim().length === 0
+  const normalized = normalizeGroupLineNewlines(body)
+  const lines = normalized.split("\n")
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim()
+    if (!trimmed) continue
+    const match = trimmed.match(groupLineRegex)
+    if (match) {
+      if (match[2].trim().length > 0) return true
+      continue
+    }
+    return true
+  }
+  return false
+}
+
+function isBlockBodyEmpty(text, block) {
+  return !blockHasMeaningfulBody(text, block)
 }
 
 function removeBlockRange(text, block) {
@@ -683,18 +702,17 @@ function removeEmptyBlockByDateKey(text, baseYear, dateKey) {
   return { newText, changed: true, caretPos }
 }
 
-function removeIntegratedEmptyBlocks(text, baseYear, labels) {
-  const parsed = parseBlocksAndItems(text, baseYear)
-  let out = text
+function removeAllEmptyBlocks(text, baseYear) {
+  let current = text ?? ""
   let changed = false
-  for (let i = parsed.blocks.length - 1; i >= 0; i--) {
-    const b = parsed.blocks[i]
-    if (!isIntegratedBlockBodyEmpty(out, b, labels)) continue
-    const r = removeBlockRange(out, b)
-    out = r.newText
+  while (true) {
+    const parsed = parseBlocksAndItems(current, baseYear)
+    const emptyBlock = [...parsed.blocks].reverse().find((b) => isBlockBodyEmpty(current, b))
+    if (!emptyBlock) break
+    current = removeBlockRange(current, emptyBlock).newText
     changed = true
   }
-  return { newText: out, changed }
+  return { newText: current, changed }
 }
 
 function App() {
@@ -761,6 +779,7 @@ function App() {
   }
 
 
+
   const [text, setText] = useState("")
   const today = useMemo(() => new Date(), [])
   const todayKey = useMemo(() => {
@@ -782,7 +801,6 @@ function App() {
     textRef.current = text
   }, [text])
 
-  const overrideLoadRef = useRef(null) // { year:number, text:string } | null
 
   // ===== 달력 뷰 =====
   const [view, setView] = useState({ year: today.getFullYear(), month: today.getMonth() + 1 })
@@ -844,11 +862,21 @@ function App() {
 
   const [memoInnerSplit, setMemoInnerSplit] = useState(DEFAULT_MEMO_INNER_SPLIT)
   const [memoInnerCollapsed, setMemoInnerCollapsed] = useState("none") // "none" | "left" | "right"
+  const [memoCollapsedByWindow, setMemoCollapsedByWindow] = useState(() => ({}))
   const [rightMemoText, setRightMemoText] = useState("") // ✅ 오른쪽 메모(기능 없음)
+  const [tabEditText, setTabEditText] = useState("")
+  const [dashboardSourceTick, setDashboardSourceTick] = useState(0)
+  const [isEditingLeftMemo, setIsEditingLeftMemo] = useState(false)
+  const [dashboardCollapsedByWindow, setDashboardCollapsedByWindow] = useState({})
+  const [mentionGhostText, setMentionGhostText] = useState("")
+  const [mentionGhostPos, setMentionGhostPos] = useState({ top: 0, left: 0 })
+  const [tabMentionMenu, setTabMentionMenu] = useState({ visible: false, top: 0, left: 0 })
+  const tabMentionRef = useRef(null)
   // ✅ 창 목록/활성 탭
   const [windows, setWindows] = useState(() => loadWindows())
   const [activeWindowId, setActiveWindowId] = useState("all")
   const [editingWindowId, setEditingWindowId] = useState(null)
+  const [recentlyRemovedWindow, setRecentlyRemovedWindow] = useState(null)
   const titleInputRef = useRef(null)
   const [colorPickerId, setColorPickerId] = useState(null)
   const [colorPickerPos, setColorPickerPos] = useState(null) // 어떤 탭의 색상 팔레트를 열지
@@ -975,34 +1003,24 @@ function App() {
 
 
   useEffect(() => {
-  setSelectedDateKey(null)
-  lastActiveDateKeyRef.current = null
-  setFilterOpen(false)
+    setSelectedDateKey(null)
+    lastActiveDateKeyRef.current = null
+    setFilterOpen(false)
   }, [activeWindowId])
+
+  useEffect(() => {
+    setIsEditingLeftMemo(false)
+  }, [activeWindowId])
+
+  useEffect(() => {
+    const next = memoCollapsedByWindow[activeWindowId] ?? "none"
+    if (next !== memoInnerCollapsed) setMemoInnerCollapsed(next)
+  }, [activeWindowId, memoCollapsedByWindow, memoInnerCollapsed])
  
   
   useEffect(() => {
     saveWindows(windows)
   }, [windows])
-
-  useEffect(() => {
-    const titles = extractTabTitlesFromText(text)
-    if (titles.length === 0) return
-    setWindows((prev) => {
-      const existing = new Set(prev.map((w) => w.title))
-      const toAdd = titles.filter((t) => !existing.has(t))
-      if (toAdd.length === 0) return prev
-      const next = [...prev]
-      for (const title of toAdd) {
-        next.push({
-          id: genWindowId(),
-          title,
-          color: pickNextWindowColor(next)
-        })
-      }
-      return next
-    })
-  }, [text])
 
   function addWindow() {
     const id = genWindowId()
@@ -1020,15 +1038,30 @@ function App() {
   }
 
   function removeWindow(id) {
-  setWindows((prev) => prev.filter((w) => w.id !== id))
+    const idx = windows.findIndex((w) => w.id === id)
+    if (idx < 0) return
+    const removed = windows[idx]
+    const allowedTitles = new Set(windows.filter((w) => w.id !== "all" && w.id !== id).map((w) => w.title))
+    const years = collectStoredYears()
+    const storageSnapshot = {}
+    for (const year of years) {
+      storageSnapshot[year] = {
+        all: getWindowMemoTextSync(year, "all"),
+        tab: getWindowMemoTextSync(year, id),
+        right: getRightWindowTextSync(year, id)
+      }
+    }
 
-  // 현재 보고 있는 탭을 지웠다면 통합으로 이동
-  if (activeWindowId === id) {
-    setActiveWindowId("all")
-  }
+    setRecentlyRemovedWindow({ window: removed, index: idx, storage: storageSnapshot })
 
-  // (선택) 해당 창의 메모 데이터도 정리하고 싶으면 여기서 삭제
-  // localStorage.removeItem(`planner-text-${baseYear}-${id}`)
+    setWindows((prev) => prev.filter((w) => w.id !== id))
+
+    // 현재 보고 있는 탭을 지웠다면 통합으로 이동
+    if (activeWindowId === id) {
+      setActiveWindowId("all")
+    }
+
+    removeWindowDataFromAllYears(id, allowedTitles)
   }
 
   function reorderWindows(dragId, overId) {
@@ -1045,6 +1078,59 @@ function App() {
       return [...fixed, ...next]
     })
   }
+
+  const undoRemoveWindow = useCallback(() => {
+    if (!recentlyRemovedWindow) return
+    const { window: restoredWindow, index, storage } = recentlyRemovedWindow
+
+    setWindows((prev) => {
+      const next = [...prev]
+      const insertPos = Math.max(1, Math.min(index, next.length))
+      next.splice(insertPos, 0, restoredWindow)
+      return next
+    })
+
+    setActiveWindowId(restoredWindow.id)
+    requestAnimationFrame(() => {
+      const scroll = tabsScrollRef.current
+      if (!scroll) return
+      const target = scroll.querySelector(`[data-window-id="${restoredWindow.id}"]`)
+      if (target) {
+        target.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" })
+      }
+    })
+
+    const baseStorage = storage[baseYear] ?? {}
+    const allText = baseStorage.all ?? ""
+    const tabText = baseStorage.tab ?? ""
+    if (activeWindowId === "all") {
+      updateEditorText(allText)
+    }
+    setTabEditText(tabText)
+
+    for (const [yearKey, stored] of Object.entries(storage)) {
+      const year = Number(yearKey)
+      if (!Number.isFinite(year)) continue
+      setWindowMemoTextSync(year, "all", stored.all ?? "")
+      setWindowMemoTextSync(year, restoredWindow.id, stored.tab ?? "")
+      setRightWindowTextSync(year, restoredWindow.id, stored.right ?? "")
+    }
+
+    setDashboardSourceTick((x) => x + 1)
+    setRecentlyRemovedWindow(null)
+  }, [recentlyRemovedWindow, activeWindowId, baseYear, updateEditorText])
+
+  useEffect(() => {
+    function onDocKeyDown(e) {
+      if (!recentlyRemovedWindow) return
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
+        e.preventDefault()
+        undoRemoveWindow()
+      }
+    }
+    document.addEventListener("keydown", onDocKeyDown)
+    return () => document.removeEventListener("keydown", onDocKeyDown)
+  }, [recentlyRemovedWindow, undoRemoveWindow])
 
 
   const memoInnerWrapRef = useRef(null)
@@ -1195,7 +1281,7 @@ function App() {
 
   // ===== 저장(연도별) =====
   const memoKey = useMemo(() => `planner-text-${baseYear}-${activeWindowId}`, [baseYear, activeWindowId])
-  const MIGRATED_FLAG = "planner-text-migrated-v2"
+  const legacyLeftKey = useMemo(() => `planner-left-text-${baseYear}`, [baseYear])
   const LEGACY_KEY = "planner-text"
   const suppressSaveRef = useRef(false)
 
@@ -1206,8 +1292,28 @@ function App() {
   )
   const suppressRightSaveRef = useRef(false)
   const editableWindows = useMemo(() => windows.filter((w) => w.id !== "all"), [windows])
+  const windowTitlesOrder = useMemo(() => windows.filter((w) => w.id !== "all").map((w) => w.title), [windows])
+  const windowTitleRank = useMemo(() => {
+    return new Map(windowTitlesOrder.map((title, index) => [title, index]))
+  }, [windowTitlesOrder])
 
-  function getWindowTextSync(year, windowId) {
+  function getLeftMemoTextSync(year) {
+    try {
+      const key = `planner-left-text-${year}`
+      return localStorage.getItem(key) ?? ""
+    } catch {
+      return ""
+    }
+  }
+
+  function setLeftMemoTextSync(year, value) {
+    try {
+      const key = `planner-left-text-${year}`
+      localStorage.setItem(key, value)
+    } catch {}
+  }
+
+  function getWindowMemoTextSync(year, windowId) {
     try {
       const key = `planner-text-${year}-${windowId}`
       return localStorage.getItem(key) ?? ""
@@ -1216,20 +1322,11 @@ function App() {
     }
   }
 
-  function setWindowTextSync(year, windowId, value) {
+  function setWindowMemoTextSync(year, windowId, value) {
     try {
       const key = `planner-text-${year}-${windowId}`
-      localStorage.setItem(key, value)
+      localStorage.setItem(key, value ?? "")
     } catch {}
-  }
-
-  function buildCombinedTextForYear(year) {
-    const windowTexts = {}
-    for (const w of editableWindows) {
-      windowTexts[w.id] = getWindowTextSync(year, w.id)
-    }
-    const commonText = getWindowTextSync(year, "all")
-    return buildCombinedText(year, commonText, editableWindows, integratedFilters, windowTexts)
   }
 
   function getRightWindowTextSync(year, windowId) {
@@ -1257,26 +1354,6 @@ function App() {
     return buildCombinedRightText(commonText, editableWindows, integratedFilters, windowTexts)
   }
 
-  function syncCombinedText(nextText, year = baseYear) {
-    const { allLinesByDate, windowLinesById, seenWindowIds } = splitCombinedTextByWindow(
-      nextText,
-      year,
-      editableWindows
-    )
-
-    const nextCommon = buildTextFromDateLines(allLinesByDate, year)
-    const normalizedCommon = normalizePrettyAndMerge(nextCommon, year)
-    setWindowTextSync(year, "all", normalizedCommon)
-
-    for (const w of editableWindows) {
-      if (!seenWindowIds.has(w.id)) continue
-      const lines = windowLinesById.get(w.id) ?? new Map()
-      const nextTextForWindow = buildTextFromDateLines(lines, year)
-      const normalized = normalizePrettyAndMerge(nextTextForWindow, year)
-      setWindowTextSync(year, w.id, normalized)
-    }
-  }
-
   function syncCombinedRightText(nextText, year = baseYear) {
     const { commonLines, windowLinesById, seenWindowIds } = splitCombinedRightText(nextText, editableWindows)
     setRightWindowTextSync(year, "all", commonLines.join("\n").trimEnd())
@@ -1287,48 +1364,265 @@ function App() {
     }
   }
 
-  function updateEditorText(nextText, syncAll = true) {
+  function updateEditorText(nextText) {
     setText(nextText)
     textRef.current = nextText
-    if (activeWindowId === "all" && syncAll) syncCombinedText(nextText)
   }
 
+  function handleLeftMemoChange(e) {
+    const next = e.target.value
+    if (activeWindowId === "all") updateEditorText(next)
+    else setTabEditText(next)
+  }
+
+function parseTabEditGroupLineByDate(tabText, baseYear, title) {
+    const parsedTab = parseBlocksAndItems(tabText ?? "", baseYear)
+    const out = {}
+    for (const block of parsedTab.blocks) {
+      const body = (tabText ?? "").slice(block.bodyStartPos, block.blockEndPos)
+      const rawGroupLine = findRawGroupLineText(body, title)
+      if (rawGroupLine) {
+        out[block.dateKey] = rawGroupLine.trim()
+        continue
+      }
+      const normalizedBody = normalizeGroupLineNewlines(body)
+      const lines = normalizedBody.split("\n")
+      const items = []
+      for (const rawLine of lines) {
+        const lineItems = extractGroupLineItems(rawLine, title)
+        if (lineItems.length === 0) continue
+        items.push(...lineItems)
+      }
+      if (items.length > 0) out[block.dateKey] = `@${title}(${items.join("; ")})`
+      else if (lines.some((line) => line.trim() === `@${title}()`)) out[block.dateKey] = `@${title}()`
+    }
+    return out
+  }
+
+  function extractGroupLineItems(line, title) {
+    const trimmed = (line ?? "").trim()
+    const match = trimmed.match(groupLineRegex)
+    if (!match) return []
+    const groupTitle = match[1].trim()
+    if (!groupTitle || groupTitle !== title) return []
+    return match[2]
+      .split(/;|\r?\n/)
+      .map((x) => x.trim())
+      .filter((x) => x !== "")
+  }
+
+function parseTabEditItemsFromText(tabText, baseYear, title) {
+    const parsedTab = parseBlocksAndItems(tabText ?? "", baseYear)
+    const out = {}
+    for (const block of parsedTab.blocks) {
+      const body = (tabText ?? "").slice(block.bodyStartPos, block.blockEndPos)
+      const rawGroupLine = findRawGroupLineText(body, title)
+      if (rawGroupLine) {
+        const extracted = extractGroupLineItems(rawGroupLine, title)
+        if (extracted.length > 0) out[block.dateKey] = extracted
+        continue
+      }
+      const normalizedBody = normalizeGroupLineNewlines(body)
+      const lines = normalizedBody.split("\n")
+      const items = []
+      for (const rawLine of lines) {
+        const lineItems = extractGroupLineItems(rawLine, title)
+        if (lineItems.length === 0) continue
+        items.push(...lineItems)
+      }
+      if (items.length > 0) out[block.dateKey] = items
+    }
+    return out
+  }
+
+  function updateGroupLineInBody(bodyText, title, groupLineText) {
+    const source = bodyText ?? ""
+    const pattern = new RegExp(`[ \\t]*@${escapeRegex(title)}\\s*\\(([\\s\\S]*?)\\)`, "g")
+    const segments = []
+    let lastIndex = 0
+    let match
+    while ((match = pattern.exec(source)) !== null) {
+      segments.push(source.slice(lastIndex, match.index))
+      lastIndex = match.index + match[0].length
+    }
+    segments.push(source.slice(lastIndex))
+    const nextBody = segments.join("")
+    const nextLines = nextBody === "" ? [] : nextBody.split("\n")
+    const nextGroupLine = groupLineText && groupLineText.trim() ? groupLineText.trim() : ""
+    if (nextGroupLine) {
+      if (nextLines.length > 0 && nextLines[nextLines.length - 1].trim() !== "") {
+        nextLines.push(nextGroupLine)
+      } else {
+        while (nextLines.length > 0 && nextLines[nextLines.length - 1].trim() === "") nextLines.pop()
+        nextLines.push(nextGroupLine)
+      }
+    } else {
+      while (nextLines.length > 0 && nextLines[nextLines.length - 1].trim() === "") nextLines.pop()
+    }
+    return nextLines.join("\n").trimEnd()
+  }
+
+  function stripUnknownGroupLines(bodyText, allowedTitles) {
+    const lines = (bodyText ?? "").split("\n")
+    const nextLines = []
+    for (const line of lines) {
+      const trimmed = line.trim()
+      const match = trimmed.match(groupLineRegex)
+      if (match) {
+        const title = match[1].trim()
+        if (!allowedTitles.has(title)) continue
+      }
+      nextLines.push(line)
+    }
+    return nextLines.join("\n").trimEnd()
+  }
+
+  function collectStoredYears() {
+    const years = new Set()
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i)
+        if (!key) continue
+        let match = key.match(/^planner-text-(\d{4})-/)
+        if (!match) match = key.match(/^planner-left-text-(\d{4})$/)
+        if (!match) match = key.match(/^planner-right-text-(\d{4})-/)
+        if (match) years.add(Number(match[1]))
+      }
+    } catch {}
+    return years
+  }
+
+  function pruneUnknownGroupsFromYear(year, allowedTitles, { skipTick = false } = {}) {
+    const allText = getWindowMemoTextSync(year, "all")
+    if (!allText) return false
+
+    const parsedAll = parseBlocksAndItems(allText, year)
+    if (parsedAll.blocks.length === 0) return false
+
+    let nextAll = allText
+    let changed = false
+    for (const block of parsedAll.blocks) {
+      const currentBody = getDateBlockBodyText(nextAll, year, block.dateKey)
+      const updatedBody = stripUnknownGroupLines(currentBody, allowedTitles)
+      if (updatedBody === currentBody) continue
+      changed = true
+      nextAll = updateDateBlockBody(nextAll, year, block.dateKey, updatedBody)
+      const removeResult = removeEmptyBlockByDateKey(nextAll, year, block.dateKey)
+      if (removeResult.changed) nextAll = removeResult.newText
+    }
+
+    if (!changed) return false
+
+    nextAll = normalizePrettyAndMerge(nextAll, year)
+    setWindowMemoTextSync(year, "all", nextAll)
+    if (activeWindowId === "all" && baseYearRef.current === year) updateEditorText(nextAll)
+    if (!skipTick) setDashboardSourceTick((x) => x + 1)
+    return true
+  }
+
+  function pruneUnknownGroupsFromAllYears(allowedTitles) {
+    const years = collectStoredYears()
+    let changed = false
+    for (const year of years) {
+      const didChange = pruneUnknownGroupsFromYear(year, allowedTitles, { skipTick: true })
+      if (didChange) changed = true
+    }
+    if (changed) setDashboardSourceTick((x) => x + 1)
+  }
+
+  function removeWindowDataFromAllYears(windowId, allowedTitles) {
+    const years = collectStoredYears()
+    for (const year of years) {
+      try {
+        localStorage.removeItem(`planner-text-${year}-${windowId}`)
+        localStorage.removeItem(`planner-right-text-${year}-${windowId}`)
+      } catch {}
+    }
+    pruneUnknownGroupsFromAllYears(allowedTitles)
+  }
+
+  function applyTabEditToAllFromText(nextTabText) {
+    if (activeWindowId === "all") return
+    const targetWindow = windows.find((w) => w.id === activeWindowId)
+    if (!targetWindow) return
+
+    const allText = getWindowMemoTextSync(baseYear, "all")
+    const tabGroupLinesByDate = parseTabEditGroupLineByDate(nextTabText ?? "", baseYear, targetWindow.title)
+
+    let nextAll = allText
+    const allParsed = parseBlocksAndItems(allText, baseYear)
+    const allDates = new Set(allParsed.blocks.map((b) => b.dateKey))
+    for (const key of Object.keys(tabGroupLinesByDate)) allDates.add(key)
+
+    for (const key of allDates) {
+      const currentBody = getDateBlockBodyText(nextAll, baseYear, key)
+      const groupLine = tabGroupLinesByDate[key] ?? ""
+      const updatedBody = updateGroupLineInBody(currentBody, targetWindow.title, groupLine)
+      nextAll = updateDateBlockBody(nextAll, baseYear, key, updatedBody)
+      const removeResult = removeEmptyBlockByDateKey(nextAll, baseYear, key)
+      if (removeResult.changed) nextAll = removeResult.newText
+    }
+
+    nextAll = normalizePrettyAndMerge(nextAll, baseYear)
+    setWindowMemoTextSync(baseYear, "all", nextAll)
+    if (activeWindowId === "all") updateEditorText(nextAll)
+    setDashboardSourceTick((x) => x + 1)
+  }
+
+  function applyTabEditToAll() {
+    if (activeWindowId === "all") return
+    const targetWindow = windows.find((w) => w.id === activeWindowId)
+    if (!targetWindow) return
+
+    const allText = getWindowMemoTextSync(baseYear, "all")
+    const tabGroupLinesByDate = parseTabEditGroupLineByDate(tabEditText ?? "", baseYear, targetWindow.title)
+
+    let nextAll = allText
+    const allParsed = parseBlocksAndItems(allText, baseYear)
+    const allDates = new Set(allParsed.blocks.map((b) => b.dateKey))
+    for (const key of Object.keys(tabGroupLinesByDate)) allDates.add(key)
+
+    for (const key of allDates) {
+      const currentBody = getDateBlockBodyText(nextAll, baseYear, key)
+      const groupLine = tabGroupLinesByDate[key] ?? ""
+      const updatedBody = updateGroupLineInBody(currentBody, targetWindow.title, groupLine)
+      nextAll = updateDateBlockBody(nextAll, baseYear, key, updatedBody)
+      const removeResult = removeEmptyBlockByDateKey(nextAll, baseYear, key)
+      if (removeResult.changed) nextAll = removeResult.newText
+    }
+
+    nextAll = normalizePrettyAndMerge(nextAll, baseYear)
+    setWindowMemoTextSync(baseYear, "all", nextAll)
+    if (activeWindowId === "all") updateEditorText(nextAll)
+    setDashboardSourceTick((x) => x + 1)
+  }
 
   useEffect(() => {
     suppressSaveRef.current = true
-
-    if (activeWindowId === "all") {
-      const combined = buildCombinedTextForYear(baseYear)
-      setText(combined)
-      textRef.current = combined
-      return
-    }
-
-    if (overrideLoadRef.current && overrideLoadRef.current.year === baseYear) {
-      const forced = overrideLoadRef.current.text ?? ""
-      overrideLoadRef.current = null
-      setText(forced)
-      return
-    }
-
     const saved = localStorage.getItem(memoKey)
     if (saved != null) {
       setText(saved)
       return
     }
 
-    const migrated = localStorage.getItem(MIGRATED_FLAG) === "1"
-    const legacy = localStorage.getItem(LEGACY_KEY)
-    if (!migrated && legacy) {
-      localStorage.setItem(memoKey, legacy)
-      localStorage.setItem(MIGRATED_FLAG, "1")
-      localStorage.removeItem(LEGACY_KEY)
-      setText(legacy)
-      return
+    if (activeWindowId === "all") {
+      const legacyLeft = localStorage.getItem(legacyLeftKey)
+      if (legacyLeft != null) {
+        localStorage.setItem(memoKey, legacyLeft)
+        setText(legacyLeft)
+        return
+      }
+
+      const legacy = localStorage.getItem(LEGACY_KEY)
+      if (legacy != null) {
+        localStorage.setItem(memoKey, legacy)
+        setText(legacy)
+        return
+      }
     }
 
     setText("")
-  }, [memoKey, baseYear, activeWindowId, editableWindows, integratedFilters])
+  }, [memoKey, legacyLeftKey])
 
   // ✅ 오른쪽 메모(연도별) 로드
 useEffect(() => {
@@ -1352,9 +1646,8 @@ useEffect(() => {
       suppressSaveRef.current = false
       return
     }
-    if (activeWindowId === "all") return
     localStorage.setItem(memoKey, text)
-  }, [memoKey, text, activeWindowId])
+  }, [memoKey, text])
 
   // ✅ 오른쪽 메모(연도별) 저장
 useEffect(() => {
@@ -1368,7 +1661,10 @@ useEffect(() => {
   } catch {}
 }, [rightMemoKey, rightMemoText, activeWindowId])
 
-  const leftOverlayLines = useMemo(() => buildMemoOverlayLines(text), [text])
+  const leftOverlayLines = useMemo(() => {
+    if (activeWindowId === "all") return buildMemoOverlayLines(text)
+    return buildMemoOverlayLines(tabEditText)
+  }, [activeWindowId, tabEditText, text])
   const rightOverlayLines = useMemo(() => buildMemoOverlayLines(rightMemoText), [rightMemoText])
 
   useEffect(() => {
@@ -1379,42 +1675,215 @@ useEffect(() => {
     syncOverlayScroll(rightTextareaRef.current, rightOverlayInnerRef.current)
   }, [rightMemoText, memoFontPx, memoInnerSplit])
 
+  useEffect(() => {
+    updateMentionGhost()
+  }, [activeWindowId, isEditingLeftMemo, tabEditText, windows])
+
 
   function getEditorTextSync(year) {
-    if (activeWindowId === "all") return buildCombinedTextForYear(year)
-    return getWindowTextSync(year, activeWindowId)
+    return getLeftMemoTextSync(year)
   }
 
   // ===== 파싱 =====
   const parsed = useMemo(() => parseBlocksAndItems(text, baseYear), [text, baseYear])
   const blocks = parsed.blocks
-  const itemsByDate = useMemo(() => {
-    if (activeWindowId !== "all") return parsed.items
-    const colorByTitle = new Map(windows.map((w) => [w.title, w.color]))
-    const out = {}
-    for (const [key, items] of Object.entries(parsed.items)) {
-      let currentTitle = null
-      const next = []
-      for (const it of items) {
-        const labelMatch = it.text.match(/^\s*\[(.+)\]\s*$/)
-        if (labelMatch) {
-          currentTitle = labelMatch[1]
-          continue
-        }
-        next.push({
-          ...it,
-          sourceTitle: currentTitle,
-          color: currentTitle ? colorByTitle.get(currentTitle) ?? null : null
+  const dashboardSourceText = useMemo(() => {
+    if (activeWindowId === "all") return text
+    return getWindowMemoTextSync(baseYear, "all")
+  }, [activeWindowId, baseYear, text, dashboardSourceTick])
+  const dashboardParsed = useMemo(() => parseBlocksAndItems(dashboardSourceText, baseYear), [dashboardSourceText, baseYear])
+  const dashboardBlocksSource = dashboardParsed.blocks
+  const allowedDashboardGroupTitles = useMemo(() => {
+    if (activeWindowId !== "all") return null
+    const set = new Set()
+    for (const w of windows) {
+      if (w.id === "all") continue
+      if (integratedFilters[w.id] !== false) set.add(w.title)
+    }
+    return set
+  }, [activeWindowId, integratedFilters, windows])
+
+  const dashboardByDate = useMemo(() => {
+    const map = {}
+    for (const block of dashboardBlocksSource) {
+      const body = dashboardSourceText.slice(block.bodyStartPos, block.blockEndPos)
+      const parsedBlock = parseDashboardBlockContent(body)
+      const filteredGroups = allowedDashboardGroupTitles
+        ? parsedBlock.groups.filter((group) => allowedDashboardGroupTitles.has(group.title))
+        : parsedBlock.groups
+      if (parsedBlock.general.length === 0 && filteredGroups.length === 0) continue
+      map[block.dateKey] = { general: parsedBlock.general, groups: filteredGroups }
+    }
+    return map
+  }, [dashboardBlocksSource, dashboardSourceText, allowedDashboardGroupTitles])
+  const dashboardBlocks = useMemo(() => {
+    const out = []
+    for (const block of dashboardBlocksSource) {
+      const parsedBlock = dashboardByDate[block.dateKey]
+      if (!parsedBlock) continue
+      const orderedGroups = parsedBlock.groups
+        .map((group, idx) => ({ group, idx }))
+        .sort((a, b) => {
+          const idxA = windowTitleRank.get(a.group.title)
+          const idxB = windowTitleRank.get(b.group.title)
+          const rankA = idxA != null ? idxA : Number.MAX_SAFE_INTEGER
+          const rankB = idxB != null ? idxB : Number.MAX_SAFE_INTEGER
+          if (rankA !== rankB) return rankA - rankB
+          return a.idx - b.idx
         })
+        .map((entry) => entry.group)
+      out.push({
+        dateKey: block.dateKey,
+        general: parsedBlock.general,
+        groups: orderedGroups
+      })
+    }
+    out.sort((a, b) => keyToTime(a.dateKey) - keyToTime(b.dateKey))
+    return out
+  }, [dashboardBlocksSource, dashboardByDate, windowTitleRank])
+
+  function buildTabEditTextForTitle(title) {
+    if (!title) return ""
+    const out = []
+    for (const block of dashboardBlocksSource) {
+      const body = dashboardSourceText.slice(block.bodyStartPos, block.blockEndPos)
+      const normalizedBody = normalizeGroupLineNewlines(body)
+      const lines = normalizedBody.split("\n")
+      const items = []
+      for (const rawLine of lines) {
+        const lineItems = extractGroupLineItems(rawLine, title)
+        if (lineItems.length === 0) continue
+        items.push(...lineItems)
       }
-      if (next.length > 0) out[key] = next
+      const rawGroupLine = findRawGroupLineText(body, title)
+      let groupLine = rawGroupLine ?? ""
+      if (!groupLine) {
+        if (items.length > 0) groupLine = `@${title}(${items.join("; ")})`
+        else if (lines.some((line) => line.trim() === `@${title}()`)) groupLine = `@${title}()`
+      }
+      if (!groupLine) continue
+      const { y, m, d } = keyToYMD(block.dateKey)
+      out.push(buildHeaderLine(y, m, d))
+      out.push(groupLine)
+      out.push("")
+    }
+    return out.join("\n").trimEnd()
+  }
+
+  const tabReadBlocks = useMemo(() => {
+    if (activeWindowId === "all") return []
+    const targetWindow = windows.find((w) => w.id === activeWindowId)
+    if (!targetWindow) return []
+
+    const tabItemsByDate = parseTabEditItemsFromText(tabEditText ?? "", baseYear, targetWindow.title)
+    const out = Object.entries(tabItemsByDate)
+      .filter(([, items]) => Array.isArray(items) && items.length > 0)
+      .map(([dateKey, items]) => ({ dateKey, items }))
+    out.sort((a, b) => keyToTime(a.dateKey) - keyToTime(b.dateKey))
+    return out
+  }, [activeWindowId, baseYear, tabEditText, windows])
+
+  useEffect(() => {
+    if (activeWindowId === "all") return
+    if (isEditingLeftMemo) return
+    const targetWindow = windows.find((w) => w.id === activeWindowId)
+    if (!targetWindow) return
+    setTabEditText(buildTabEditTextForTitle(targetWindow.title))
+  }, [activeWindowId, baseYear, dashboardByDate, dashboardBlocksSource, isEditingLeftMemo, windows])
+
+  useEffect(() => {
+    if (activeWindowId === "all") return
+    if (!isEditingLeftMemo) return
+    const timer = setTimeout(() => {
+      applyTabEditToAll()
+    }, 250)
+    return () => clearTimeout(timer)
+  }, [activeWindowId, isEditingLeftMemo, tabEditText])
+  const itemsByDate = useMemo(() => {
+    if (activeWindowId === "all") {
+      const out = {}
+      for (const block of dashboardBlocksSource) {
+        const parsedBlock = dashboardByDate[block.dateKey]
+        if (!parsedBlock) continue
+        const bucket = []
+        // general lines first (colorless)
+        for (const line of parsedBlock.general) {
+          if (!line) continue
+          bucket.push({
+            id: `${block.dateKey}-general-${bucket.length}`,
+            time: "",
+            text: line,
+            color: "#999",
+            sourceTitle: ""
+          })
+        }
+        const orderedGroups = parsedBlock.groups
+          .map((group, idx) => ({ group, idx }))
+          .sort((a, b) => {
+            const idxA = windowTitleRank.get(a.group.title)
+            const idxB = windowTitleRank.get(b.group.title)
+            const rankA = idxA != null ? idxA : Number.MAX_SAFE_INTEGER
+            const rankB = idxB != null ? idxB : Number.MAX_SAFE_INTEGER
+            if (rankA !== rankB) return rankA - rankB
+            return a.idx - b.idx
+          })
+          .map((entry) => entry.group)
+        for (const group of orderedGroups) {
+          const window = windows.find((w) => w.title === group.title)
+          const color = window?.color ?? "#aaa"
+          for (let idx = 0; idx < group.items.length; idx++) {
+            bucket.push({
+              id: `${block.dateKey}-${group.title}-${idx}`,
+              time: "",
+              text: group.items[idx],
+              color,
+              sourceTitle: group.title
+            })
+          }
+        }
+        if (bucket.length > 0) out[block.dateKey] = bucket
+      }
+      return out
+    }
+
+    const targetWindow = windows.find((w) => w.id === activeWindowId)
+    if (!targetWindow) return {}
+
+    const tabItemsByDate = parseTabEditItemsFromText(tabEditText ?? "", baseYear, targetWindow.title)
+    const out = {}
+    for (const [key, items] of Object.entries(tabItemsByDate)) {
+      if (!items || items.length === 0) continue
+      const bucket = items.map((item, idx) => ({
+        id: `${key}-${targetWindow.id}-${idx}`,
+        time: "",
+        text: item,
+        color: targetWindow.color,
+        sourceTitle: targetWindow.title
+      }))
+      out[key] = (out[key] ?? []).concat(bucket)
     }
     return out
-  }, [parsed, activeWindowId, windows])
-  const activeWindowColor = useMemo(
-    () => windows.find((w) => w.id === activeWindowId)?.color ?? null,
-    [windows, activeWindowId]
-  )
+  }, [activeWindowId, baseYear, dashboardBlocksSource, dashboardByDate, parsed.items, tabEditText, windowTitleRank, windows])
+
+  const collapsedForActive = dashboardCollapsedByWindow[activeWindowId] ?? {}
+
+  function toggleDashboardCollapse(dateKey) {
+    setDashboardCollapsedByWindow((prev) => {
+      const next = { ...prev }
+      const bucket = { ...(next[activeWindowId] ?? {}) }
+      bucket[dateKey] = !bucket[dateKey]
+      next[activeWindowId] = bucket
+      return next
+    })
+  }
+
+  function enterEditMode() {
+    setIsEditingLeftMemo(true)
+    requestAnimationFrame(() => {
+      const el = textareaRef.current
+      if (el) el.focus()
+    })
+  }
 
   // ===== 선택된 날짜 =====
   const [selectedDateKey, setSelectedDateKey] = useState(null)
@@ -1422,23 +1891,22 @@ useEffect(() => {
   const calendarInteractingRef = useRef(false)
   const [dayListModal, setDayListModal] = useState(null)
   const [dayListEditText, setDayListEditText] = useState("")
+  const [dayListMode, setDayListMode] = useState("read")
+  const dayListView = useMemo(() => {
+    if (!dayListModal) return null
+    return parseDashboardBlockContent(dayListEditText)
+  }, [dayListModal, dayListEditText])
 
   useEffect(() => {
     if (!dayListModal) {
       setDayListEditText("")
       return
     }
-    const current = textRef.current ?? text
-    const body = getDateBlockBodyText(current, baseYear, dayListModal.key)
-    if (!body && activeWindowId === "all") {
-      const labels = getIntegratedLabels(editableWindows, integratedFilters)
-      const seeded = labels.join("\n")
-      setDayListEditText(seeded)
-      if (seeded) applyDayListEdit(seeded)
-      return
-    }
+    const sourceText = activeWindowId === "all" ? textRef.current ?? text : tabEditText ?? ""
+    const body = getDateBlockBodyText(sourceText, baseYear, dayListModal.key)
     setDayListEditText(body)
-  }, [dayListModal ? dayListModal.key : null, baseYear])
+    setDayListMode("read")
+  }, [dayListModal ? dayListModal.key : null, baseYear, activeWindowId])
 
   function setActiveDateKey(key) {
     if (!key) return
@@ -1454,42 +1922,17 @@ useEffect(() => {
 
   function applyDayListEdit(nextBody) {
     if (!dayListModal) return
-    const current = textRef.current ?? text
+    const isAll = activeWindowId === "all"
+    const current = isAll ? textRef.current ?? text : tabEditText ?? ""
     const nextText = updateDateBlockBody(current, baseYear, dayListModal.key, nextBody)
     if (nextText === current) return
-    if (activeWindowId === "all") updateEditorText(nextText)
-    else {
-      setText(nextText)
-      textRef.current = nextText
+    if (isAll) {
+      updateEditorText(nextText)
+      return
     }
-  }
-
-  function confirmDayListEdit() {
-    if (!dayListModal) return
-    const current = textRef.current ?? text
-    const nextBody =
-      activeWindowId === "all" ? pruneEmptyLabelSections(dayListEditText) : dayListEditText.trimEnd()
-    const updated = updateDateBlockBody(current, baseYear, dayListModal.key, nextBody)
-
-    let normalized = normalizePrettyAndMerge(updated, baseYear)
-    if (activeWindowId === "all") {
-      normalized = injectIntegratedLabels(normalized, baseYear, editableWindows, integratedFilters)
-      const labels = getIntegratedLabels(editableWindows, integratedFilters)
-      const r = removeIntegratedEmptyBlocks(normalized, baseYear, labels)
-      if (r.changed) normalized = r.newText
-    } else {
-      const r = removeEmptyBlockByDateKey(normalized, baseYear, dayListModal.key)
-      if (r.changed) normalized = r.newText
-    }
-
-    if (normalized !== current) {
-      if (activeWindowId === "all") updateEditorText(normalized)
-      else {
-        setText(normalized)
-        textRef.current = normalized
-      }
-    }
-    setDayListEditText(getDateBlockBodyText(normalized, baseYear, dayListModal.key))
+    setTabEditText(nextText)
+    setWindowMemoTextSync(baseYear, activeWindowId, nextText)
+    applyTabEditToAllFromText(nextText)
   }
 
   // ===== 점프 스케줄 =====
@@ -1514,7 +1957,8 @@ useEffect(() => {
       if (!ta2 || !mirror2 || !marker2) return
 
       ta2.focus()
-      ta2.setSelectionRange(a.caretPos, a.caretPos)
+      const caretForTa2 = normalizeCaretForTextarea(ta2, a.caretPos)
+      ta2.setSelectionRange(caretForTa2, caretForTa2)
       scrollCharPosToTopOffset(ta2, mirror2, marker2, ta2.value ?? "", a.headerPos, a.topOffsetLines ?? 1)
 
       requestAnimationFrame(() => {
@@ -1527,7 +1971,8 @@ useEffect(() => {
 
       pendingJumpRef.current = null
     })
-  }, [text, baseYear])
+  }, [text, tabEditText, activeWindowId, baseYear])
+
 
   function scheduleJump(headerPos, caretPos, topOffsetLines = 1) {
     pendingJumpRef.current = { headerPos, caretPos, topOffsetLines }
@@ -1541,7 +1986,8 @@ useEffect(() => {
       if (!ta || !mirror || !marker) return
 
       ta.focus()
-      ta.setSelectionRange(a.caretPos, a.caretPos)
+      const caretForTa = normalizeCaretForTextarea(ta, a.caretPos)
+      ta.setSelectionRange(caretForTa, caretForTa)
       scrollCharPosToTopOffset(ta, mirror, marker, ta.value ?? "", a.headerPos, a.topOffsetLines ?? 1)
 
       requestAnimationFrame(() => {
@@ -1562,75 +2008,211 @@ useEffect(() => {
     const ta = textareaRef.current
     if (!ta) return
     const caret = ta.selectionStart ?? 0
-    const idx = findBlockIndexByCaret(blocks, caret)
+    const sourceText = activeWindowId === "all" ? text : tabEditText
+    const sourceBlocks =
+      activeWindowId === "all" ? blocks : parseBlocksAndItems(sourceText ?? "", baseYear).blocks
+    const idx = findBlockIndexByCaret(sourceBlocks, caret)
     if (idx < 0) return
-    const key = blocks[idx]?.dateKey
+    const key = sourceBlocks[idx]?.dateKey
     if (!key) return
     setActiveDateKey(key)
   }
 
+  function updateMentionGhost() {
+    if (activeWindowId === "all" || !isEditingLeftMemo) {
+      if (mentionGhostText) setMentionGhostText("")
+      return
+    }
+    const ta = textareaRef.current
+    if (!ta) return
+    if (ta.selectionStart !== ta.selectionEnd) {
+      if (mentionGhostText) setMentionGhostText("")
+      return
+    }
+    if (document.activeElement !== ta) {
+      if (mentionGhostText) setMentionGhostText("")
+      return
+    }
+    const value = ta.value ?? ""
+    const caret = ta.selectionStart ?? 0
+    const lineStart = value.lastIndexOf("\n", caret - 1)
+    const linePrefix = value.slice(lineStart + 1, caret)
+    if (linePrefix.trim() !== "@" || !linePrefix.endsWith("@")) {
+      if (mentionGhostText) setMentionGhostText("")
+      return
+    }
+    const activeWindow = windows.find((w) => w.id === activeWindowId)
+    if (!activeWindow) {
+      if (mentionGhostText) setMentionGhostText("")
+      return
+    }
+    const mirror = mirrorRef.current
+    const marker = markerRef.current
+    if (!mirror || !marker) return
+
+    const pos = measureCharPosPx(ta, mirror, marker, value, caret)
+    setMentionGhostPos({ top: pos.top - ta.scrollTop, left: pos.left })
+    setMentionGhostText(`${activeWindow.title}(`)
+  }
+
+  function acceptMentionGhost(e) {
+    if (e.key !== "Enter") return false
+    if (activeWindowId === "all") return false
+    if (!mentionGhostText) return false
+    const ta = textareaRef.current
+    if (!ta) return false
+
+    e.preventDefault()
+    const value = ta.value ?? ""
+    const caret = ta.selectionStart ?? 0
+    const nextText = value.slice(0, caret) + mentionGhostText + value.slice(caret)
+    const nextCaret = caret + mentionGhostText.length
+    setTabEditText(nextText)
+    setMentionGhostText("")
+    requestAnimationFrame(() => {
+      const el = textareaRef.current
+      if (el) {
+        el.focus()
+        el.setSelectionRange(nextCaret, nextCaret)
+      }
+    })
+    return true
+  }
+
+  function handleBoxEnterKey(e, value, taRef, setValue) {
+    if (e.key !== "Enter") return
+    if (activeWindowId === "all") return
+    const ta = taRef?.current
+    if (!ta) return
+    if (ta.selectionStart !== ta.selectionEnd) return
+
+    const textValue = value ?? ""
+    const caret = ta.selectionStart ?? 0
+    const lineStart = textValue.lastIndexOf("\n", caret - 1) + 1
+    const lineEndRaw = textValue.indexOf("\n", caret)
+    const lineEnd = lineEndRaw === -1 ? textValue.length : lineEndRaw
+    const line = textValue.slice(lineStart, lineEnd)
+    const dateKey = getDateKeyFromLine(line, baseYear)
+    if (!dateKey) return
+
+    const targetWindow = windows.find((w) => w.id === activeWindowId)
+    if (!targetWindow) return
+
+    e.preventDefault()
+    let workingText = textValue
+    if (lineEndRaw === -1) {
+      workingText = textValue.slice(0, lineEnd) + "\n" + textValue.slice(lineEnd)
+    }
+    const ensured = ensureTabGroupLineAtDate(workingText, dateKey, targetWindow.title, baseYear)
+    const headerPos = ensured.headerPos ?? lineStart
+    const caretPos = ensured.caretPos ?? lineEnd + 1
+    if (ensured.newText !== workingText) {
+      pendingJumpRef.current = { headerPos, caretPos, topOffsetLines: 1 }
+      setValue(ensured.newText)
+      return
+    }
+    if (workingText !== textValue) {
+      pendingJumpRef.current = { headerPos, caretPos, topOffsetLines: 1 }
+      setValue(workingText)
+      return
+    }
+    scheduleJump(headerPos, caretPos, 1)
+  }
+
   function onTextareaSelectOrKeyUp() {
     updateCalendarFromMemoCaret()
+    updateMentionGhost()
   }
 
   // ===== blur 정리 + 빈 블록이면 삭제 =====
   function onTextareaBlur() {
+    if (activeWindowId !== "all") {
+      let nextTabText = tabEditText ?? ""
+      const cleaned = removeAllEmptyBlocks(nextTabText, baseYear)
+      if (cleaned.changed) {
+        nextTabText = cleaned.newText
+        setTabEditText(nextTabText)
+        setWindowMemoTextSync(baseYear, activeWindowId, nextTabText)
+        applyTabEditToAllFromText(nextTabText)
+      } else {
+        applyTabEditToAll()
+      }
+      setIsEditingLeftMemo(false)
+      if (mentionGhostText) setMentionGhostText("")
+      return
+    }
     const ta = textareaRef.current
     if (!ta) return
     const current = ta.value ?? ""
 
     let normalized = normalizePrettyAndMerge(current, baseYear)
-    if (activeWindowId === "all") {
-      normalized = injectIntegratedLabels(normalized, baseYear, editableWindows, integratedFilters)
-    }
-
-    if (activeWindowId === "all") {
-      const labels = getIntegratedLabels(editableWindows, integratedFilters)
-      const r = removeIntegratedEmptyBlocks(normalized, baseYear, labels)
+    const key = lastActiveDateKeyRef.current
+    if (key) {
+      const r = removeEmptyBlockByDateKey(normalized, baseYear, key)
       if (r.changed) normalized = r.newText
-    } else {
-      const key = lastActiveDateKeyRef.current
-      if (key) {
-        const r = removeEmptyBlockByDateKey(normalized, baseYear, key)
-        if (r.changed) normalized = r.newText
-      }
     }
 
     if (normalized !== current) {
-      if (activeWindowId === "all") updateEditorText(normalized)
-      else setText(normalized)
+      updateEditorText(normalized)
     }
     if (!calendarInteractingRef.current) {
       setSelectedDateKey(null)
       lastActiveDateKeyRef.current = null
     }
+    setIsEditingLeftMemo(false)
   }
 
   // ===== 달력 클릭 =====
   function handleDayClick(day) {
+    if (!isEditingLeftMemo) {
+      setIsEditingLeftMemo(true)
+      requestAnimationFrame(() => {
+        const el = textareaRef.current
+        if (el) el.focus()
+      })
+    }
     const { year, month } = viewRef.current
     const key = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`
     setActiveDateKey(key)
 
-    const currentText = textareaRef.current ? textareaRef.current.value : text
-    const existing = blocks.find((b) => b.dateKey === key)
+    const isAll = activeWindowId === "all"
+    const sourceText = isAll ? (textareaRef.current ? textareaRef.current.value : text) : tabEditText
+    const sourceBlocks = isAll ? blocks : parseBlocksAndItems(sourceText ?? "", baseYear).blocks
+    const existing = sourceBlocks.find((b) => b.dateKey === key)
 
     if (existing) {
-      const { newText, caretPos } = ensureOneBlankLineAtBlockEnd(currentText, existing)
-      if (newText !== currentText) {
-        pendingJumpRef.current = { headerPos: existing.headerStartPos, caretPos, topOffsetLines: 1 }
-        if (activeWindowId === "all") updateEditorText(newText)
-        else setText(newText)
+      if (isAll) {
+        const { newText, caretPos } = ensureBodyLineForBlock(sourceText ?? "", existing)
+        if (newText !== (sourceText ?? "")) {
+          pendingJumpRef.current = { headerPos: existing.headerStartPos, caretPos, topOffsetLines: 1 }
+          updateEditorText(newText)
+        } else {
+          scheduleJump(existing.headerStartPos, caretPos, 1)
+        }
       } else {
-        scheduleJump(existing.headerStartPos, caretPos, 1)
+        const targetWindow = windows.find((w) => w.id === activeWindowId)
+        if (!targetWindow) return
+        const ensured = ensureTabGroupLineAtDate(sourceText ?? "", key, targetWindow.title, baseYear)
+        if (ensured.newText !== (sourceText ?? "")) {
+          pendingJumpRef.current = {
+            headerPos: ensured.headerPos ?? existing.headerStartPos,
+            caretPos: ensured.caretPos ?? existing.bodyStartPos,
+            topOffsetLines: 1
+          }
+          setTabEditText(ensured.newText)
+        } else {
+          scheduleJump(existing.headerStartPos, ensured.caretPos ?? existing.bodyStartPos, 1)
+        }
       }
       return
     }
 
     const targetTime = keyToTime(key)
-    const byDate = [...blocks].sort((a, b) => keyToTime(a.dateKey) - keyToTime(b.dateKey) || a.blockStartPos - b.blockStartPos)
+    const byDate = [...sourceBlocks].sort(
+      (a, b) => keyToTime(a.dateKey) - keyToTime(b.dateKey) || a.blockStartPos - b.blockStartPos
+    )
 
-    let insertPos = currentText.length
+    let insertPos = (sourceText ?? "").length
     for (const b of byDate) {
       if (keyToTime(b.dateKey) > targetTime) {
         insertPos = b.blockStartPos
@@ -1639,23 +2221,30 @@ useEffect(() => {
     }
 
     const headerLine = buildHeaderLine(year, month, day)
-    const { newText: insertedText, headerStartPos, bodyStartPos } = insertDateBlockAt(currentText, insertPos, headerLine)
-    let newText = insertedText
-    if (activeWindowId === "all") {
-      const labels = getIntegratedLabels(editableWindows, integratedFilters)
-      const labelsText = labels.length > 0 ? `\n${labels.join("\n")}\n` : ""
-      if (labelsText) {
-        newText = newText.slice(0, bodyStartPos) + labelsText + newText.slice(bodyStartPos)
-      }
-    }
-
+    const { newText: insertedText, headerStartPos, bodyStartPos } = insertDateBlockAt(
+      sourceText ?? "",
+      insertPos,
+      headerLine
+    )
     pendingJumpRef.current = { headerPos: headerStartPos, caretPos: bodyStartPos, topOffsetLines: 1 }
-    if (activeWindowId === "all") updateEditorText(newText)
-    else setText(newText)
+    if (isAll) {
+      updateEditorText(insertedText)
+    } else {
+      const targetWindow = windows.find((w) => w.id === activeWindowId)
+      if (!targetWindow) return
+      const ensured = ensureTabGroupLineAtDate(insertedText, key, targetWindow.title, baseYear)
+      pendingJumpRef.current.caretPos = ensured.caretPos ?? pendingJumpRef.current.caretPos
+      setTabEditText(ensured.newText)
+    }
   }
 
   // ===== Today 버튼 동작 =====
   function goToday() {
+    setIsEditingLeftMemo(true)
+    requestAnimationFrame(() => {
+      const el = textareaRef.current
+      if (el) el.focus()
+    })
     const y = today.getFullYear()
     const m = today.getMonth() + 1
     const d = today.getDate()
@@ -1665,6 +2254,63 @@ useEffect(() => {
     viewRef.current = { year: y, month: m }
     lastActiveDateKeyRef.current = key
     setSelectedDateKey(key)
+
+    if (activeWindowId !== "all") {
+      const targetWindow = windows.find((w) => w.id === activeWindowId)
+      if (!targetWindow) return
+
+      const sameYear = baseYearRef.current === y
+      if (!sameYear) {
+        baseYearRef.current = y
+        setBaseYear(y)
+      }
+
+      const baseTabText = sameYear
+        ? tabEditText ?? ""
+        : buildTabEditTextForTitleFromAllText(getWindowMemoTextSync(y, "all"), y, targetWindow.title)
+      const currentText = baseTabText
+      const blocksNow = parseBlocksAndItems(currentText, y).blocks
+      const existing = blocksNow.find((b) => b.dateKey === key)
+
+      if (existing) {
+        const ensured = ensureTabGroupLineAtDate(currentText, key, targetWindow.title, y)
+        if (ensured.newText !== currentText) {
+          pendingJumpRef.current = {
+            headerPos: ensured.headerPos ?? existing.headerStartPos,
+            caretPos: ensured.caretPos ?? existing.bodyStartPos,
+            topOffsetLines: 1
+          }
+          setTabEditText(ensured.newText)
+        } else {
+          scheduleJump(existing.headerStartPos, ensured.caretPos ?? existing.bodyStartPos, 1)
+        }
+      } else {
+        const targetTime = keyToTime(key)
+        const byDate = [...blocksNow].sort(
+          (a, b) => keyToTime(a.dateKey) - keyToTime(b.dateKey) || a.blockStartPos - b.blockStartPos
+        )
+
+        let insertPos = currentText.length
+        for (const b of byDate) {
+          if (keyToTime(b.dateKey) > targetTime) {
+            insertPos = b.blockStartPos
+            break
+          }
+        }
+
+        const headerLine = buildHeaderLine(y, m, d)
+        const { newText: insertedText, headerStartPos, bodyStartPos } = insertDateBlockAt(
+          currentText,
+          insertPos,
+          headerLine
+        )
+        pendingJumpRef.current = { headerPos: headerStartPos, caretPos: bodyStartPos, topOffsetLines: 1 }
+        const ensured = ensureTabGroupLineAtDate(insertedText, key, targetWindow.title, y)
+        pendingJumpRef.current.caretPos = ensured.caretPos ?? pendingJumpRef.current.caretPos
+        setTabEditText(ensured.newText)
+      }
+      return
+    }
 
     const switchingYear = baseYearRef.current !== y
 
@@ -1678,7 +2324,7 @@ useEffect(() => {
     const existing = blocksNow.find((b) => b.dateKey === key)
 
     if (existing) {
-      const { newText, caretPos } = ensureOneBlankLineAtBlockEnd(workingText, existing)
+      const { newText, caretPos } = ensureBodyLineForBlock(workingText, existing)
       pendingJumpRef.current = { headerPos: existing.headerStartPos, caretPos, topOffsetLines: 1 }
       if (newText !== workingText) workingText = newText
     } else {
@@ -1697,26 +2343,13 @@ useEffect(() => {
 
       const headerLine = buildHeaderLine(y, m, d)
       const { newText: insertedText, headerStartPos, bodyStartPos } = insertDateBlockAt(workingText, insertPos, headerLine)
-      let newText = insertedText
-      if (activeWindowId === "all") {
-        const labels = getIntegratedLabels(editableWindows, integratedFilters)
-        const labelsText = labels.length > 0 ? `\n${labels.join("\n")}\n` : ""
-        if (labelsText) {
-          newText = newText.slice(0, bodyStartPos) + labelsText + newText.slice(bodyStartPos)
-        }
-      }
+      const newText = insertedText
       pendingJumpRef.current = { headerPos: headerStartPos, caretPos: bodyStartPos, topOffsetLines: 1 }
       workingText = newText
     }
 
     if (switchingYear) {
-      if (activeWindowId === "all") {
-        syncCombinedText(workingText, y)
-      } else {
-        setWindowTextSync(y, activeWindowId, workingText)
-        overrideLoadRef.current = { year: y, text: workingText }
-      }
-
+      setLeftMemoTextSync(y, workingText)
       suppressSaveRef.current = true
       baseYearRef.current = y
       setBaseYear(y)
@@ -1727,8 +2360,7 @@ useEffect(() => {
 
     const currentSameYearText = (textareaRef.current ? textareaRef.current.value : textRef.current) ?? ""
     if (workingText !== currentSameYearText) {
-      if (activeWindowId === "all") updateEditorText(workingText)
-      else setText(workingText)
+      updateEditorText(workingText)
       textRef.current = workingText
       return
     }
@@ -1883,21 +2515,21 @@ useEffect(() => {
       saturday: "#2563eb"
     }
     const dark = {
-      bg: "#0b1220",
-      surface: "#0f172a",
-      surface2: "#111c33",
-      text: "#e5e7eb",
-      text2: "#9ca3af",
-      border: "#22304a",
-      border2: "#2b3b5c",
-      accent: "#60a5fa",
-      accentSoft: "rgba(96,165,250,0.18)",
-      shadow: "0 10px 28px rgba(0,0,0,0.45)",
+      bg: "#1b1c1f",
+      surface: "#202226",
+      surface2: "#25282d",
+      text: "#e6e8ec",
+      text2: "#bac0c9",
+      border: "#3a3d45",
+      border2: "#454955",
+      accent: "#7ea6ff",
+      accentSoft: "rgba(126,166,255,0.16)",
+      shadow: "0 8px 20px rgba(0,0,0,0.4)",
       radius: 12,
-      todayRing: "#38bdf8",
-      todaySoft: "rgba(56,189,248,0.18)",
-      holiday: "#f87171",
-      saturday: "#60a5fa"
+      todayRing: "#7ea6ff",
+      todaySoft: "rgba(126,166,255,0.16)",
+      holiday: "#ff8f8f",
+      saturday: "#8bb3ff"
     }
     return { light, dark }
   }, [])
@@ -1979,16 +2611,26 @@ useEffect(() => {
     zIndex: 0
   }
 
+
   function openDayList(key, items) {
     setDayListModal({ key, items })
+    setDayListMode("read")
   }
 
   function toggleLeftMemo() {
-    setMemoInnerCollapsed((prev) => (prev === "left" ? "none" : "left"))
+    setMemoInnerCollapsed((prev) => {
+      const next = prev === "left" ? "none" : "left"
+      setMemoCollapsedByWindow((map) => ({ ...map, [activeWindowId]: next }))
+      return next
+    })
   }
 
   function toggleRightMemo() {
-    setMemoInnerCollapsed((prev) => (prev === "right" ? "none" : "right"))
+    setMemoInnerCollapsed((prev) => {
+      const next = prev === "right" ? "none" : "right"
+      setMemoCollapsedByWindow((map) => ({ ...map, [activeWindowId]: next }))
+      return next
+    })
   }
 
   const memoTextareaStyle = {
@@ -2109,6 +2751,7 @@ useEffect(() => {
         flex: memoPanelFlex,
         minWidth: 0,
         minHeight: 0,
+        height: "100%",
         display: "flex",
         flexDirection: "column",
         borderRadius: ui.radius,
@@ -2462,6 +3105,7 @@ useEffect(() => {
     <div
       key={w.id}
       className={`tab-pill${isActive ? " is-active" : ""}`}
+      data-window-id={w.id}
                 style={{
                   position: "relative",
                   display: "inline-flex",
@@ -2667,13 +3311,14 @@ useEffect(() => {
         </button>
       </div>
       {/* ✅ 메모 2분할 + 내부 드래그 */}
-      <div style={{ minHeight: 0, padding: "6px 8px", marginTop: 0 }}>
+      <div style={{ flex: "1 1 auto", minHeight: 0, padding: "6px 8px", marginTop: 0 }}>
         <div
           ref={memoInnerWrapRef}
           style={{
             position: "relative",
             display: "flex",
             gap: memoInnerCollapsed === "none" ? MEMO_INNER_GAP : 0,
+            flex: "1 1 auto",
             height: "100%",
             minHeight: 0
           }}
@@ -2691,76 +3336,83 @@ useEffect(() => {
             }}
           >
             <div style={memoInputWrap}>
-              <div style={memoOverlay} aria-hidden="true">
-                <div ref={leftOverlayInnerRef} style={{ transform: "translateY(0px)", willChange: "transform" }}>
-                  {leftOverlayLines.map((line, i) => (
-                    <div
-                      key={`memo-left-line-${i}`}
-                      className={line.isHeader ? "memo-overlay__line memo-overlay__line--header" : "memo-overlay__line"}
-                    >
-                      {line.text === "" ? " " : line.text}
+              {isEditingLeftMemo ? (
+                <>
+                  <div style={memoOverlay} aria-hidden="true">
+                    <div ref={leftOverlayInnerRef} style={{ transform: "translateY(0px)", willChange: "transform" }}>
+                      {leftOverlayLines.map((line, i) => (
+                        <div
+                          key={`memo-left-line-${i}`}
+                          className={
+                            line.isHeader ? "memo-overlay__line memo-overlay__line--header" : "memo-overlay__line"
+                          }
+                        >
+                          {line.groupParts ? (
+                            <>
+                              <span className="memo-overlay__fn">{line.groupParts.prefix}</span>
+                              {line.groupParts.suffix ? <span>{line.groupParts.suffix}</span> : null}
+                            </>
+                          ) : line.text === "" ? (
+                            " "
+                          ) : (
+                            line.text
+                          )}
+                        </div>
+                      ))}
                     </div>
-                  ))}
-                </div>
-              </div>
-              <textarea
-                ref={textareaRef}
-                className="memo-input"
-                value={text}
-                onChange={(e) => {
-                  const next = e.target.value
-                  if (activeWindowId === "all") updateEditorText(next)
-                  else setText(next)
-                }}
-                onKeyDown={(e) => {
-                  if (e.key !== "Enter" || activeWindowId !== "all") return
-                  const ta = textareaRef.current
-                  if (!ta) return
-                  const value = ta.value ?? ""
-                  const start = ta.selectionStart ?? 0
-                  const end = ta.selectionEnd ?? start
-                  if (start !== end) return
-
-                  const lineStart = value.lastIndexOf("\n", start - 1) + 1
-                  const lineEnd = (() => {
-                    const idx = value.indexOf("\n", start)
-                    return idx === -1 ? value.length : idx
-                  })()
-
-                  if (start !== lineEnd) return
-
-                  const line = value.slice(lineStart, lineEnd).trim()
-                  const dateKey = getDateKeyFromLine(line, baseYear)
-                  if (!dateKey) return
-                  const { m, d } = keyToYMD(dateKey)
-                  const headerLine = buildHeaderLine(baseYear, m, d)
-
-                const labels = getIntegratedLabels(editableWindows, integratedFilters)
-                if (labels.length === 0) return
-                const parsedNow = parseBlocksAndItems(value, baseYear)
-                const blockNow = parsedNow.blocks.find((b) => b.dateKey === dateKey)
-                if (blockNow && !isBlockBodyEmpty(value, blockNow)) return
-
-                e.preventDefault()
-                  const before = value.slice(0, lineStart)
-                  const after = value.slice(lineEnd)
-                  const insert = `\n\n${labels.join("\n")}\n`
-                  const newText = `${before}${headerLine}${insert}${after}`
-                  const caretPos = lineStart + headerLine.length + 1
-                  updateEditorText(newText)
-                  requestAnimationFrame(() => {
-                    const ta2 = textareaRef.current
-                    if (ta2) ta2.setSelectionRange(caretPos, caretPos)
-                  })
-                }}
-                onBlur={onTextareaBlur}
-                onClick={onTextareaSelectOrKeyUp}
-                onKeyUp={onTextareaSelectOrKeyUp}
-                onSelect={onTextareaSelectOrKeyUp}
-                onWheel={onMemoWheel}
-                onScroll={(e) => syncOverlayScroll(e.currentTarget, leftOverlayInnerRef.current)}
-                style={memoTextareaStyle}
-                placeholder={`왼쪽 메모장(기존 기능)
+                  </div>
+                  {mentionGhostText ? (
+                    <div
+                      aria-hidden="true"
+                      style={{
+                        position: "absolute",
+                        top: mentionGhostPos.top,
+                        left: mentionGhostPos.left,
+                        fontSize: memoFontPx,
+                        lineHeight: 1.55,
+                        fontFamily: "inherit",
+                        fontWeight: 400,
+                        color: ui.text2,
+                        whiteSpace: "pre",
+                        pointerEvents: "none",
+                        zIndex: 2
+                      }}
+                    >
+                      {mentionGhostText}
+                    </div>
+                  ) : null}
+                  <textarea
+                    ref={textareaRef}
+                    className="memo-input"
+                    value={activeWindowId === "all" ? text : tabEditText}
+                    onFocus={() => {
+                      setIsEditingLeftMemo(true)
+                      requestAnimationFrame(() => updateMentionGhost())
+                    }}
+                    onChange={(e) => {
+                      handleLeftMemoChange(e)
+                      updateMentionGhost()
+                    }}
+                    onBlur={onTextareaBlur}
+                    onClick={onTextareaSelectOrKeyUp}
+                    onKeyUp={onTextareaSelectOrKeyUp}
+                    onKeyDown={(e) => {
+                      if (acceptMentionGhost(e)) return
+                      handleBoxEnterKey(
+                        e,
+                        activeWindowId === "all" ? text : tabEditText,
+                        textareaRef,
+                        activeWindowId === "all" ? updateEditorText : setTabEditText
+                      )
+                    }}
+                    onSelect={onTextareaSelectOrKeyUp}
+                    onWheel={onMemoWheel}
+                    onScroll={(e) => {
+                      syncOverlayScroll(e.currentTarget, leftOverlayInnerRef.current)
+                      updateMentionGhost()
+                    }}
+                    style={memoTextareaStyle}
+                    placeholder={`왼쪽 메모장(기존 기능)
 
 1) 달력에서 날짜를 클릭하면, 메모에 날짜가 자동으로 생깁니다.
 2) 그 아래 줄에 할 일을 적으면 됩니다.
@@ -2771,7 +3423,119 @@ useEffect(() => {
 장보기
 운동
 `}
-              />
+                  />
+                </>
+              ) : (
+                <div
+                  onClick={enterEditMode}
+                  style={{
+                    width: "100%",
+                    height: "100%",
+                    border: `1px solid ${ui.border}`,
+                    borderRadius: 12,
+                    background: ui.surface,
+                    padding: "12px 12px",
+                    overflow: "auto",
+                    fontSize: memoFontPx,
+                    lineHeight: 1.25
+                  }}
+                >
+                  {(activeWindowId === "all" ? dashboardBlocks : tabReadBlocks).length === 0 ? (
+                    <div style={{ color: ui.text2, fontWeight: 600 }}>내용이 없습니다.</div>
+                  ) : (
+                    (activeWindowId === "all" ? dashboardBlocks : tabReadBlocks).map((block) => {
+                      const { y, m, d } = keyToYMD(block.dateKey)
+                      const header = buildHeaderLine(y, m, d)
+                      const isCollapsed = Boolean(collapsedForActive[block.dateKey])
+                      const isAll = activeWindowId === "all"
+                      const activeWindow = windows.find((w) => w.id === activeWindowId)
+                      const matchedGroups = isAll ? block.groups : []
+                      const hasContent = isAll
+                        ? block.general.length > 0 || matchedGroups.length > 0
+                        : Array.isArray(block.items) && block.items.length > 0
+                      if (!hasContent) return null
+                      return (
+                        <div key={block.dateKey} style={{ marginBottom: 16 }}>
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "space-between",
+                              gap: 8,
+                              fontWeight: 900
+                            }}
+                          >
+                            <div>{header}</div>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                toggleDashboardCollapse(block.dateKey)
+                              }}
+                              style={{
+                                border: `1px solid ${ui.border}`,
+                                background: ui.surface,
+                                color: ui.text2,
+                                borderRadius: 999,
+                                width: 24,
+                                height: 24,
+                                cursor: "pointer",
+                                fontWeight: 900,
+                                lineHeight: 1
+                              }}
+                              title={isCollapsed ? "펼치기" : "접기"}
+                            >
+                              {isCollapsed ? "▸" : "▾"}
+                            </button>
+                          </div>
+                          {!isCollapsed && (
+                            <div style={{ marginTop: 4, display: "flex", flexDirection: "column", gap: 2 }}>
+                              {isAll ? (
+                                <>
+                                  {block.general.map((line, idx) => (
+                                    <div
+                                      key={`${block.dateKey}-general-${idx}`}
+                                      style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}
+                                    >
+                                      {line}
+                                    </div>
+                                  ))}
+                                  {matchedGroups.map((group, gi) => (
+                                    <div key={`${block.dateKey}-group-${gi}`} style={{ marginTop: 4 }}>
+                                      <div style={{ fontWeight: 900, color: ui.text }}>[{group.title}]</div>
+                                      <div style={{ marginTop: 2, display: "flex", flexDirection: "column", gap: 2 }}>
+                                        {group.items.map((item, ii) => (
+                                          <div
+                                            key={`${block.dateKey}-group-${gi}-item-${ii}`}
+                                            style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}
+                                          >
+                                            {item}
+                                          </div>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  ))}
+                                </>
+                              ) : (
+                                <>
+                                  {(block.items ?? []).map((item, ii) => (
+                                    <div
+                                      key={`${block.dateKey}-${activeWindow?.id ?? "tab"}-item-${ii}`}
+                                      style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}
+                                    >
+                                      {item}
+                                    </div>
+                                  ))}
+                                </>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })
+                  )}
+                </div>
+              )}
             </div>
           </div>
 
@@ -2791,7 +3555,16 @@ useEffect(() => {
                       key={`memo-right-line-${i}`}
                       className={line.isHeader ? "memo-overlay__line memo-overlay__line--header" : "memo-overlay__line"}
                     >
-                      {line.text === "" ? " " : line.text}
+                      {line.groupParts ? (
+                        <>
+                          <span className="memo-overlay__fn">{line.groupParts.prefix}</span>
+                          {line.groupParts.suffix ? <span>{line.groupParts.suffix}</span> : null}
+                        </>
+                      ) : line.text === "" ? (
+                        " "
+                      ) : (
+                        line.text
+                      )}
                     </div>
                   ))}
                 </div>
@@ -3256,14 +4029,14 @@ useEffect(() => {
                           minWidth: 0
                         }}
                       >
-                        {(it.color || (activeWindowId !== "all" && activeWindowColor)) && (
+                        {it.color && (
                           <span
                             title={it.sourceTitle ? `[${it.sourceTitle}]` : "항목"}
                             style={{
                               width: 6,
                               height: 6,
                               borderRadius: 999,
-                              background: it.color || activeWindowColor,
+                              background: it.color,
                               flexShrink: 0,
                               marginTop: 4
                             }}
@@ -3539,19 +4312,35 @@ useEffect(() => {
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                 <button
                   type="button"
-                  onClick={confirmDayListEdit}
+                  onClick={() => setDayListMode("read")}
                   style={{
                     height: 28,
                     padding: "0 10px",
                     borderRadius: 8,
                     border: `1px solid ${ui.border}`,
-                    background: ui.surface,
-                    color: ui.text,
+                    background: dayListMode === "read" ? ui.accent : ui.surface,
+                    color: dayListMode === "read" ? "#fff" : ui.text,
                     cursor: "pointer",
                     fontWeight: 800
                   }}
                 >
-                  확인
+                  읽기모드
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDayListMode("edit")}
+                  style={{
+                    height: 28,
+                    padding: "0 10px",
+                    borderRadius: 8,
+                    border: `1px solid ${ui.border}`,
+                    background: dayListMode === "edit" ? ui.accent : ui.surface,
+                    color: dayListMode === "edit" ? "#fff" : ui.text,
+                    cursor: "pointer",
+                    fontWeight: 800
+                  }}
+                >
+                  편집모드
                 </button>
                 <button
                   type="button"
@@ -3571,31 +4360,86 @@ useEffect(() => {
                 </button>
               </div>
             </div>
-            <textarea
-              value={dayListEditText}
-              onChange={(e) => {
-                const next = e.target.value
-                setDayListEditText(next)
-                applyDayListEdit(next)
-              }}
-              placeholder="할 일을 입력하세요"
-              style={{
-                marginTop: 10,
-                width: "100%",
-                minHeight: 260,
-                maxHeight: "60vh",
-                padding: "10px 12px",
-                borderRadius: 10,
-                border: `1px solid ${ui.border2}`,
-                background: ui.surface2,
-                color: ui.text,
-                fontSize: 13,
-                lineHeight: 1.6,
-                fontFamily: "inherit",
-                fontWeight: 600,
-                resize: "vertical"
-              }}
-            />
+            {dayListMode === "edit" ? (
+              <textarea
+                value={dayListEditText}
+                onChange={(e) => {
+                  const next = e.target.value
+                  setDayListEditText(next)
+                  applyDayListEdit(next)
+                }}
+                placeholder="할 일을 입력하세요"
+                style={{
+                  marginTop: 10,
+                  width: "100%",
+                  minHeight: 260,
+                  maxHeight: "60vh",
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: `1px solid ${ui.border2}`,
+                  background: ui.surface2,
+                  color: ui.text,
+                  fontSize: 13,
+                  lineHeight: 1.6,
+                  fontFamily: "inherit",
+                  fontWeight: 600,
+                  resize: "vertical"
+                }}
+              />
+            ) : (
+              <div
+                style={{
+                  marginTop: 10,
+                  width: "100%",
+                  minHeight: 260,
+                  maxHeight: "60vh",
+                  padding: "12px",
+                  borderRadius: 10,
+                  border: `1px solid ${ui.border2}`,
+                  background: ui.surface2,
+                  color: ui.text,
+                  fontSize: memoFontPx,
+                  lineHeight: 1.28,
+                  fontFamily: "inherit",
+                  fontWeight: 600,
+                  overflowY: "auto"
+                }}
+              >
+                {dayListView ? (
+                  <>
+                    {dayListView.general.map((line, idx) => (
+                      <div key={`daylist-general-${idx}`} style={{ color: ui.text, marginBottom: 4 }}>
+                        {line}
+                      </div>
+                    ))}
+                    {dayListView.groups
+                      .map((group, idx) => ({ group, idx }))
+                      .sort((a, b) => {
+                        const rankA = windowTitleRank.get(a.group.title) ?? Number.MAX_SAFE_INTEGER
+                        const rankB = windowTitleRank.get(b.group.title) ?? Number.MAX_SAFE_INTEGER
+                        if (rankA !== rankB) return rankA - rankB
+                        return a.idx - b.idx
+                      })
+                      .map((entry) => entry.group)
+                      .map((group, gi) => (
+                        <div key={`daylist-group-${gi}`} style={{ marginTop: gi === 0 && dayListView.general.length ? 12 : 8 }}>
+                          <div style={{ fontWeight: 900 }}>[{group.title}]</div>
+                          <div style={{ marginTop: 4, display: "flex", flexDirection: "column", gap: 2 }}>
+                            {group.items.map((item, ii) => (
+                              <div key={`daylist-group-${gi}-item-${ii}`}>{item}</div>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    {dayListView.general.length === 0 && dayListView.groups.length === 0 && (
+                      <div style={{ color: ui.text2 }}>내용이 없습니다.</div>
+                    )}
+                  </>
+                ) : (
+                  <span style={{ color: ui.text2 }}>내용이 없습니다.</span>
+                )}
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -3618,8 +4462,11 @@ useEffect(() => {
           font-weight: 400;
         }
         .memo-overlay__line--header {
-          font-weight: 400;
-          text-shadow: 0 0 0 currentColor, 0.6px 0 0 currentColor, -0.6px 0 0 currentColor;
+          font-weight: 520;
+          text-shadow: 0 0 0 currentColor, 0.2px 0 0 currentColor, -0.2px 0 0 currentColor;
+        }
+        .memo-overlay__fn {
+          font-weight: 600;
         }
         .tab-pill__delete {
           opacity: 0;
