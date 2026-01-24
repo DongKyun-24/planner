@@ -765,7 +765,26 @@ function App() {
   } catch {}
   }
 
-  const WINDOW_COLORS = ["#2563eb", "#22c55e", "#ef4444", "#a855f7", "#f59e0b", "#14b8a6"]
+  const WINDOW_COLORS = [
+    "#c40000", // 153 red
+    "#ff7a00", // 1201 orange
+    "#ff4a00", // 255 fluorescent orange
+    "#ffe94a", // 355 yellow
+    "#ffd21a", // 356 deep yellow
+    "#dff08a", // 452 pale yellow-green
+    "#86e000", // 455 light green
+    "#0b7a0b", // 457 green
+    "#0a5a1f", // 460 deep green
+    "#7fe8d2", // 463 jade
+    "#98ddff", // 1501 sky
+    "#cfe0ff", // 551 light sky
+    "#14a7d8", // 553 deep sky
+    "#1f33d6", // 558 blue
+    "#1b0f7d", // 562 navy
+    "#6b2e8f", // 654 purple
+    "#e1c2ff", // 657 lavender
+    "#ffd1e7" // 656 light pink
+  ]
 
   function nextColor(cur) {
     const i = WINDOW_COLORS.indexOf(cur)
