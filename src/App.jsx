@@ -722,6 +722,7 @@ function App() {
   const markerRef = useRef(null)
   const leftOverlayInnerRef = useRef(null)
   const rightOverlayInnerRef = useRef(null)
+  const readBlockRefs = useRef(new Map())
 
   // ===== 창(캘린더) 탭 =====
   const WINDOWS_KEY = "planner-windows-v1"
@@ -1897,6 +1898,11 @@ useEffect(() => {
   }
 
   function enterEditMode() {
+    const targetKey = selectedDateKey ?? lastEditedDateKey ?? lastActiveDateKeyRef.current
+    if (targetKey) {
+      handleReadBlockClick(targetKey)
+      return
+    }
     setIsEditingLeftMemo(true)
     requestAnimationFrame(() => {
       const el = textareaRef.current
@@ -1904,8 +1910,55 @@ useEffect(() => {
     })
   }
 
+  function handleReadBlockClick(dateKey) {
+    if (!dateKey) return
+    setActiveDateKey(dateKey)
+    setIsEditingLeftMemo(true)
+    requestAnimationFrame(() => {
+      const el = textareaRef.current
+      if (el) el.focus()
+    })
+
+    if (activeWindowId === "all") {
+      const sourceText = textRef.current ?? text
+      const parsedSource = parseBlocksAndItems(sourceText ?? "", baseYear)
+      const block = parsedSource.blocks.find((b) => b.dateKey === dateKey)
+      if (!block) return
+
+      const ensured = ensureBodyLineForBlock(sourceText ?? "", block)
+      if (ensured.newText !== (sourceText ?? "")) {
+        pendingJumpRef.current = {
+          headerPos: block.headerStartPos,
+          caretPos: ensured.caretPos,
+          topOffsetLines: 1
+        }
+        updateEditorText(ensured.newText)
+      } else {
+        scheduleJump(block.headerStartPos, ensured.caretPos, 1)
+      }
+      return
+    }
+
+    const targetWindow = windows.find((w) => w.id === activeWindowId)
+    if (!targetWindow) return
+    const sourceText = tabEditText ?? ""
+    const ensured = ensureTabGroupLineAtDate(sourceText, dateKey, targetWindow.title, baseYear)
+    const headerPos = ensured.headerPos ?? 0
+    const caretPos = ensured.caretPos ?? 0
+    if (ensured.newText !== sourceText) {
+      pendingJumpRef.current = { headerPos, caretPos, topOffsetLines: 1 }
+      setTabEditText(ensured.newText)
+    } else {
+      scheduleJump(headerPos, caretPos, 1)
+    }
+  }
+
+  const READ_SCROLL_MARGIN_TOP = 16
+
   // ===== 선택된 날짜 =====
   const [selectedDateKey, setSelectedDateKey] = useState(null)
+  const [lastEditedDateKey, setLastEditedDateKey] = useState(null)
+  const [hoveredReadDateKey, setHoveredReadDateKey] = useState(null)
   const lastActiveDateKeyRef = useRef(null)
   const calendarInteractingRef = useRef(false)
   const [dayListModal, setDayListModal] = useState(null)
@@ -1915,6 +1968,25 @@ useEffect(() => {
     if (!dayListModal) return null
     return parseDashboardBlockContent(dayListEditText)
   }, [dayListModal, dayListEditText])
+
+  const setReadBlockRef = useCallback((dateKey) => {
+    return (el) => {
+      const map = readBlockRefs.current
+      if (!map) return
+      if (el) map.set(dateKey, el)
+      else map.delete(dateKey)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (isEditingLeftMemo) return
+    if (!lastEditedDateKey) return
+    const target = readBlockRefs.current?.get(lastEditedDateKey)
+    if (!target) return
+    requestAnimationFrame(() => {
+      target.scrollIntoView({ block: "start", behavior: "smooth" })
+    })
+  }, [isEditingLeftMemo, lastEditedDateKey, activeWindowId])
 
   useEffect(() => {
     if (!dayListModal) {
@@ -1931,6 +2003,7 @@ useEffect(() => {
     if (!key) return
     lastActiveDateKeyRef.current = key
     setSelectedDateKey(key)
+    setLastEditedDateKey(key)
 
     const { y, m } = keyToYMD(key)
     if (viewRef.current.year !== y || viewRef.current.month !== m) {
@@ -2175,6 +2248,7 @@ useEffect(() => {
       updateEditorText(normalized)
     }
     if (!calendarInteractingRef.current) {
+      if (selectedDateKey) setLastEditedDateKey(selectedDateKey)
       setSelectedDateKey(null)
       lastActiveDateKeyRef.current = null
     }
@@ -2259,15 +2333,21 @@ useEffect(() => {
 
   // ===== Today 버튼 동작 =====
   function goToday() {
+    const y = today.getFullYear()
+    const m = today.getMonth() + 1
+    const d = today.getDate()
+    const key = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`
+
+    if (!isEditingLeftMemo) {
+      setActiveDateKey(key)
+      return
+    }
+
     setIsEditingLeftMemo(true)
     requestAnimationFrame(() => {
       const el = textareaRef.current
       if (el) el.focus()
     })
-    const y = today.getFullYear()
-    const m = today.getMonth() + 1
-    const d = today.getDate()
-    const key = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`
 
     setView({ year: y, month: m })
     viewRef.current = { year: y, month: m }
@@ -2571,6 +2651,8 @@ useEffect(() => {
     boxShadow: theme === "dark" ? "none" : "0 1px 0 rgba(15, 23, 42, 0.04)"
   }
 
+  // navArrowButton removed (reverted to original iconButton usage)
+
   const memoTopRightButton = {
     ...iconButton,
     width: 36,
@@ -2644,7 +2726,7 @@ useEffect(() => {
 
   function toggleLeftMemo() {
     setMemoInnerCollapsed((prev) => {
-      const next = prev === "left" ? "none" : "left"
+      const next = prev === "right" ? "none" : "right"
       setMemoCollapsedByWindow((map) => ({ ...map, [activeWindowId]: next }))
       return next
     })
@@ -2652,7 +2734,7 @@ useEffect(() => {
 
   function toggleRightMemo() {
     setMemoInnerCollapsed((prev) => {
-      const next = prev === "right" ? "none" : "right"
+      const next = prev === "left" ? "none" : "left"
       setMemoCollapsedByWindow((map) => ({ ...map, [activeWindowId]: next }))
       return next
     })
@@ -2685,6 +2767,8 @@ useEffect(() => {
 
   const isLeftCollapsed = memoInnerCollapsed === "left"
   const isRightCollapsed = memoInnerCollapsed === "right"
+  const leftButtonOpacity = isLeftCollapsed ? 0.4 : 1
+  const rightButtonOpacity = isRightCollapsed ? 0.4 : 1
   const leftMemoFlex = isLeftCollapsed ? "0 0 0px" : isRightCollapsed ? "1 1 0" : `0 0 ${memoInnerSplit * 100}%`
   const rightMemoFlex = isRightCollapsed ? "0 0 0px" : "1 1 0"
 
@@ -2786,27 +2870,27 @@ useEffect(() => {
         overflow: "hidden"
       }}
     >
-      <div
-        style={{
-          padding: "8px 12px",
-          borderBottom: `1px solid ${ui.border}`,
-          background: ui.surface2,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          gap: 10,
-          minWidth: 0,
-          position: "relative"
-        }}
-      >
-        <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-          <button onClick={basePrevYear} style={iconButton} title="이전 연도" aria-label="이전 연도">
-            ◀
-          </button>
-          <div style={{ fontWeight: 900 }}>{baseYear}</div>
-          <button onClick={baseNextYear} style={iconButton} title="다음 연도" aria-label="다음 연도">
-            ▶
-          </button>
+        <div
+          style={{
+            padding: "8px 12px",
+            borderBottom: `1px solid ${ui.border}`,
+            background: ui.surface2,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 10,
+            minWidth: 0,
+            position: "relative"
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+            <button onClick={basePrevYear} style={iconButton} title="이전 연도" aria-label="이전 연도">
+              ◀
+            </button>
+            <div style={{ fontWeight: 900 }}>{baseYear}</div>
+            <button onClick={baseNextYear} style={iconButton} title="다음 연도" aria-label="다음 연도">
+              ▶
+            </button>
           <button
             onClick={goToday}
             style={{ ...pillButton, padding: "0 10px 2px", borderRadius: 12, lineHeight: 1 }}
@@ -2826,49 +2910,49 @@ useEffect(() => {
               overflow: "hidden"
             }}
           >
-            <button
-              onClick={toggleLeftMemo}
-              style={{
-                width: 30,
-                height: 32,
-                border: "none",
-                background: "transparent",
-                color: ui.text,
-                cursor: "pointer",
-                fontWeight: 800,
-                lineHeight: 1,
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
-                opacity: isLeftCollapsed ? 0.4 : 1
-              }}
-              title={isLeftCollapsed ? "왼쪽 메모 펼치기" : "왼쪽 메모 접기"}
-              aria-label={isLeftCollapsed ? "왼쪽 메모 펼치기" : "왼쪽 메모 접기"}
-            >
-              L
-            </button>
+              <button
+                onClick={toggleLeftMemo}
+                style={{
+                  width: 30,
+                  height: 32,
+                  border: "none",
+                  background: "transparent",
+                  color: ui.text,
+                  cursor: "pointer",
+                  fontWeight: 800,
+                  lineHeight: 1,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  opacity: leftButtonOpacity
+                }}
+                title={isRightCollapsed ? "오른쪽 메모 펼치기" : "오른쪽 메모 접기"}
+                aria-label={isRightCollapsed ? "오른쪽 메모 펼치기" : "오른쪽 메모 접기"}
+              >
+                L
+              </button>
             <div style={{ width: 1, height: 32, background: ui.border2 }} />
-            <button
-              onClick={toggleRightMemo}
-              style={{
-                width: 30,
-                height: 32,
-                border: "none",
-                background: "transparent",
-                color: ui.text,
-                cursor: "pointer",
-                fontWeight: 800,
-                lineHeight: 1,
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
-                opacity: isRightCollapsed ? 0.4 : 1
-              }}
-              title={isRightCollapsed ? "오른쪽 메모 펼치기" : "오른쪽 메모 접기"}
-              aria-label={isRightCollapsed ? "오른쪽 메모 펼치기" : "오른쪽 메모 접기"}
-            >
-              R
-            </button>
+              <button
+                onClick={toggleRightMemo}
+                style={{
+                  width: 30,
+                  height: 32,
+                  border: "none",
+                  background: "transparent",
+                  color: ui.text,
+                  cursor: "pointer",
+                  fontWeight: 800,
+                  lineHeight: 1,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  opacity: rightButtonOpacity
+                }}
+                title={isLeftCollapsed ? "왼쪽 메모 펼치기" : "왼쪽 메모 접기"}
+                aria-label={isLeftCollapsed ? "왼쪽 메모 펼치기" : "왼쪽 메모 접기"}
+              >
+                R
+              </button>
           </div>
         </div>
 
@@ -2938,9 +3022,9 @@ useEffect(() => {
               )}
             </div>
           )}
-          <button
-            ref={settingsBtnRef}
-            onClick={() => setSettingsOpen((v) => !v)}
+            <button
+              ref={settingsBtnRef}
+              onClick={() => setSettingsOpen((v) => !v)}
             title="설정"
             aria-label="설정"
             style={{
@@ -2966,6 +3050,16 @@ useEffect(() => {
             </svg>
               </button>
           {layoutPreset === "memo-left" && (
+            <button
+              onClick={() => setLayoutPreset((p) => (p === "memo-left" ? "calendar-left" : "memo-left"))}
+              style={{ ...memoTopRightButton, fontSize: 12, fontWeight: 900 }}
+              title="메모/달력 위치 변경"
+              aria-label="메모/달력 위치 변경"
+            >
+              ⇆
+            </button>
+          )}
+          {outerCollapsed === "left" && (
             <button
               onClick={() => setLayoutPreset((p) => (p === "memo-left" ? "calendar-left" : "memo-left"))}
               style={{ ...memoTopRightButton, fontSize: 12, fontWeight: 900 }}
@@ -3464,6 +3558,7 @@ useEffect(() => {
                     borderRadius: 12,
                     background: ui.surface,
                     padding: "12px 12px",
+                    paddingBottom: 400,
                     overflow: "auto",
                     fontSize: memoFontPx,
                     lineHeight: 1.25
@@ -3484,7 +3579,26 @@ useEffect(() => {
                         : Array.isArray(block.items) && block.items.length > 0
                       if (!hasContent) return null
                       return (
-                        <div key={block.dateKey} style={{ marginBottom: 16 }}>
+                        <div
+                          key={block.dateKey}
+                          ref={setReadBlockRef(block.dateKey)}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            handleReadBlockClick(block.dateKey)
+                          }}
+                          onMouseEnter={() => setHoveredReadDateKey(block.dateKey)}
+                          onMouseLeave={() => {
+                            setHoveredReadDateKey((prev) => (prev === block.dateKey ? null : prev))
+                          }}
+                          style={{
+                            marginBottom: 16,
+                            scrollMarginTop: READ_SCROLL_MARGIN_TOP,
+                            cursor: "pointer",
+                            border: hoveredReadDateKey === block.dateKey ? `1px solid ${ui.accent}` : "1px solid transparent", 
+                            borderRadius: 10,
+                            padding: "6px 8px"
+                          }}
+                        >
                           <div
                             style={{
                               display: "flex",
@@ -3836,7 +3950,7 @@ useEffect(() => {
           </div>
 
           <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
-            {layoutPreset === "calendar-left" && (
+            {(layoutPreset === "calendar-left" || outerCollapsed === "left") && (
               <button
                 onClick={() => setLayoutPreset((p) => (p === "memo-left" ? "calendar-left" : "memo-left"))}
                 style={{ ...pillButton, padding: "0 10px" }}
