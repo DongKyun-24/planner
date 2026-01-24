@@ -2571,6 +2571,12 @@ useEffect(() => {
     boxShadow: theme === "dark" ? "none" : "0 1px 0 rgba(15, 23, 42, 0.04)"
   }
 
+  const memoTopRightButton = {
+    ...iconButton,
+    width: 36,
+    height: 34
+  }
+
   const controlInput = {
     height: 34,
     padding: "0 10px",
@@ -2869,23 +2875,21 @@ useEffect(() => {
         <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
           {activeWindowId === "all" && (
             <div style={{ position: "relative" }}>
-              <button
-                ref={filterBtnRef}
-                onClick={() => setFilterOpen((v) => !v)}
-                style={{
-                  ...pillButton,
-                  padding: 0,
-                  fontSize: 22,
-                  width: 36,
-                  height: 32,
-                  display: "inline-flex",
-                  alignItems: "center",
-                  justifyContent: "center"
-                }}
+            <button
+              ref={filterBtnRef}
+              onClick={() => setFilterOpen((v) => !v)}
+              style={{
+                ...memoTopRightButton,
+                padding: 0,
+                fontSize: 26,
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center"
+              }}
                 title="통합 필터"
                 aria-label="통합 필터"
               >
-                <span style={{ display: "inline-block", transform: "translateY(-1px)" }}>≡</span>
+                <span style={{ display: "inline-block", transform: "translateY(-1.5px)" }}>≡</span>
               </button>
               {filterOpen && (
                 <div
@@ -2940,25 +2944,31 @@ useEffect(() => {
             title="설정"
             aria-label="설정"
             style={{
-              width: 38,
-              height: 34,
-              borderRadius: 10,
-              border: `1px solid ${ui.border}`,
-              background: ui.surface,
-              color: ui.text,
-              cursor: "pointer",
-              fontWeight: 900,
-              display: "inline-flex",
-              alignItems: "center",
-              justifyContent: "center"
+              ...memoTopRightButton,
+              fontSize: 18,
+              color: ui.text
             }}
           >
-            ⚙️
+            <svg
+              width="22"
+              height="22"
+              viewBox="0 0 24 24"
+              aria-hidden="true"
+              focusable="false"
+              style={{ transform: "translateY(1px) scale(1.02)" }}
+            >
+              <path
+                fill="currentColor"
+                fillRule="evenodd"
+                d="M11.983 2.25c-.267 0-.52.04-.76.115l-.6 1.95a.75.75 0 0 1-.428.48l-.9.39a.75.75 0 0 1-.636-.02l-1.823-1.07a9.029 9.029 0 0 0-1.354 1.354l1.07 1.823a.75.75 0 0 1 .02.636l-.39.9a.75.75 0 0 1-.48.428l-1.95.6a9.05 9.05 0 0 0 0 1.52l1.95.6a.75.75 0 0 1 .48.428l.39.9a.75.75 0 0 1-.02.636l-1.07 1.823a9.029 9.029 0 0 0 1.354 1.354l1.823-1.07a.75.75 0 0 1 .636-.02l.9.39a.75.75 0 0 1 .428.48l.6 1.95a9.05 9.05 0 0 0 1.52 0l.6-1.95a.75.75 0 0 1 .428-.48l.9-.39a.75.75 0 0 1 .636.02l1.823 1.07a9.029 9.029 0 0 0 1.354-1.354l-1.07-1.823a.75.75 0 0 1-.02-.636l.39-.9a.75.75 0 0 1 .48-.428l1.95-.6a9.05 9.05 0 0 0 0-1.52l-1.95-.6a.75.75 0 0 1-.48-.428l-.39-.9a.75.75 0 0 1 .02-.636l1.07-1.823a9.029 9.029 0 0 0-1.354-1.354l-1.823 1.07a.75.75 0 0 1-.636.02l-.9-.39a.75.75 0 0 1-.428-.48l-.6-1.95a9.05 9.05 0 0 0-.76-.115Zm.017 5.25a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z"
+                clipRule="evenodd"
+              />
+            </svg>
               </button>
           {layoutPreset === "memo-left" && (
             <button
               onClick={() => setLayoutPreset((p) => (p === "memo-left" ? "calendar-left" : "memo-left"))}
-              style={{ ...pillButton, padding: "0 10px" }}
+              style={{ ...memoTopRightButton, fontSize: 12, fontWeight: 900 }}
               title="메모/달력 위치 변경"
               aria-label="메모/달력 위치 변경"
             >
@@ -3690,29 +3700,132 @@ useEffect(() => {
             minWidth: 0
           }}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-            <input
-              type="number"
-              value={ymYear}
-              onChange={(e) => setYmYear(e.target.value)}
-              style={{ ...controlInput, width: 84 }}
-              aria-label="연도 입력"
-            />
-            <select
-              value={ymMonth}
-              onChange={(e) => setYmMonth(Number(e.target.value))}
-              style={{ ...controlInput, width: 84 }}
-              aria-label="월 선택"
-            >
-              {Array.from({ length: 12 }).map((_, i) => {
-                const m = i + 1
-                return (
-                  <option key={m} value={m}>
-                    {m}월
-                  </option>
-                )
-              })}
-            </select>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+            <div style={{ position: "relative", display: "inline-flex", alignItems: "center" }}>
+              <input
+                type="number"
+                value={ymYear}
+                onChange={(e) => setYmYear(e.target.value)}
+                style={{ ...controlInput, width: 76, padding: "0 24px 0 10px" }}
+                aria-label="연도 입력"
+              />
+              <span
+                aria-hidden="true"
+                style={{
+                  position: "absolute",
+                  right: 8,
+                  top: "50%",
+                  marginTop: 0.5,
+                  transform: "translateY(-50%)",
+                  display: "inline-flex",
+                  flexDirection: "column",
+                  gap: 1
+                }}
+              >
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = Number(ymYear)
+                    setYmYear(Number.isFinite(next) ? next + 1 : view.year + 1)
+                  }}
+                  style={{
+                    width: 14,
+                    height: 12,
+                    padding: 0,
+                    border: "none",
+                    background: "transparent",
+                    color: ui.text,
+                    cursor: "pointer",
+                    lineHeight: 1
+                  }}
+                  aria-label="연도 증가"
+                >
+                  <svg width="14" height="12" viewBox="0 0 20 20" fill="none">
+                    <path
+                      d="M5 13l5-5 5 5"
+                      stroke="currentColor"
+                      strokeWidth="3.2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = Number(ymYear)
+                    setYmYear(Number.isFinite(next) ? next - 1 : view.year - 1)
+                  }}
+                  style={{
+                    width: 14,
+                    height: 12,
+                    padding: 0,
+                    border: "none",
+                    background: "transparent",
+                    color: ui.text,
+                    cursor: "pointer",
+                    lineHeight: 1
+                  }}
+                  aria-label="연도 감소"
+                >
+                  <svg width="14" height="12" viewBox="0 0 20 20" fill="none">
+                    <path
+                      d="M5 7l5 5 5-5"
+                      stroke="currentColor"
+                      strokeWidth="3.2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                </button>
+              </span>
+            </div>
+            <div style={{ position: "relative", display: "inline-flex", alignItems: "center" }}>
+              <select
+                value={ymMonth}
+                onChange={(e) => setYmMonth(Number(e.target.value))}
+                style={{
+                  ...controlInput,
+                  width: 72,
+                  padding: "0 20px 0 8px",
+                  appearance: "none",
+                  WebkitAppearance: "none",
+                  MozAppearance: "none"
+                }}
+                aria-label="월 선택"
+              >
+                {Array.from({ length: 12 }).map((_, i) => {
+                  const m = i + 1
+                  return (
+                    <option key={m} value={m}>
+                      {m}월
+                    </option>
+                  )
+                })}
+              </select>
+              <span
+                aria-hidden="true"
+                style={{
+                  position: "absolute",
+                  right: 7,
+                  top: "50%",
+                  marginTop: 1,
+                  transform: "translateY(-50%)",
+                  pointerEvents: "none",
+                  color: ui.text
+                }}
+              >
+                <svg width="14" height="14" viewBox="0 0 20 20" fill="none">
+                  <path
+                    d="M5 7l5 5 5-5"
+                    stroke="currentColor"
+                    strokeWidth="2.4"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              </span>
+            </div>
 
             <button onClick={goPrevMonth} style={iconButton} title="이전 달" aria-label="이전 달">
               ◀
@@ -4468,6 +4581,14 @@ useEffect(() => {
         textarea:focus, input:focus, select:focus {
           border-color: ${ui.accent};
           box-shadow: 0 0 0 3px ${theme === "dark" ? "rgba(96,165,250,0.18)" : "rgba(37, 99, 235, 0.15)"};
+        }
+        input[type=number]::-webkit-outer-spin-button,
+        input[type=number]::-webkit-inner-spin-button {
+          -webkit-appearance: none;
+          margin: 0;
+        }
+        input[type=number] {
+          -moz-appearance: textfield;
         }
         .memo-input {
           color: transparent;
