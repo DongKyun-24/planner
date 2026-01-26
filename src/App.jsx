@@ -22,6 +22,91 @@ const groupLineStartRegex = /^\s*@([^(]+)\s*\(\s*$/
 const groupLineTitleOnlyRegex = /^\s*@([^()]+)\s*$/
 const groupLineCloseRegex = /^\s*\)\s*$/
 const emptyGroupLineParenRegex = /^\s*\(\s*\)\s*$/
+const timeTokenRegex = /^(\d{1,2}):(\d{2})$/
+const timeRangeRegex = /^(\d{1,2}):(\d{2})\s*([~-])\s*(\d{1,2}):(\d{2})$/
+const timePrefixRegex = /^(\d{1,2}):(\d{2})(?:\s*([~-])\s*(\d{1,2}):(\d{2}))?(?:\s*;\s*|\s+)(.+)$/
+
+function normalizeTimeToken(token) {
+  const match = String(token ?? "").trim().match(timeTokenRegex)
+  if (!match) return ""
+  const hh = String(Number(match[1])).padStart(2, "0")
+  return `${hh}:${match[2]}`
+}
+
+function normalizeTimeRangeToken(token) {
+  const match = String(token ?? "").trim().match(timeRangeRegex)
+  if (!match) return ""
+  const startH = String(Number(match[1])).padStart(2, "0")
+  const endH = String(Number(match[4])).padStart(2, "0")
+  return `${startH}:${match[2]}${match[3]}${endH}:${match[5]}`
+}
+
+function normalizeTimeTokenOrRange(token) {
+  return normalizeTimeToken(token) || normalizeTimeRangeToken(token)
+}
+
+function parseTimePrefix(value) {
+  const trimmed = String(value ?? "").trim()
+  if (!trimmed) return null
+  const match = trimmed.match(timePrefixRegex)
+  if (!match) return null
+  const rawTime = match[3] ? `${match[1]}:${match[2]}${match[3]}${match[4]}:${match[5]}` : `${match[1]}:${match[2]}`
+  const time = normalizeTimeTokenOrRange(rawTime)
+  const text = (match[6] ?? "").trim()
+  if (!text) return null
+  return { time, text }
+}
+
+function timeToMinutes(value) {
+  const trimmed = String(value ?? "").trim()
+  let match = trimmed.match(timeTokenRegex)
+  if (match) return Number(match[1]) * 60 + Number(match[2])
+  match = trimmed.match(timeRangeRegex)
+  if (match) return Number(match[1]) * 60 + Number(match[2])
+  return Number.MAX_SAFE_INTEGER
+}
+
+function parseDashboardSemicolonLine(value, { allowEmptyText = false } = {}) {
+  const raw = String(value ?? "").trim()
+  if (!raw.includes(";")) return null
+  const parts = raw.split(";")
+  if (parts.length < 2) return null
+
+  const first = parts[0].trim()
+  const time = normalizeTimeTokenOrRange(first)
+  let group = ""
+  let text = ""
+
+  if (time) {
+    const second = (parts[1] ?? "").trim()
+    const maybeGroup = second.startsWith("@") ? second.slice(1).trim() : ""
+    if (maybeGroup) {
+      group = maybeGroup
+      text = parts.slice(2).join(";").trim()
+    } else {
+      text = parts.slice(1).join(";").trim()
+    }
+  } else if (first.startsWith("@")) {
+    group = first.slice(1).trim()
+    text = parts.slice(1).join(";").trim()
+  } else {
+    return null
+  }
+
+  if (!allowEmptyText && !text) return null
+  return { time: time || "", group, text }
+}
+
+function addGroupItem(groupIndex, groups, title, item) {
+  if (!title) return
+  const existing = groupIndex.get(title)
+  if (existing) existing.items.push(item)
+  else {
+    const entry = { title, items: [item] }
+    groupIndex.set(title, entry)
+    groups.push(entry)
+  }
+}
 
 function normalizeGroupLineNewlines(text) {
   const s = (text ?? "").replace(/\r\n/g, "\n")
@@ -88,10 +173,27 @@ function parseDashboardBlockContent(body) {
   const general = []
   const groups = []
   const groupIndex = new Map()
+  const timed = []
   const lines = normalizeGroupLineNewlines(body).split("\n")
+  let order = 0
   for (const raw of lines) {
     const trimmed = raw.trim()
     if (!trimmed) continue
+    const semicolon = parseDashboardSemicolonLine(trimmed)
+    if (semicolon) {
+      if (semicolon.group) {
+        addGroupItem(groupIndex, groups, semicolon.group, { text: semicolon.text, time: semicolon.time, order })
+      } else if (semicolon.time) {
+        timed.push({ time: semicolon.time, text: semicolon.text, order })
+      } else {
+        general.push(semicolon.text)
+      }
+      order++
+      continue
+    }
+    const emptySemicolon = parseDashboardSemicolonLine(trimmed, { allowEmptyText: true })
+    if (emptySemicolon && !emptySemicolon.text) continue
+
     const match = trimmed.match(groupLineRegex)
     if (match) {
       const title = match[1].trim()
@@ -101,20 +203,29 @@ function parseDashboardBlockContent(body) {
         .split(";")
         .map((x) => x.trim())
         .filter((x) => x !== "")
-      if (items.length > 0) {
-        const existing = groupIndex.get(title)
-        if (existing) existing.items.push(...items)
-        else {
-          const entry = { title, items: [...items] }
-          groupIndex.set(title, entry)
-          groups.push(entry)
-        }
+      for (const item of items) {
+        const parsed = parseTimePrefix(item)
+        addGroupItem(groupIndex, groups, title, {
+          text: parsed ? parsed.text : item,
+          time: parsed ? parsed.time : "",
+          order
+        })
+        order++
       }
       continue
     }
+
+    const timeLine = parseTimePrefix(trimmed)
+    if (timeLine) {
+      timed.push({ time: timeLine.time, text: timeLine.text, order })
+      order++
+      continue
+    }
+
     general.push(trimmed)
+    order++
   }
-  return { general, groups }
+  return { general, groups, timed }
 }
 function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n))
@@ -162,7 +273,7 @@ function buildLineStartPositions(s) {
 // ===== 날짜 헤더 파서 =====
 const mdOnlyRegex = /^\s*(\d{1,2})\/(\d{1,2})(?:\s+.*)?\s*$/
 const ymdOnlyRegex = /^\s*(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})(?:\s+.*)?\s*$/
-const timeOnlyRegex = /^\s*(\d{1,2}):(\d{2})\s+(.+)\s*$/
+const timeOnlyRegex = /^\s*(\d{1,2}):(\d{2})(?:\s*([~-])\s*(\d{1,2}):(\d{2}))?\s+(.+)\s*$/
 const tabTitleRegex = /^\s*\[.+\]\s*$/
 
 function parseBlocksAndItems(rawText, baseYear) {
@@ -230,8 +341,14 @@ function parseBlocksAndItems(rawText, baseYear) {
       const mm = t.match(timeOnlyRegex)
       if (mm) {
         const hh = String(Number(mm[1])).padStart(2, "0")
-        time = `${hh}:${mm[2]}`
-        text = mm[3]
+        if (mm[3]) {
+          const endH = String(Number(mm[4])).padStart(2, "0")
+          time = `${hh}:${mm[2]}${mm[3]}${endH}:${mm[5]}`
+          text = mm[6]
+        } else {
+          time = `${hh}:${mm[2]}`
+          text = mm[6]
+        }
       }
 
       if (!items[b.dateKey]) items[b.dateKey] = []
@@ -404,14 +521,19 @@ function splitCombinedRightText(text, windows) {
 
   const lines = (text ?? "").split("\n")
   for (const rawLine of lines) {
-    const trimmed = rawLine.trim()
-    const labelMatch = trimmed.match(/^\[(.+)\]$/)
-    if (labelMatch) {
-      const title = labelMatch[1]
+    const headerMatch = rawLine.match(/^\s*\[(.+)\](.*)$/)
+    if (headerMatch) {
+      const title = headerMatch[1]
       const id = titleToId.get(title)
       if (id) {
         currentSection = id
         seenWindowIds.add(id)
+        const rest = (headerMatch[2] ?? "").replace(/^\s+/, "")
+        if (rest) {
+          const bucket = windowLinesById.get(currentSection) ?? []
+          bucket.push(rest)
+          windowLinesById.set(currentSection, bucket)
+        }
         continue
       }
     }
@@ -631,38 +753,12 @@ function ensureTabGroupLineAtDate(text, dateKey, title, year = baseYear) {
   if (!block || !title) return { newText: source, caretPos: null, headerPos: null }
 
   const body = source.slice(block.bodyStartPos, block.blockEndPos)
-  const match = findRawGroupLineMatch(body, title)
-  if (match) {
-    const inner = match[1] ?? ""
-    const innerHasText = inner.trim().length > 0
-    if (!innerHasText) {
-      const indent = match[0].match(/^\s*/)?.[0] ?? ""
-      const replacement = `${indent}@${title}\n${indent}()`
-      const before = source.slice(0, block.bodyStartPos + match.index)
-      const after = source.slice(block.bodyStartPos + match.index + match[0].length)
-      const newText = before + replacement + after
-      const caretPos = block.bodyStartPos + match.index + getGroupLineCaretOffset(replacement)
-      return { newText, caretPos, headerPos: block.headerStartPos }
-    }
-
-    const caretPos = block.bodyStartPos + match.index + match[0].length
-    return { newText: source, caretPos, headerPos: block.headerStartPos }
+  if (body.trim().length > 0) {
+    return { newText: source, caretPos: block.bodyStartPos, headerPos: block.headerStartPos }
   }
 
-  const trimmedBody = body.replace(/^\n+/, "").replace(/\n+$/, "")
-  const groupLine = `@${title}\n()`
-  const nextBody = trimmedBody ? `${groupLine}\n${trimmedBody}` : groupLine
-  const newText = updateDateBlockBody(source, year, dateKey, nextBody)
-
-  const reparsed = parseBlocksAndItems(newText, year)
-  const nextBlock = reparsed.blocks.find((b) => b.dateKey === dateKey)
-  if (!nextBlock) return { newText, caretPos: null, headerPos: null }
-  const nextBodyText = newText.slice(nextBlock.bodyStartPos, nextBlock.blockEndPos)
-  const nextMatch = findRawGroupLineMatch(nextBodyText, title)
-  const caretPos = nextMatch
-    ? nextBlock.bodyStartPos + nextMatch.index + getGroupLineCaretOffset(nextMatch[0])
-    : nextBlock.bodyStartPos
-  return { newText, caretPos, headerPos: nextBlock.headerStartPos }
+  const ensured = ensureBodyLineForBlock(source, block)
+  return { newText: ensured.newText, caretPos: ensured.caretPos ?? block.bodyStartPos, headerPos: block.headerStartPos }
 }
 
 // ===== (추가) 빈 날짜 블록 삭제 유틸 =====
@@ -673,6 +769,11 @@ function blockHasMeaningfulBody(text, block) {
   for (const rawLine of lines) {
     const trimmed = rawLine.trim()
     if (!trimmed) continue
+    const semicolon = parseDashboardSemicolonLine(trimmed, { allowEmptyText: true })
+    if (semicolon) {
+      if (!semicolon.text) continue
+      return true
+    }
     const match = trimmed.match(groupLineRegex)
     if (match) {
       if (match[2].trim().length > 0) return true
@@ -944,6 +1045,7 @@ function App() {
   const [windows, setWindows] = useState(() => loadWindows())
   const [activeWindowId, setActiveWindowId] = useState("all")
   const [editingWindowId, setEditingWindowId] = useState(null)
+  const [deleteConfirm, setDeleteConfirm] = useState(null)
   const titleInputRef = useRef(null)
   const [colorPickerId, setColorPickerId] = useState(null)
   const [colorPickerPos, setColorPickerPos] = useState(null) // 어떤 탭의 색상 팔레트를 열지
@@ -1369,6 +1471,16 @@ function App() {
     }
   }
 
+  function ensureRightMemoSectionHeaders(nextText) {
+    const { commonLines, windowLinesById } = splitCombinedRightText(nextText, editableWindows)
+    const normalizedCommon = commonLines.join("\n").trimEnd()
+    const windowTexts = {}
+    for (const w of editableWindows) {
+      windowTexts[w.id] = (windowLinesById.get(w.id) ?? []).join("\n").trimEnd()
+    }
+    return buildCombinedRightText(normalizedCommon, editableWindows, integratedFilters, windowTexts)
+  }
+
   function updateEditorText(nextText) {
     setText(nextText)
     textRef.current = nextText
@@ -1380,26 +1492,73 @@ function App() {
     else setTabEditText(next)
   }
 
-function parseTabEditGroupLineByDate(tabText, baseYear, title) {
+function parseTabEditItemsByDate(tabText, baseYear, title) {
     const parsedTab = parseBlocksAndItems(tabText ?? "", baseYear)
     const out = {}
     for (const block of parsedTab.blocks) {
       const body = (tabText ?? "").slice(block.bodyStartPos, block.blockEndPos)
-      const rawGroupLine = findRawGroupLineText(body, title)
-      if (rawGroupLine) {
-        const extracted = extractGroupLineItems(rawGroupLine, title)
-        if (extracted.length > 0) out[block.dateKey] = rawGroupLine.trim()
-        continue
-      }
       const normalizedBody = normalizeGroupLineNewlines(body)
       const lines = normalizedBody.split("\n")
       const items = []
+      let order = 0
       for (const rawLine of lines) {
-        const lineItems = extractGroupLineItems(rawLine, title)
-        if (lineItems.length === 0) continue
-        items.push(...lineItems)
+        const trimmed = rawLine.trim()
+        if (!trimmed) continue
+
+        const match = trimmed.match(groupLineRegex)
+        if (match) {
+          const groupTitle = match[1].trim()
+          if (!groupTitle || (title && groupTitle !== title)) continue
+          const innerItems = match[2]
+            .split(/;|\r?\n/)
+            .map((x) => x.trim())
+            .filter((x) => x !== "")
+          for (const item of innerItems) {
+            const parsed = parseTimePrefix(item)
+            items.push({ text: parsed ? parsed.text : item, time: parsed ? parsed.time : "", order })
+            order++
+          }
+          continue
+        }
+
+        const semicolon = parseDashboardSemicolonLine(trimmed)
+        if (semicolon) {
+          if (semicolon.group && title && semicolon.group !== title) continue
+          items.push({ text: semicolon.text, time: semicolon.time, order })
+          order++
+          continue
+        }
+        const emptySemicolon = parseDashboardSemicolonLine(trimmed, { allowEmptyText: true })
+        if (emptySemicolon && !emptySemicolon.text) continue
+
+        const timeLine = parseTimePrefix(trimmed)
+        if (timeLine) {
+          items.push({ text: timeLine.text, time: timeLine.time, order })
+          order++
+          continue
+        }
+
+        items.push({ text: trimmed, time: "", order })
+        order++
       }
-      if (items.length > 0) out[block.dateKey] = `@${title}(${items.join("; ")})`
+      if (items.length > 0) out[block.dateKey] = items
+    }
+    return out
+  }
+
+  function parseTabEditGroupLineByDate(tabText, baseYear, title) {
+    const itemsByDate = parseTabEditItemsByDate(tabText ?? "", baseYear, title)
+    const out = {}
+    for (const [dateKey, items] of Object.entries(itemsByDate)) {
+      const lines = items
+        .map((item) => {
+          const text = (item.text ?? "").trim()
+          if (!text) return ""
+          if (item.time) return `${item.time};@${title};${text}`
+          return `@${title};${text}`
+        })
+        .filter((line) => line !== "")
+      if (lines.length > 0) out[dateKey] = lines.join("\n")
     }
     return out
   }
@@ -1417,53 +1576,37 @@ function parseTabEditGroupLineByDate(tabText, baseYear, title) {
   }
 
 function parseTabEditItemsFromText(tabText, baseYear, title) {
-    const parsedTab = parseBlocksAndItems(tabText ?? "", baseYear)
-    const out = {}
-    for (const block of parsedTab.blocks) {
-      const body = (tabText ?? "").slice(block.bodyStartPos, block.blockEndPos)
-      const rawGroupLine = findRawGroupLineText(body, title)
-      if (rawGroupLine) {
-        const extracted = extractGroupLineItems(rawGroupLine, title)
-        if (extracted.length > 0) out[block.dateKey] = extracted
-        continue
-      }
-      const normalizedBody = normalizeGroupLineNewlines(body)
-      const lines = normalizedBody.split("\n")
-      const items = []
-      for (const rawLine of lines) {
-        const lineItems = extractGroupLineItems(rawLine, title)
-        if (lineItems.length === 0) continue
-        items.push(...lineItems)
-      }
-      if (items.length > 0) out[block.dateKey] = items
-    }
-    return out
+    return parseTabEditItemsByDate(tabText, baseYear, title)
   }
 
   function updateGroupLineInBody(bodyText, title, groupLineText) {
     const source = bodyText ?? ""
-    const pattern = new RegExp(`[ \\t]*@${escapeRegex(title)}\\s*\\(([\\s\\S]*?)\\)`, "g")
-    const segments = []
-    let lastIndex = 0
-    let match
-    while ((match = pattern.exec(source)) !== null) {
-      segments.push(source.slice(lastIndex, match.index))
-      lastIndex = match.index + match[0].length
+    const lines = source.split("\n")
+    const nextLines = []
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (trimmed) {
+        const semicolon = parseDashboardSemicolonLine(trimmed, { allowEmptyText: true })
+        if (semicolon?.group && semicolon.group === title) continue
+        const match = trimmed.match(groupLineRegex)
+        if (match && match[1].trim() === title) continue
+      }
+      nextLines.push(line)
     }
-    segments.push(source.slice(lastIndex))
-    const nextBody = segments.join("")
-    const nextLines = nextBody === "" ? [] : nextBody.split("\n")
-    const nextGroupLine = groupLineText && groupLineText.trim() ? groupLineText.trim() : ""
-    if (nextGroupLine) {
+
+    const nextGroupText = groupLineText && groupLineText.trim() ? groupLineText.trim() : ""
+    if (nextGroupText) {
+      const groupLines = nextGroupText.split("\n")
       if (nextLines.length > 0 && nextLines[nextLines.length - 1].trim() !== "") {
-        nextLines.push(nextGroupLine)
+        nextLines.push(...groupLines)
       } else {
         while (nextLines.length > 0 && nextLines[nextLines.length - 1].trim() === "") nextLines.pop()
-        nextLines.push(nextGroupLine)
+        nextLines.push(...groupLines)
       }
     } else {
       while (nextLines.length > 0 && nextLines[nextLines.length - 1].trim() === "") nextLines.pop()
     }
+
     return nextLines.join("\n").trimEnd()
   }
 
@@ -1472,12 +1615,16 @@ function stripUnknownGroupLines(bodyText, allowedTitles) {
   const nextLines = []
   for (const line of lines) {
     const trimmed = line.trim()
+    if (trimmed) {
+      const semicolon = parseDashboardSemicolonLine(trimmed, { allowEmptyText: true })
+      if (semicolon?.group && !allowedTitles.has(semicolon.group)) continue
       const match = trimmed.match(groupLineRegex)
       if (match) {
         const title = match[1].trim()
         if (!allowedTitles.has(title)) continue
       }
-      nextLines.push(line)
+    }
+    nextLines.push(line)
   }
   return nextLines.join("\n").trimEnd()
 }
@@ -1488,6 +1635,10 @@ function stripEmptyGroupLines(bodyText) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
     const trimmed = line.trim()
+    const semicolon = parseDashboardSemicolonLine(trimmed, { allowEmptyText: true })
+    if (semicolon && !semicolon.text) {
+      continue
+    }
     const match = trimmed.match(groupLineRegex)
     if (match) {
       if ((match[2] ?? "").trim().length === 0) continue
@@ -1774,8 +1925,8 @@ useEffect(() => {
       const filteredGroups = allowedDashboardGroupTitles
         ? parsedBlock.groups.filter((group) => allowedDashboardGroupTitles.has(group.title))
         : parsedBlock.groups
-      if (parsedBlock.general.length === 0 && filteredGroups.length === 0) continue
-      map[block.dateKey] = { general: parsedBlock.general, groups: filteredGroups }
+      if (parsedBlock.general.length === 0 && filteredGroups.length === 0 && parsedBlock.timed.length === 0) continue
+      map[block.dateKey] = { general: parsedBlock.general, groups: filteredGroups, timed: parsedBlock.timed }
     }
     return map
   }, [dashboardBlocksSource, dashboardSourceText, allowedDashboardGroupTitles])
@@ -1798,7 +1949,8 @@ useEffect(() => {
       out.push({
         dateKey: block.dateKey,
         general: parsedBlock.general,
-        groups: orderedGroups
+        groups: orderedGroups,
+        timed: parsedBlock.timed
       })
     }
     out.sort((a, b) => keyToTime(a.dateKey) - keyToTime(b.dateKey))
@@ -1810,23 +1962,40 @@ useEffect(() => {
     const out = []
     for (const block of dashboardBlocksSource) {
       const body = dashboardSourceText.slice(block.bodyStartPos, block.blockEndPos)
-      const normalizedBody = normalizeGroupLineNewlines(body)
-      const lines = normalizedBody.split("\n")
-      const items = []
-      for (const rawLine of lines) {
-        const lineItems = extractGroupLineItems(rawLine, title)
-        if (lineItems.length === 0) continue
-        items.push(...lineItems)
-      }
-      const rawGroupLine = findRawGroupLineText(body, title)
-      const rawItems = rawGroupLine ? extractGroupLineItems(rawGroupLine, title) : []
-      let groupLine = ""
-      if (rawItems.length > 0) groupLine = rawGroupLine.trim()
-      else if (items.length > 0) groupLine = `@${title}(${items.join("; ")})`
-      if (!groupLine) continue
+      const parsedBlock = parseDashboardBlockContent(body)
+      const group = parsedBlock.groups.find((entry) => entry.title === title)
+      const items = group?.items ?? []
+      if (items.length === 0) continue
       const { y, m, d } = keyToYMD(block.dateKey)
       out.push(buildHeaderLine(y, m, d))
-      out.push(groupLine)
+      for (const item of items) {
+        const text = (item.text ?? "").trim()
+        if (!text) continue
+        out.push(item.time ? `${item.time};${text}` : text)
+      }
+      out.push("")
+    }
+    return out.join("\n").trimEnd()
+  }
+
+  function buildTabEditTextForTitleFromAllText(allText, year, title) {
+    if (!title) return ""
+    const source = allText ?? ""
+    const parsed = parseBlocksAndItems(source, year)
+    const out = []
+    for (const block of parsed.blocks) {
+      const body = source.slice(block.bodyStartPos, block.blockEndPos)
+      const parsedBlock = parseDashboardBlockContent(body)
+      const group = parsedBlock.groups.find((entry) => entry.title === title)
+      const items = group?.items ?? []
+      if (items.length === 0) continue
+      const { y, m, d } = keyToYMD(block.dateKey)
+      out.push(buildHeaderLine(y, m, d))
+      for (const item of items) {
+        const text = (item.text ?? "").trim()
+        if (!text) continue
+        out.push(item.time ? `${item.time};${text}` : text)
+      }
       out.push("")
     }
     return out.join("\n").trimEnd()
@@ -1879,6 +2048,18 @@ useEffect(() => {
             sourceTitle: ""
           })
         }
+        for (let idx = 0; idx < parsedBlock.timed.length; idx++) {
+          const item = parsedBlock.timed[idx]
+          const text = (item.text ?? "").trim()
+          if (!text) continue
+          bucket.push({
+            id: `${block.dateKey}-timed-${idx}`,
+            time: item.time || "",
+            text,
+            color: "#999",
+            sourceTitle: ""
+          })
+        }
         const orderedGroups = parsedBlock.groups
           .map((group, idx) => ({ group, idx }))
           .sort((a, b) => {
@@ -1894,10 +2075,13 @@ useEffect(() => {
           const window = windows.find((w) => w.title === group.title)
           const color = window?.color ?? "#aaa"
           for (let idx = 0; idx < group.items.length; idx++) {
+            const item = group.items[idx]
+            const text = (item.text ?? "").trim()
+            if (!text) continue
             bucket.push({
               id: `${block.dateKey}-${group.title}-${idx}`,
-              time: "",
-              text: group.items[idx],
+              time: item.time || "",
+              text,
               color,
               sourceTitle: group.title
             })
@@ -1915,13 +2099,19 @@ useEffect(() => {
     const out = {}
     for (const [key, items] of Object.entries(tabItemsByDate)) {
       if (!items || items.length === 0) continue
-      const bucket = items.map((item, idx) => ({
-        id: `${key}-${targetWindow.id}-${idx}`,
-        time: "",
-        text: item,
-        color: targetWindow.color,
-        sourceTitle: targetWindow.title
-      }))
+      const bucket = items
+        .map((item, idx) => {
+          const text = (item.text ?? "").trim()
+          if (!text) return null
+          return {
+            id: `${key}-${targetWindow.id}-${idx}`,
+            time: item.time || "",
+            text,
+            color: targetWindow.color,
+            sourceTitle: targetWindow.title
+          }
+        })
+        .filter(Boolean)
       out[key] = (out[key] ?? []).concat(bucket)
     }
     return out
@@ -2189,6 +2379,22 @@ useEffect(() => {
     setMentionGhostText(`${activeWindow.title}(`)
   }
 
+  function getTabMentionAnchor(value, caret) {
+    if (caret <= 0) return null
+    const lineStart = value.lastIndexOf("\n", caret - 1)
+    const linePrefix = value.slice(lineStart + 1, caret)
+    const trimmed = linePrefix.replace(/\s+$/, "")
+    if (!trimmed.endsWith("@")) return null
+    const atIndex = trimmed.lastIndexOf("@")
+    if (atIndex === -1) return null
+    const before = trimmed.slice(0, atIndex)
+    if (before.length > 0) {
+      const prev = before[before.length - 1]
+      if (prev !== ";" && !/\s/.test(prev)) return null
+    }
+    return { lineStart, anchorPos: lineStart + 1 + atIndex }
+  }
+
   function updateTabMentionMenu() {
     if (activeWindowId !== "all" || !isEditingLeftMemo) {
       if (tabMentionMenu.visible) setTabMentionMenu({ visible: false, top: 0, left: 0 })
@@ -2206,9 +2412,8 @@ useEffect(() => {
     }
     const value = ta.value ?? ""
     const caret = ta.selectionStart ?? 0
-    const lineStart = value.lastIndexOf("\n", caret - 1)
-    const linePrefix = value.slice(lineStart + 1, caret)
-    if (linePrefix.trim() !== "@" || !linePrefix.endsWith("@")) {
+    const anchor = getTabMentionAnchor(value, caret)
+    if (!anchor) {
       if (tabMentionMenu.visible) setTabMentionMenu({ visible: false, top: 0, left: 0 })
       return
     }
@@ -2238,14 +2443,12 @@ useEffect(() => {
     if (!ta) return
     const value = ta.value ?? ""
     const caret = ta.selectionStart ?? 0
-    if (caret <= 0) return
-    const lineStart = value.lastIndexOf("\n", caret - 1)
-    const linePrefix = value.slice(lineStart + 1, caret)
-    const indent = linePrefix.match(/^\s*/)?.[0] ?? ""
+    const anchor = getTabMentionAnchor(value, caret)
+    if (!anchor) return
 
-    const insert = `@${title}\n${indent}()`
-    const nextText = value.slice(0, caret - 1) + insert + value.slice(caret)
-    const caretPos = caret - 1 + insert.indexOf("(") + 1
+    const insert = `@${title}`
+    const nextText = value.slice(0, anchor.anchorPos) + insert + value.slice(caret)
+    const caretPos = anchor.anchorPos + insert.length
 
     updateEditorText(nextText)
     setTabMentionMenu({ visible: false, top: 0, left: 0 })
@@ -3112,6 +3315,16 @@ useEffect(() => {
     boxShadow: theme === "dark" ? "none" : "0 1px 0 rgba(15, 23, 42, 0.04)"
   }
 
+  const arrowButton = {
+    ...iconButton,
+    border: "1px solid var(--arrow-border)",
+    background: "var(--arrow-bg)",
+    color: "var(--arrow-color)",
+    boxShadow: "var(--arrow-shadow)",
+    opacity: "var(--arrow-opacity)",
+    transition: "opacity 140ms ease, background 140ms ease, border-color 140ms ease, color 140ms ease"
+  }
+
   // navArrowButton removed (reverted to original iconButton usage)
 
   const memoTopRightButton = {
@@ -3298,8 +3511,6 @@ useEffect(() => {
           width: containerWidth,
           minHeight: dotSize + gap * 2,
           borderRadius: 999,
-          border: `1px solid ${ui.border}`,
-          background: ui.surface,
           display: "grid",
           gridTemplateColumns: `repeat(5, ${dotSize}px)`,
           gap,
@@ -3399,11 +3610,23 @@ useEffect(() => {
           }}
         >
           <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-            <button onClick={basePrevYear} style={iconButton} title="이전 연도" aria-label="이전 연도">
+            <button
+              onClick={basePrevYear}
+              className="arrow-button"
+              style={arrowButton}
+              title="이전 연도"
+              aria-label="이전 연도"
+            >
               ◀
             </button>
             <div style={{ fontWeight: 900 }}>{baseYear}</div>
-            <button onClick={baseNextYear} style={iconButton} title="다음 연도" aria-label="다음 연도">
+            <button
+              onClick={baseNextYear}
+              className="arrow-button"
+              style={arrowButton}
+              title="다음 연도"
+              aria-label="다음 연도"
+            >
               ▶
             </button>
           <button
@@ -3741,7 +3964,8 @@ useEffect(() => {
       >
         <button
           onClick={() => scrollTabs(-1)}
-          style={{ ...iconButton, flexShrink: 0 }}
+          className="arrow-button"
+          style={{ ...arrowButton, flexShrink: 0 }}
           title="왼쪽으로 이동"
           aria-label="왼쪽으로 이동"
         >
@@ -3937,7 +4161,7 @@ useEffect(() => {
           className="tab-pill__delete"
           onClick={(e) => {
             e.stopPropagation() // 탭 클릭 방지
-            removeWindow(w.id)
+            setDeleteConfirm({ id: w.id, title: w.title })
           }}
           aria-label="탭 삭제"
           title="탭 삭제"
@@ -3963,7 +4187,8 @@ useEffect(() => {
 
         <button
           onClick={() => scrollTabs(1)}
-          style={{ ...iconButton, flexShrink: 0 }}
+          className="arrow-button"
+          style={{ ...arrowButton, flexShrink: 0 }}
           title="오른쪽으로 이동"
           aria-label="오른쪽으로 이동"
         >
@@ -4010,15 +4235,15 @@ useEffect(() => {
                             line.isHeader ? "memo-overlay__line memo-overlay__line--header" : "memo-overlay__line"
                           }
                         >
-                          {line.groupParts ? (
-                            <>
-                              <span className="memo-overlay__fn">{line.groupParts.prefix}</span>
-                              {line.groupParts.suffix ? <span>{line.groupParts.suffix}</span> : null}
-                            </>
-                          ) : line.text === "" ? (
-                            " "
-                          ) : (
-                            line.text
+                      {line.groupParts ? (
+                        <>
+                          {line.groupParts.prefix}
+                          {line.groupParts.suffix ? <span>{line.groupParts.suffix}</span> : null}
+                        </>
+                      ) : line.text === "" ? (
+                        " "
+                      ) : (
+                        line.text
                           )}
                         </div>
                       ))}
@@ -4165,11 +4390,66 @@ useEffect(() => {
                       const isCollapsed = Boolean(collapsedForActive[block.dateKey])
                       const isAll = activeWindowId === "all"
                       const activeWindow = windows.find((w) => w.id === activeWindowId)
-                      const matchedGroups = isAll ? block.groups : []
+                      const groups = isAll ? block.groups : []
+                      const groupItemCount = isAll
+                        ? groups.reduce((sum, group) => sum + (group.items?.length ?? 0), 0)
+                        : 0
                       const hasContent = isAll
-                        ? block.general.length > 0 || matchedGroups.length > 0
+                        ? block.general.length > 0 || (block.timed?.length ?? 0) > 0 || groupItemCount > 0
                         : Array.isArray(block.items) && block.items.length > 0
                       if (!hasContent) return null
+                      const noTimeGroupItems = []
+                      const timedItems = []
+                      if (isAll) {
+                        for (const group of groups) {
+                          for (const item of group.items ?? []) {
+                            const text = (item.text ?? "").trim()
+                            if (!text) continue
+                            const entry = {
+                              time: item.time || "",
+                              text,
+                              title: group.title,
+                              order: item.order ?? 0
+                            }
+                            if (entry.time) timedItems.push(entry)
+                            else noTimeGroupItems.push(entry)
+                          }
+                        }
+                        const timedNoGroup = (block.timed ?? [])
+                          .map((item) => ({
+                            time: item.time || "",
+                            text: (item.text ?? "").trim(),
+                            title: "",
+                            order: item.order ?? 0
+                          }))
+                          .filter((item) => item.text)
+                        timedItems.push(...timedNoGroup)
+                        noTimeGroupItems.sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+                        timedItems.sort((a, b) => {
+                          const ta = timeToMinutes(a.time)
+                          const tb = timeToMinutes(b.time)
+                          if (ta !== tb) return ta - tb
+                          return (a.order ?? 0) - (b.order ?? 0)
+                        })
+                      }
+                      const tabNoTimeItems = []
+                      const tabTimedItems = []
+                      if (!isAll && Array.isArray(block.items)) {
+                        for (const item of block.items) {
+                          const text = (item.text ?? "").trim()
+                          if (!text) continue
+                          const entry = { time: item.time || "", text, order: item.order ?? 0 }
+                          if (entry.time) tabTimedItems.push(entry)
+                          else tabNoTimeItems.push(entry)
+                        }
+                        tabNoTimeItems.sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+                        tabTimedItems.sort((a, b) => {
+                          const ta = timeToMinutes(a.time)
+                          const tb = timeToMinutes(b.time)
+                          if (ta !== tb) return ta - tb
+                          return (a.order ?? 0) - (b.order ?? 0)
+                        })
+                      }
                       return (
                         <div
                           key={block.dateKey}
@@ -4235,30 +4515,39 @@ useEffect(() => {
                                       {line}
                                     </div>
                                   ))}
-                                  {matchedGroups.map((group, gi) => (
-                                    <div key={`${block.dateKey}-group-${gi}`} style={{ marginTop: 4 }}>
-                                      <div style={{ fontWeight: 900, color: ui.text }}>[{group.title}]</div>
-                                      <div style={{ marginTop: 2, display: "flex", flexDirection: "column", gap: 2 }}>
-                                        {group.items.map((item, ii) => (
-                                          <div
-                                            key={`${block.dateKey}-group-${gi}-item-${ii}`}
-                                            style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}
-                                          >
-                                            {item}
-                                          </div>
-                                        ))}
-                                      </div>
+                                  {noTimeGroupItems.map((item, idx) => (
+                                    <div
+                                      key={`${block.dateKey}-group-notime-${idx}`}
+                                      style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}
+                                    >
+                                      [{item.title}] {item.text}
+                                    </div>
+                                  ))}
+                                  {timedItems.map((item, idx) => (
+                                    <div
+                                      key={`${block.dateKey}-timed-${idx}`}
+                                      style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}
+                                    >
+                                      {item.time} {item.title ? `[${item.title}] ` : ""}{item.text}
                                     </div>
                                   ))}
                                 </>
                               ) : (
                                 <>
-                                  {(block.items ?? []).map((item, ii) => (
+                                  {tabNoTimeItems.map((item, ii) => (
                                     <div
-                                      key={`${block.dateKey}-${activeWindow?.id ?? "tab"}-item-${ii}`}
+                                      key={`${block.dateKey}-${activeWindow?.id ?? "tab"}-notime-${ii}`}
                                       style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}
                                     >
-                                      {item}
+                                      {item.text}
+                                    </div>
+                                  ))}
+                                  {tabTimedItems.map((item, ii) => (
+                                    <div
+                                      key={`${block.dateKey}-${activeWindow?.id ?? "tab"}-time-${ii}`}
+                                      style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}
+                                    >
+                                      {item.time} {item.text}
                                     </div>
                                   ))}
                                 </>
@@ -4292,7 +4581,7 @@ useEffect(() => {
                     >
                       {line.groupParts ? (
                         <>
-                          <span className="memo-overlay__fn">{line.groupParts.prefix}</span>
+                          {line.groupParts.prefix}
                           {line.groupParts.suffix ? <span>{line.groupParts.suffix}</span> : null}
                         </>
                       ) : line.text === "" ? (
@@ -4310,12 +4599,18 @@ useEffect(() => {
                 value={rightMemoText}
                 onChange={(e) => {
                   const next = e.target.value
+                  setRightMemoText(next)
                   if (activeWindowId === "all") {
-                    setRightMemoText(next)
                     syncCombinedRightText(next)
-                  } else {
-                    setRightMemoText(next)
                   }
+                }}
+                onBlur={(e) => {
+                  if (activeWindowId !== "all") return
+                  const raw = e.currentTarget.value
+                  const sanitized = ensureRightMemoSectionHeaders(raw)
+                  if (sanitized === raw) return
+                  setRightMemoText(sanitized)
+                  syncCombinedRightText(sanitized)
                 }}
                 onFocus={() => {
                   setSelectedDateKey(null)
@@ -4419,13 +4714,13 @@ useEffect(() => {
                 aria-hidden="true"
                 style={{
                   position: "absolute",
-                  right: 8,
+                  right: 2,
                   top: "50%",
                   marginTop: 0.5,
                   transform: "translateY(-50%)",
                   display: "inline-flex",
                   flexDirection: "column",
-                  gap: 1
+                  gap: 0
                 }}
               >
                 <button
@@ -4435,25 +4730,24 @@ useEffect(() => {
                     setYmYear(Number.isFinite(next) ? next + 1 : view.year + 1)
                   }}
                   style={{
-                    width: 14,
-                    height: 12,
+                    width: 22,
+                    height: 20,
                     padding: 0,
                     border: "none",
                     background: "transparent",
-                    color: ui.text,
+                    color: ui.text2,
+                    opacity: 0.6,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
                     cursor: "pointer",
-                    lineHeight: 1
+                    lineHeight: 0,
+                    marginBottom: -5
                   }}
                   aria-label="연도 증가"
                 >
-                  <svg width="14" height="12" viewBox="0 0 20 20" fill="none">
-                    <path
-                      d="M5 13l5-5 5 5"
-                      stroke="currentColor"
-                      strokeWidth="3.2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    />
+                  <svg width="22" height="20" viewBox="0 0 20 20" aria-hidden="true">
+                    <path d="M5 12l5-6 5 6z" fill="currentColor" />
                   </svg>
                 </button>
                 <button
@@ -4463,41 +4757,40 @@ useEffect(() => {
                     setYmYear(Number.isFinite(next) ? next - 1 : view.year - 1)
                   }}
                   style={{
-                    width: 14,
-                    height: 12,
+                    width: 22,
+                    height: 20,
                     padding: 0,
                     border: "none",
                     background: "transparent",
-                    color: ui.text,
+                    color: ui.text2,
+                    opacity: 0.6,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
                     cursor: "pointer",
-                    lineHeight: 1
+                    lineHeight: 0,
+                    marginTop: -5
                   }}
                   aria-label="연도 감소"
                 >
-                  <svg width="14" height="12" viewBox="0 0 20 20" fill="none">
-                    <path
-                      d="M5 7l5 5 5-5"
-                      stroke="currentColor"
-                      strokeWidth="3.2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    />
+                  <svg width="22" height="20" viewBox="0 0 20 20" aria-hidden="true">
+                    <path d="M5 8l5 6 5-6z" fill="currentColor" />
                   </svg>
                 </button>
               </span>
             </div>
             <div style={{ position: "relative", display: "inline-flex", alignItems: "center" }}>
-              <select
-                value={ymMonth}
-                onChange={(e) => setYmMonth(Number(e.target.value))}
-                style={{
-                  ...controlInput,
-                  width: 72,
-                  padding: "0 20px 0 8px",
-                  appearance: "none",
-                  WebkitAppearance: "none",
-                  MozAppearance: "none"
-                }}
+                <select
+                  value={ymMonth}
+                  onChange={(e) => setYmMonth(Number(e.target.value))}
+                  style={{
+                    ...controlInput,
+                    width: 72,
+                    padding: "0 20px 0 18px",
+                    appearance: "none",
+                    WebkitAppearance: "none",
+                    MozAppearance: "none"
+                  }}
                 aria-label="월 선택"
               >
                 {Array.from({ length: 12 }).map((_, i) => {
@@ -4509,34 +4802,48 @@ useEffect(() => {
                   )
                 })}
               </select>
-              <span
-                aria-hidden="true"
-                style={{
-                  position: "absolute",
-                  right: 7,
-                  top: "50%",
-                  marginTop: 1,
-                  transform: "translateY(-50%)",
-                  pointerEvents: "none",
-                  color: ui.text
-                }}
-              >
-                <svg width="14" height="14" viewBox="0 0 20 20" fill="none">
-                  <path
-                    d="M5 7l5 5 5-5"
-                    stroke="currentColor"
-                    strokeWidth="2.4"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  />
-                </svg>
-              </span>
+                <span
+                  aria-hidden="true"
+                  style={{
+                    position: "absolute",
+                    right: 2,
+                    top: "50%",
+                    marginTop: 0,
+                    transform: "translateY(-50%)",
+                    pointerEvents: "none",
+                    color: ui.text2,
+                    opacity: 0.5
+                  }}
+                >
+                  <svg width="18" height="12" viewBox="0 0 20 20" aria-hidden="true">
+                    <path
+                      d="M4 7l6 6 6-6"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                </span>
             </div>
 
-            <button onClick={goPrevMonth} style={iconButton} title="이전 달" aria-label="이전 달">
+            <button
+              onClick={goPrevMonth}
+              className="arrow-button"
+              style={arrowButton}
+              title="이전 달"
+              aria-label="이전 달"
+            >
               ◀
             </button>
-            <button onClick={goNextMonth} style={iconButton} title="다음 달" aria-label="다음 달">
+            <button
+              onClick={goNextMonth}
+              className="arrow-button"
+              style={arrowButton}
+              title="다음 달"
+              aria-label="다음 달"
+            >
               ▶
             </button>
           </div>
@@ -5250,6 +5557,11 @@ useEffect(() => {
                         {line}
                       </div>
                     ))}
+                    {dayListView.timed.map((item, idx) => (
+                      <div key={`daylist-timed-${idx}`} style={{ color: ui.text, marginBottom: 4 }}>
+                        {item.time} {item.text}
+                      </div>
+                    ))}
                     {dayListView.groups
                       .map((group, idx) => ({ group, idx }))
                       .sort((a, b) => {
@@ -5264,12 +5576,16 @@ useEffect(() => {
                           <div style={{ fontWeight: 900 }}>[{group.title}]</div>
                           <div style={{ marginTop: 4, display: "flex", flexDirection: "column", gap: 2 }}>
                             {group.items.map((item, ii) => (
-                              <div key={`daylist-group-${gi}-item-${ii}`}>{item}</div>
+                              <div key={`daylist-group-${gi}-item-${ii}`}>
+                                {item.time ? `${item.time} ` : ""}{item.text}
+                              </div>
                             ))}
                           </div>
                         </div>
                       ))}
-                    {dayListView.general.length === 0 && dayListView.groups.length === 0 && (
+                    {dayListView.general.length === 0 &&
+                      dayListView.groups.length === 0 &&
+                      dayListView.timed.length === 0 && (
                       <div style={{ color: ui.text2 }}>내용이 없습니다.</div>
                     )}
                   </>
@@ -5278,6 +5594,80 @@ useEffect(() => {
                 )}
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {deleteConfirm && (
+        <div
+          onClick={() => setDeleteConfirm(null)}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(15, 23, 42, 0.35)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+            zIndex: 210
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: "min(360px, 92vw)",
+              background: ui.surface,
+              color: ui.text,
+              borderRadius: 12,
+              border: `1px solid ${ui.border}`,
+              boxShadow: ui.shadow,
+              padding: 16,
+              display: "flex",
+              flexDirection: "column",
+              gap: 12
+            }}
+          >
+            <div style={{ fontWeight: 900, fontSize: 16 }}>탭을 삭제할까요?</div>
+            <div style={{ color: ui.text2, fontWeight: 600, fontSize: 13 }}>
+              [{deleteConfirm.title}] 탭을 삭제하면 복구할 수 없습니다.
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+              <button
+                type="button"
+                onClick={() => setDeleteConfirm(null)}
+                style={{
+                  height: 32,
+                  padding: "0 16px",
+                  borderRadius: 10,
+                  border: `1px solid ${ui.border}`,
+                  background: ui.surface2,
+                  color: ui.text,
+                  cursor: "pointer",
+                  fontWeight: 800
+                }}
+              >
+                N
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  removeWindow(deleteConfirm.id)
+                  setDeleteConfirm(null)
+                }}
+                style={{
+                  height: 32,
+                  padding: "0 16px",
+                  borderRadius: 10,
+                  border: `1px solid ${ui.border}`,
+                  background: ui.accent,
+                  color: "#fff",
+                  cursor: "pointer",
+                  fontWeight: 800
+                }}
+              >
+                Y
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -5295,6 +5685,14 @@ useEffect(() => {
         }
         input[type=number] {
           -moz-appearance: textfield;
+        }
+        button {
+          transition: transform 120ms ease, filter 120ms ease, box-shadow 120ms ease, background 120ms ease,
+            border-color 120ms ease, color 120ms ease;
+        }
+        button:hover:not(:disabled) {
+          transform: translateY(-1px);
+          filter: brightness(0.98);
         }
         .memo-input {
           color: transparent;
@@ -5314,6 +5712,25 @@ useEffect(() => {
         .memo-overlay__fn {
           font-weight: 600;
         }
+        .arrow-button {
+          --arrow-opacity: 0.35;
+          --arrow-border: transparent;
+          --arrow-bg: transparent;
+          --arrow-color: ${ui.text2};
+          --arrow-shadow: none;
+        }
+        .arrow-button:hover {
+          --arrow-opacity: 0.85;
+          --arrow-border: ${ui.border2};
+          --arrow-bg: ${ui.surface2};
+          --arrow-color: ${ui.text};
+        }
+        .arrow-button:focus-visible {
+          --arrow-opacity: 0.9;
+          --arrow-border: ${ui.accent};
+          --arrow-bg: ${ui.surface2};
+          --arrow-color: ${ui.text};
+        }
         .tab-pill__delete {
           opacity: 0;
           pointer-events: none;
@@ -5326,8 +5743,8 @@ useEffect(() => {
           pointer-events: auto;
         }
         .calendar-day-cell:hover {
-          outline: 1px solid #000;
-          outline-offset: -1px;
+          outline: 2px solid ${theme === "dark" ? "rgba(148, 197, 255, 0.7)" : "rgba(37, 99, 235, 0.35)"};
+          outline-offset: -2px;
         }
         .outer-divider__buttons {
           position: absolute;
