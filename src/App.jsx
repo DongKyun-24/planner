@@ -21,6 +21,7 @@ const groupLineRegex = /^\s*@([^(]+)\(([^)]*)\)\s*$/
 const groupLineStartRegex = /^\s*@([^(]+)\s*\(\s*$/
 const groupLineTitleOnlyRegex = /^\s*@([^()]+)\s*$/
 const groupLineCloseRegex = /^\s*\)\s*$/
+const emptyGroupLineParenRegex = /^\s*\(\s*\)\s*$/
 
 function normalizeGroupLineNewlines(text) {
   const s = (text ?? "").replace(/\r\n/g, "\n")
@@ -634,14 +635,22 @@ function ensureTabGroupLineAtDate(text, dateKey, title, year = baseYear) {
   if (match) {
     const inner = match[1] ?? ""
     const innerHasText = inner.trim().length > 0
-    const caretPos = innerHasText
-      ? block.bodyStartPos + match.index + match[0].length
-      : block.bodyStartPos + match.index + getGroupLineCaretOffset(match[0])
+    if (!innerHasText) {
+      const indent = match[0].match(/^\s*/)?.[0] ?? ""
+      const replacement = `${indent}@${title}\n${indent}()`
+      const before = source.slice(0, block.bodyStartPos + match.index)
+      const after = source.slice(block.bodyStartPos + match.index + match[0].length)
+      const newText = before + replacement + after
+      const caretPos = block.bodyStartPos + match.index + getGroupLineCaretOffset(replacement)
+      return { newText, caretPos, headerPos: block.headerStartPos }
+    }
+
+    const caretPos = block.bodyStartPos + match.index + match[0].length
     return { newText: source, caretPos, headerPos: block.headerStartPos }
   }
 
   const trimmedBody = body.replace(/^\n+/, "").replace(/\n+$/, "")
-  const groupLine = `@${title}(\n\n)`
+  const groupLine = `@${title}\n()`
   const nextBody = trimmedBody ? `${groupLine}\n${trimmedBody}` : groupLine
   const newText = updateDateBlockBody(source, year, dateKey, nextBody)
 
@@ -726,6 +735,8 @@ function App() {
 
   // ===== 창(캘린더) 탭 =====
   const WINDOWS_KEY = "planner-windows-v1"
+  const TRASH_KEY = "planner-tab-trash-v1"
+  const TRASH_MAX = 20
 
   const DEFAULT_WINDOWS = [{ id: "all", title: "통합", color: "#2563eb", fixed: true }]
 
@@ -763,6 +774,41 @@ function App() {
   function saveWindows(ws) {
   try {
     localStorage.setItem(WINDOWS_KEY, JSON.stringify(ws))
+  } catch {}
+  }
+
+  function loadTabTrash() {
+  try {
+    const raw = localStorage.getItem(TRASH_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .map((entry) => {
+        if (!entry || typeof entry !== "object") return null
+        const window = entry.window
+        if (!window || typeof window.id !== "string") return null
+        return {
+          window: {
+            id: window.id,
+            title: typeof window.title === "string" && window.title.trim() ? window.title : "제목없음",
+            color: typeof window.color === "string" ? window.color : "#2563eb",
+            fixed: false
+          },
+          index: Number.isFinite(entry.index) ? entry.index : 1,
+          removedAt: Number.isFinite(entry.removedAt) ? entry.removedAt : Date.now(),
+          storage: entry.storage && typeof entry.storage === "object" ? entry.storage : {}
+        }
+      })
+      .filter(Boolean)
+  } catch {
+    return []
+  }
+  }
+
+  function saveTabTrash(items) {
+  try {
+    localStorage.setItem(TRASH_KEY, JSON.stringify(items))
   } catch {}
   }
 
@@ -891,12 +937,13 @@ function App() {
   const [mentionGhostText, setMentionGhostText] = useState("")
   const [mentionGhostPos, setMentionGhostPos] = useState({ top: 0, left: 0 })
   const [tabMentionMenu, setTabMentionMenu] = useState({ visible: false, top: 0, left: 0 })
+  const [tabMentionHoverId, setTabMentionHoverId] = useState(null)
   const tabMentionRef = useRef(null)
+  const tabMentionMouseDownRef = useRef(false)
   // ✅ 창 목록/활성 탭
   const [windows, setWindows] = useState(() => loadWindows())
   const [activeWindowId, setActiveWindowId] = useState("all")
   const [editingWindowId, setEditingWindowId] = useState(null)
-  const [recentlyRemovedWindow, setRecentlyRemovedWindow] = useState(null)
   const titleInputRef = useRef(null)
   const [colorPickerId, setColorPickerId] = useState(null)
   const [colorPickerPos, setColorPickerPos] = useState(null) // 어떤 탭의 색상 팔레트를 열지
@@ -982,7 +1029,9 @@ function App() {
       const calendar = calendarPanelRef.current
       const memo = textareaRef.current
       const rightMemo = rightTextareaRef.current
-      const inLeftMemo = memo && memo.contains(t)
+      const tabMenu = tabMentionRef.current
+      const inTabMenu = tabMenu && tabMenu.contains(t)
+      const inLeftMemo = (memo && memo.contains(t)) || inTabMenu
       const inRightMemo = rightMemo && rightMemo.contains(t)
       const inMemo = inLeftMemo || inRightMemo
 
@@ -1062,17 +1111,6 @@ function App() {
     if (idx < 0) return
     const removed = windows[idx]
     const allowedTitles = new Set(windows.filter((w) => w.id !== "all" && w.id !== id).map((w) => w.title))
-    const years = collectStoredYears()
-    const storageSnapshot = {}
-    for (const year of years) {
-      storageSnapshot[year] = {
-        all: getWindowMemoTextSync(year, "all"),
-        tab: getWindowMemoTextSync(year, id),
-        right: getRightWindowTextSync(year, id)
-      }
-    }
-
-    setRecentlyRemovedWindow({ window: removed, index: idx, storage: storageSnapshot })
 
     setWindows((prev) => prev.filter((w) => w.id !== id))
 
@@ -1098,59 +1136,6 @@ function App() {
       return [...fixed, ...next]
     })
   }
-
-  const undoRemoveWindow = useCallback(() => {
-    if (!recentlyRemovedWindow) return
-    const { window: restoredWindow, index, storage } = recentlyRemovedWindow
-
-    setWindows((prev) => {
-      const next = [...prev]
-      const insertPos = Math.max(1, Math.min(index, next.length))
-      next.splice(insertPos, 0, restoredWindow)
-      return next
-    })
-
-    setActiveWindowId(restoredWindow.id)
-    requestAnimationFrame(() => {
-      const scroll = tabsScrollRef.current
-      if (!scroll) return
-      const target = scroll.querySelector(`[data-window-id="${restoredWindow.id}"]`)
-      if (target) {
-        target.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" })
-      }
-    })
-
-    const baseStorage = storage[baseYear] ?? {}
-    const allText = baseStorage.all ?? ""
-    const tabText = baseStorage.tab ?? ""
-    if (activeWindowId === "all") {
-      updateEditorText(allText)
-    }
-    setTabEditText(tabText)
-
-    for (const [yearKey, stored] of Object.entries(storage)) {
-      const year = Number(yearKey)
-      if (!Number.isFinite(year)) continue
-      setWindowMemoTextSync(year, "all", stored.all ?? "")
-      setWindowMemoTextSync(year, restoredWindow.id, stored.tab ?? "")
-      setRightWindowTextSync(year, restoredWindow.id, stored.right ?? "")
-    }
-
-    setDashboardSourceTick((x) => x + 1)
-    setRecentlyRemovedWindow(null)
-  }, [recentlyRemovedWindow, activeWindowId, baseYear, updateEditorText])
-
-  useEffect(() => {
-    function onDocKeyDown(e) {
-      if (!recentlyRemovedWindow) return
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
-        e.preventDefault()
-        undoRemoveWindow()
-      }
-    }
-    document.addEventListener("keydown", onDocKeyDown)
-    return () => document.removeEventListener("keydown", onDocKeyDown)
-  }, [recentlyRemovedWindow, undoRemoveWindow])
 
 
   const memoInnerWrapRef = useRef(null)
@@ -1402,7 +1387,8 @@ function parseTabEditGroupLineByDate(tabText, baseYear, title) {
       const body = (tabText ?? "").slice(block.bodyStartPos, block.blockEndPos)
       const rawGroupLine = findRawGroupLineText(body, title)
       if (rawGroupLine) {
-        out[block.dateKey] = rawGroupLine.trim()
+        const extracted = extractGroupLineItems(rawGroupLine, title)
+        if (extracted.length > 0) out[block.dateKey] = rawGroupLine.trim()
         continue
       }
       const normalizedBody = normalizeGroupLineNewlines(body)
@@ -1414,7 +1400,6 @@ function parseTabEditGroupLineByDate(tabText, baseYear, title) {
         items.push(...lineItems)
       }
       if (items.length > 0) out[block.dateKey] = `@${title}(${items.join("; ")})`
-      else if (lines.some((line) => line.trim() === `@${title}()`)) out[block.dateKey] = `@${title}()`
     }
     return out
   }
@@ -1482,20 +1467,78 @@ function parseTabEditItemsFromText(tabText, baseYear, title) {
     return nextLines.join("\n").trimEnd()
   }
 
-  function stripUnknownGroupLines(bodyText, allowedTitles) {
-    const lines = (bodyText ?? "").split("\n")
-    const nextLines = []
-    for (const line of lines) {
-      const trimmed = line.trim()
+function stripUnknownGroupLines(bodyText, allowedTitles) {
+  const lines = (bodyText ?? "").split("\n")
+  const nextLines = []
+  for (const line of lines) {
+    const trimmed = line.trim()
       const match = trimmed.match(groupLineRegex)
       if (match) {
         const title = match[1].trim()
         if (!allowedTitles.has(title)) continue
       }
       nextLines.push(line)
-    }
-    return nextLines.join("\n").trimEnd()
   }
+  return nextLines.join("\n").trimEnd()
+}
+
+function stripEmptyGroupLines(bodyText) {
+  const lines = (bodyText ?? "").split("\n")
+  const nextLines = []
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    const trimmed = line.trim()
+    const match = trimmed.match(groupLineRegex)
+    if (match) {
+      if ((match[2] ?? "").trim().length === 0) continue
+      nextLines.push(line)
+      continue
+    }
+    const isTitleOnly = groupLineTitleOnlyRegex.test(trimmed)
+    const isStartOnly = groupLineStartRegex.test(trimmed)
+    if (isTitleOnly || isStartOnly) {
+      let j = i + 1
+      let contentFound = false
+      if (isTitleOnly) {
+        while (j < lines.length && lines[j].trim() === "") j++
+        if (j >= lines.length) {
+          nextLines.push(line)
+          continue
+        }
+        const inlineMatch = lines[j].match(/^\s*\(([\s\S]*?)\)\s*$/)
+        if (inlineMatch) {
+          if ((inlineMatch[1] ?? "").trim().length === 0) {
+            i = j
+            continue
+          }
+          nextLines.push(line)
+          continue
+        }
+        if (!/^\s*\(\s*$/.test(lines[j])) {
+          nextLines.push(line)
+          continue
+        }
+        j += 1
+      }
+
+      let closeIndex = null
+      for (; j < lines.length; j++) {
+        const t = lines[j].trim()
+        if (groupLineCloseRegex.test(t)) {
+          closeIndex = j
+          break
+        }
+        if (t !== "") contentFound = true
+      }
+      if (closeIndex != null && !contentFound) {
+        i = closeIndex
+        continue
+      }
+    }
+    nextLines.push(line)
+  }
+  return nextLines.join("\n").trimEnd()
+}
 
   function collectStoredYears() {
     const years = new Set()
@@ -1776,11 +1819,10 @@ useEffect(() => {
         items.push(...lineItems)
       }
       const rawGroupLine = findRawGroupLineText(body, title)
-      let groupLine = rawGroupLine ?? ""
-      if (!groupLine) {
-        if (items.length > 0) groupLine = `@${title}(${items.join("; ")})`
-        else if (lines.some((line) => line.trim() === `@${title}()`)) groupLine = `@${title}()`
-      }
+      const rawItems = rawGroupLine ? extractGroupLineItems(rawGroupLine, title) : []
+      let groupLine = ""
+      if (rawItems.length > 0) groupLine = rawGroupLine.trim()
+      else if (items.length > 0) groupLine = `@${title}(${items.join("; ")})`
       if (!groupLine) continue
       const { y, m, d } = keyToYMD(block.dateKey)
       out.push(buildHeaderLine(y, m, d))
@@ -2147,6 +2189,122 @@ useEffect(() => {
     setMentionGhostText(`${activeWindow.title}(`)
   }
 
+  function updateTabMentionMenu() {
+    if (activeWindowId !== "all" || !isEditingLeftMemo) {
+      if (tabMentionMenu.visible) setTabMentionMenu({ visible: false, top: 0, left: 0 })
+      return
+    }
+    const ta = textareaRef.current
+    if (!ta) return
+    if (ta.selectionStart !== ta.selectionEnd) {
+      if (tabMentionMenu.visible) setTabMentionMenu({ visible: false, top: 0, left: 0 })
+      return
+    }
+    if (document.activeElement !== ta) {
+      if (tabMentionMenu.visible) setTabMentionMenu({ visible: false, top: 0, left: 0 })
+      return
+    }
+    const value = ta.value ?? ""
+    const caret = ta.selectionStart ?? 0
+    const lineStart = value.lastIndexOf("\n", caret - 1)
+    const linePrefix = value.slice(lineStart + 1, caret)
+    if (linePrefix.trim() !== "@" || !linePrefix.endsWith("@")) {
+      if (tabMentionMenu.visible) setTabMentionMenu({ visible: false, top: 0, left: 0 })
+      return
+    }
+    if (editableWindows.length === 0) {
+      if (tabMentionMenu.visible) setTabMentionMenu({ visible: false, top: 0, left: 0 })
+      return
+    }
+    const mirror = mirrorRef.current
+    const marker = markerRef.current
+    if (!mirror || !marker) return
+
+    const pos = measureCharPosPx(ta, mirror, marker, value, caret)
+    const lh = getLineHeightPx(ta)
+    if (!tabMentionMenu.visible) {
+      const firstId = editableWindows[0]?.id ?? null
+      if (firstId !== tabMentionHoverId) setTabMentionHoverId(firstId)
+    }
+    setTabMentionMenu({
+      visible: true,
+      top: pos.top - ta.scrollTop + lh,
+      left: pos.left
+    })
+  }
+
+  function handleTabMentionPick(title) {
+    const ta = textareaRef.current
+    if (!ta) return
+    const value = ta.value ?? ""
+    const caret = ta.selectionStart ?? 0
+    if (caret <= 0) return
+    const lineStart = value.lastIndexOf("\n", caret - 1)
+    const linePrefix = value.slice(lineStart + 1, caret)
+    const indent = linePrefix.match(/^\s*/)?.[0] ?? ""
+
+    const insert = `@${title}\n${indent}()`
+    const nextText = value.slice(0, caret - 1) + insert + value.slice(caret)
+    const caretPos = caret - 1 + insert.indexOf("(") + 1
+
+    updateEditorText(nextText)
+    setTabMentionMenu({ visible: false, top: 0, left: 0 })
+    requestAnimationFrame(() => {
+      const el = textareaRef.current
+      if (el) {
+        el.focus()
+        el.setSelectionRange(caretPos, caretPos)
+      }
+    })
+  }
+
+  function handleTabMentionKeyDown(e) {
+    if (activeWindowId !== "all") return false
+    if (!tabMentionMenu.visible) return false
+    if (editableWindows.length === 0) return false
+
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault()
+      setTabMentionHoverId((prev) => {
+        const currentIndex = editableWindows.findIndex((w) => w.id === prev)
+        const baseIndex = currentIndex >= 0 ? currentIndex : 0
+        const delta = e.key === "ArrowDown" ? 1 : -1
+        const nextIndex = (baseIndex + delta + editableWindows.length) % editableWindows.length
+        return editableWindows[nextIndex]?.id ?? null
+      })
+      return true
+    }
+    if (e.key === "Enter") {
+      e.preventDefault()
+      const activeId = tabMentionHoverId ?? editableWindows[0]?.id
+      const target = editableWindows.find((w) => w.id === activeId) ?? editableWindows[0]
+      if (target) handleTabMentionPick(target.title)
+      return true
+    }
+    if (e.key === "Escape") {
+      e.preventDefault()
+      setTabMentionMenu({ visible: false, top: 0, left: 0 })
+      return true
+    }
+    return false
+  }
+
+  useEffect(() => {
+    if (!tabMentionMenu.visible) return
+
+    function onDocPointerDown(e) {
+      const menu = tabMentionRef.current
+      const ta = textareaRef.current
+      const t = e.target
+      if (!(t instanceof Node)) return
+      if ((menu && menu.contains(t)) || (ta && ta.contains(t))) return
+      setTabMentionMenu({ visible: false, top: 0, left: 0 })
+    }
+
+    document.addEventListener("pointerdown", onDocPointerDown, true)
+    return () => document.removeEventListener("pointerdown", onDocPointerDown, true)
+  }, [tabMentionMenu.visible])
+
   function acceptMentionGhost(e) {
     if (e.key !== "Enter") return false
     if (activeWindowId === "all") return false
@@ -2214,15 +2372,34 @@ useEffect(() => {
   function onTextareaSelectOrKeyUp() {
     updateCalendarFromMemoCaret()
     updateMentionGhost()
+    updateTabMentionMenu()
   }
 
   // ===== blur 정리 + 빈 블록이면 삭제 =====
   function onTextareaBlur() {
+    if (tabMentionMouseDownRef.current) {
+      tabMentionMouseDownRef.current = false
+      requestAnimationFrame(() => {
+        const el = textareaRef.current
+        if (el) el.focus()
+      })
+      return
+    }
+    if (tabMentionMenu.visible) setTabMentionMenu({ visible: false, top: 0, left: 0 })
     if (activeWindowId !== "all") {
       let nextTabText = tabEditText ?? ""
+      let changed = false
+      const stripped = stripEmptyGroupLines(nextTabText)
+      if (stripped !== nextTabText) {
+        nextTabText = stripped
+        changed = true
+      }
       const cleaned = removeAllEmptyBlocks(nextTabText, baseYear)
       if (cleaned.changed) {
         nextTabText = cleaned.newText
+        changed = true
+      }
+      if (changed) {
         setTabEditText(nextTabText)
         setWindowMemoTextSync(baseYear, activeWindowId, nextTabText)
         applyTabEditToAllFromText(nextTabText)
@@ -2237,7 +2414,8 @@ useEffect(() => {
     if (!ta) return
     const current = ta.value ?? ""
 
-    let normalized = normalizePrettyAndMerge(current, baseYear)
+    let normalized = stripEmptyGroupLines(current)
+    normalized = normalizePrettyAndMerge(normalized, baseYear)
     const key = lastActiveDateKeyRef.current
     if (key) {
       const r = removeEmptyBlockByDateKey(normalized, baseYear, key)
@@ -2338,21 +2516,12 @@ useEffect(() => {
     const d = today.getDate()
     const key = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`
 
-    if (!isEditingLeftMemo) {
-      setActiveDateKey(key)
-      return
-    }
-
     setIsEditingLeftMemo(true)
     requestAnimationFrame(() => {
       const el = textareaRef.current
       if (el) el.focus()
     })
-
-    setView({ year: y, month: m })
-    viewRef.current = { year: y, month: m }
-    lastActiveDateKeyRef.current = key
-    setSelectedDateKey(key)
+    setActiveDateKey(key)
 
     if (activeWindowId !== "all") {
       const targetWindow = windows.find((w) => w.id === activeWindowId)
@@ -2595,6 +2764,7 @@ useEffect(() => {
   }
 
   // ===== 테마 토큰 =====
+  const THEME_ORDER = ["light", "navy", "dark", "sky", "mint"]
   const themes = useMemo(() => {
     const light = {
       bg: "#f6f7fb",
@@ -2630,10 +2800,301 @@ useEffect(() => {
       holiday: "#ff8f8f",
       saturday: "#8bb3ff"
     }
-    return { light, dark }
+    const navy = {
+      bg: "#0b142f",
+      surface: "#111b38",
+      surface2: "#18254c",
+      text: "#e8edff",
+      text2: "#a1b1da",
+      border: "#2d3a63",
+      border2: "#1f2951",
+      accent: "#6e8bff",
+      accentSoft: "rgba(109,154,255,0.22)",
+      shadow: "0 12px 40px rgba(8, 10, 26, 0.75)",
+      radius: 16,
+      todayRing: "#5f7dff",
+      todaySoft: "rgba(95, 125, 255, 0.24)",
+      holiday: "#ff8282",
+      saturday: "#9cb5ff"
+    }
+    const sage = {
+      bg: "#f4fbf8",
+      surface: "#ffffff",
+      surface2: "#f1f6f3",
+      text: "#0f1b14",
+      text2: "#5a6b5b",
+      border: "#d6e4d7",
+      border2: "#c6d7c7",
+      accent: "#34a853",
+      accentSoft: "rgba(52,168,83,0.18)",
+      shadow: "0 12px 32px rgba(15, 23, 42, 0.12)",
+      radius: 12,
+      todayRing: "#34a853",
+      todaySoft: "rgba(52,168,83,0.2)",
+      holiday: "#e44b4b",
+      saturday: "#31a0a2"
+    }
+    const sunset = {
+      bg: "#fff8f3",
+      surface: "#fffdf9",
+      surface2: "#fff5ee",
+      text: "#1f1b18",
+      text2: "#6e5a4c",
+      border: "#f3dcd0",
+      border2: "#eccfc0",
+      accent: "#f97316",
+      accentSoft: "rgba(249,115,22,0.18)",
+      shadow: "0 14px 38px rgba(15, 23, 42, 0.18)",
+      radius: 12,
+      todayRing: "#f97316",
+      todaySoft: "rgba(249,115,22,0.2)",
+      holiday: "#ff5f5f",
+      saturday: "#fb923c"
+    }
+    const berry = {
+      bg: "#1c0c1b",
+      surface: "#2b0f2b",
+      surface2: "#33132e",
+      text: "#f4d9ff",
+      text2: "#d6b9ff",
+      border: "#3c173f",
+      border2: "#2f0d30",
+      accent: "#e879f9",
+      accentSoft: "rgba(232,121,249,0.2)",
+      shadow: "0 16px 36px rgba(12, 2, 24, 0.65)",
+      radius: 12,
+      todayRing: "#e879f9",
+      todaySoft: "rgba(232,121,249,0.3)",
+      holiday: "#ff7fbf",
+      saturday: "#c084fc"
+    }
+    const mint = {
+      bg: "#edfff7",
+      surface: "#ffffff",
+      surface2: "#f3fff9",
+      text: "#0f2a1e",
+      text2: "#4c6b5f",
+      border: "#c5e9db",
+      border2: "#b4ddcf",
+      accent: "#22b8cf",
+      accentSoft: "rgba(34,184,207,0.25)",
+      shadow: "0 12px 30px rgba(15, 23, 42, 0.12)",
+      radius: 12,
+      todayRing: "#22b8cf",
+      todaySoft: "rgba(34,184,207,0.25)",
+      holiday: "#ff6f61",
+      saturday: "#12b5d8"
+    }
+    const charcoal = {
+      bg: "#020204",
+      surface: "#020204",
+      surface2: "#0b0d11",
+      text: "#f5f5f5",
+      text2: "#c8c8c8",
+      border: "#2d2d2d",
+      border2: "#1a1a1a",
+      accent: "#ffffff",
+      accentSoft: "rgba(255,255,255,0.15)",
+      shadow: "0 18px 48px rgba(0, 0, 0, 0.6)",
+      radius: 12,
+      todayRing: "#ffffff",
+      todaySoft: "rgba(255,255,255,0.25)",
+      holiday: "#ff4b4b",
+      saturday: "#94a3b8"
+    }
+    const ivory = {
+      bg: "#fdfdfd",
+      surface: "#ffffff",
+      surface2: "#f8f8f8",
+      text: "#0a0a0a",
+      text2: "#525252",
+      border: "#e1e1e1",
+      border2: "#d1d1d1",
+      accent: "#0f172a",
+      accentSoft: "rgba(15,23,42,0.08)",
+      shadow: "0 12px 26px rgba(15, 23, 42, 0.12)",
+      radius: 12,
+      todayRing: "#0f172a",
+      todaySoft: "rgba(15,23,42,0.15)",
+      holiday: "#ef4444",
+      saturday: "#1d4ed8"
+    }
+    const stone = {
+      bg: "#f3f4f6",
+      surface: "#ffffff",
+      surface2: "#f2f3f5",
+      text: "#0f172a",
+      text2: "#475569",
+      border: "#d1d5db",
+      border2: "#cbd5e1",
+      accent: "#64748b",
+      accentSoft: "rgba(100,116,139,0.2)",
+      shadow: "0 12px 32px rgba(15, 23, 42, 0.15)",
+      radius: 12,
+      todayRing: "#64748b",
+      todaySoft: "rgba(100,116,139,0.25)",
+      holiday: "#f87171",
+      saturday: "#94a3b8"
+    }
+    const rose = {
+      bg: "#fff5f8",
+      surface: "#fff9fb",
+      surface2: "#fbeef4",
+      text: "#2d0b1c",
+      text2: "#6c495f",
+      border: "#f1d6e0",
+      border2: "#e9c5d5",
+      accent: "#f43f5e",
+      accentSoft: "rgba(244,63,94,0.15)",
+      shadow: "0 12px 32px rgba(112, 15, 47, 0.25)",
+      radius: 12,
+      todayRing: "#f43f5e",
+      todaySoft: "rgba(244,63,94,0.25)",
+      holiday: "#f43f5e",
+      saturday: "#a855f7"
+    }
+    const pistachio = {
+      bg: "#f2fbf1",
+      surface: "#ffffff",
+      surface2: "#f4fcf4",
+      text: "#0f2f1c",
+      text2: "#567057",
+      border: "#d9eed7",
+      border2: "#cde1cb",
+      accent: "#16a34a",
+      accentSoft: "rgba(22,163,74,0.2)",
+      shadow: "0 12px 30px rgba(8, 30, 10, 0.15)",
+      radius: 12,
+      todayRing: "#16a34a",
+      todaySoft: "rgba(22,163,74,0.25)",
+      holiday: "#ef4444",
+      saturday: "#10b981"
+    }
+    const sky = {
+      bg: "#edf4ff",
+      surface: "#ffffff",
+      surface2: "#ecf4ff",
+      text: "#102a43",
+      text2: "#52607e",
+      border: "#dbe9ff",
+      border2: "#c3d7ff",
+      accent: "#2563eb",
+      accentSoft: "rgba(37,99,235,0.2)",
+      shadow: "0 12px 26px rgba(14, 33, 88, 0.16)",
+      radius: 12,
+      todayRing: "#2563eb",
+      todaySoft: "rgba(37,99,235,0.25)",
+      holiday: "#dc2626",
+      saturday: "#2563eb"
+    }
+    const copper = {
+      bg: "#2a1b0c",
+      surface: "#302316",
+      surface2: "#3b2c1a",
+      text: "#f7f2eb",
+      text2: "#d2c8bb",
+      border: "#4a3927",
+      border2: "#3a2d1f",
+      accent: "#f97316",
+      accentSoft: "rgba(249,115,22,0.25)",
+      shadow: "0 18px 40px rgba(9, 5, 2, 0.7)",
+      radius: 12,
+      todayRing: "#f97316",
+      todaySoft: "rgba(249,115,22,0.3)",
+      holiday: "#ff5f5f",
+      saturday: "#fb923c"
+    }
+    const peach = {
+      bg: "#fff8f2",
+      surface: "#fffdf7",
+      surface2: "#fff4ed",
+      text: "#2f1b11",
+      text2: "#7b5b4c",
+      border: "#f6d7c8",
+      border2: "#f0cdbd",
+      accent: "#fb923c",
+      accentSoft: "rgba(251,146,60,0.2)",
+      shadow: "0 12px 26px rgba(95, 45, 15, 0.17)",
+      radius: 12,
+      todayRing: "#fb923c",
+      todaySoft: "rgba(251,146,60,0.25)",
+      holiday: "#ef4444",
+      saturday: "#fb7185"
+    }
+    const storm = {
+      bg: "#1c2231",
+      surface: "#1f2637",
+      surface2: "#262b3f",
+      text: "#edf2ff",
+      text2: "#a0aec0",
+      border: "#2d3748",
+      border2: "#1a2232",
+      accent: "#22d3ee",
+      accentSoft: "rgba(34,211,238,0.2)",
+      shadow: "0 20px 40px rgba(0, 0, 0, 0.65)",
+      radius: 12,
+      todayRing: "#22d3ee",
+      todaySoft: "rgba(34,211,238,0.25)",
+      holiday: "#f87171",
+      saturday: "#38bdf8"
+    }
+    const gold = {
+      bg: "#fffdf4",
+      surface: "#fffaf1",
+      surface2: "#fff4e7",
+      text: "#3b2d1f",
+      text2: "#7c6c54",
+      border: "#f6e0c9",
+      border2: "#efd3b7",
+      accent: "#facc15",
+      accentSoft: "rgba(250,204,21,0.2)",
+      shadow: "0 12px 28px rgba(120, 88, 30, 0.25)",
+      radius: 12,
+      todayRing: "#facc15",
+      todaySoft: "rgba(250,204,21,0.25)",
+      holiday: "#ff5f5f",
+      saturday: "#fbbf24"
+    }
+    const lavender = {
+      bg: "#f8f5ff",
+      surface: "#fff8ff",
+      surface2: "#f4efff",
+      text: "#221337",
+      text2: "#624e7f",
+      border: "#e5dbf8",
+      border2: "#dacff7",
+      accent: "#c084fc",
+      accentSoft: "rgba(192,132,252,0.18)",
+      shadow: "0 16px 32px rgba(78, 60, 94, 0.25)",
+      radius: 12,
+      todayRing: "#c084fc",
+      todaySoft: "rgba(192,132,252,0.25)",
+      holiday: "#f472b6",
+      saturday: "#a855f7"
+    }
+    return {
+      light,
+      dark,
+      navy,
+      sage,
+      sunset,
+      berry,
+      mint,
+      stone,
+      charcoal,
+      ivory,
+      rose,
+      pistachio,
+      sky,
+      copper,
+      peach,
+      storm,
+      gold,
+      lavender
+    }
   }, [])
 
-  const ui = theme === "dark" ? themes.dark : themes.light
+  const ui = themes[theme] ?? themes.light
 
   const iconButton = {
     width: 28,
@@ -2670,6 +3131,18 @@ useEffect(() => {
     fontWeight: 800,
     outline: "none"
   }
+
+  const settingsNumberInput = {
+    ...controlInput,
+    height: 22,
+    padding: "0 6px",
+    borderRadius: 8,
+    textAlign: "center",
+    fontWeight: 600,
+    fontSize: 13
+  }
+
+  const panelFontFamily = "Pretendard Variable, 'Inter', 'Apple SD Gothic Neo', system-ui, sans-serif"
 
   const pillButton = {
     height: 34,
@@ -2765,6 +3238,24 @@ useEffect(() => {
     zIndex: 1
   }
 
+  const settingsLabelTextStyle = {
+    fontWeight: 500,
+    color: ui.text2,
+    fontSize: 15,
+    letterSpacing: "0.01em",
+    width: 70,
+    textAlign: "left",
+    paddingLeft: 2
+  }
+
+  const settingsRowStyle = {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+    width: "100%"
+  }
+
   const isLeftCollapsed = memoInnerCollapsed === "left"
   const isRightCollapsed = memoInnerCollapsed === "right"
   const leftButtonOpacity = isLeftCollapsed ? 0.4 : 1
@@ -2772,51 +3263,75 @@ useEffect(() => {
   const leftMemoFlex = isLeftCollapsed ? "0 0 0px" : isRightCollapsed ? "1 1 0" : `0 0 ${memoInnerSplit * 100}%`
   const rightMemoFlex = isRightCollapsed ? "0 0 0px" : "1 1 0"
 
-  function ThemeToggle() {
-    const isDark = theme === "dark"
-    const ring = ui.accent
+  function ThemeToggle({ compact = false }) {
     const baseBorder = ui.border2
+    const dotColors = {
+      light: "#ffffff",
+      dark: "#0b1220",
+      navy: "#152248",
+      sage: "#d2f1dc",
+      sunset: "#ffe3d0",
+      berry: "#ffe4ff",
+      mint: "#dafff8",
+      stone: "#f7f8fb",
+      charcoal: "#0f0f0f",
+      ivory: "#fefefe",
+      rose: "#ffe3ec",
+      pistachio: "#e4f8e9",
+      sky: "#e1edff",
+      copper: "#f7d8b5",
+      peach: "#ffe8d0",
+      storm: "#1e2636",
+      gold: "#fff5d4",
+      lavender: "#f6edff"
+    }
+
+    const dotSize = compact ? 14 : 16
+    const gap = compact ? 4 : 6
+    const containerWidth = `calc(${dotSize * 5}px + ${gap * 4}px)`
 
     return (
-      <button
-        onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
-        title="테마 전환"
-        aria-label="테마 전환"
+      <div
+        role="group"
+        aria-label="테마 선택"
         style={{
-          height: 34,
-          padding: "0 10px",
+          width: containerWidth,
+          minHeight: dotSize + gap * 2,
           borderRadius: 999,
           border: `1px solid ${ui.border}`,
           background: ui.surface,
-          cursor: "pointer",
-          display: "inline-flex",
-          alignItems: "center",
-          gap: 8
+          display: "grid",
+          gridTemplateColumns: `repeat(5, ${dotSize}px)`,
+          gap,
+          padding: compact ? "6px 4px" : "6px 5px",
+          justifyContent: "center"
         }}
       >
-        <span
-          aria-hidden="true"
-          style={{
-            width: 18,
-            height: 18,
-            borderRadius: 999,
-            background: "#ffffff",
-            border: `2px solid ${isDark ? baseBorder : ring}`,
-            boxShadow: "inset 0 0 0 1px rgba(0,0,0,0.10)"
-          }}
-        />
-        <span
-          aria-hidden="true"
-          style={{
-            width: 18,
-            height: 18,
-            borderRadius: 999,
-            background: "#0b1220",
-            border: `2px solid ${isDark ? ring : baseBorder}`,
-            boxShadow: "inset 0 0 0 1px rgba(255,255,255,0.06)"
-          }}
-        />
-      </button>
+        {THEME_ORDER.map((name) => {
+          const isActive = theme === name
+          return (
+            <button
+              key={name}
+              type="button"
+              onClick={() => setTheme(name)}
+              title={`${name} 테마`}
+              aria-label={`${name} 테마`}
+              style={{
+                width: dotSize,
+                height: dotSize,
+                borderRadius: 999,
+                border: `1.5px solid ${isActive ? ui.accent : baseBorder}`,
+                background: dotColors[name],
+                boxShadow: isActive
+                  ? "0 0 0 2px rgba(59, 130, 246, 0.25)"
+                  : "inset 0 0 0 0.5px rgba(0,0,0,0.12)",
+                cursor: "pointer",
+                padding: 0
+              }}
+            />
+          )
+        })}
+      </div>
     )
   }
 
@@ -2982,17 +3497,30 @@ useEffect(() => {
                     position: "absolute",
                     top: 40,
                     right: 0,
-                    width: 220,
-                    borderRadius: 12,
+                    width: 230,
+                    borderRadius: 16,
                     border: `1px solid ${ui.border}`,
                     background: ui.surface,
-                    boxShadow: ui.shadow,
-                    padding: 12,
-                    zIndex: 60
+                    boxShadow: "0 18px 40px rgba(15, 23, 42, 0.3)",
+                    padding: "12px 14px",
+                    zIndex: 60,
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 6,
+                    fontFamily: panelFontFamily
                   }}
                 >
-                  <div style={{ fontWeight: 950, marginBottom: 10 }}>통합 필터</div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  <div
+                    style={{
+                      fontWeight: 900,
+                      marginBottom: 2,
+                      color: ui.text,
+                      letterSpacing: "0.01em"
+                    }}
+                  >
+                    통합 필터
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                     {editableWindows.map((w) => (
                       <label
                         key={w.id}
@@ -3000,8 +3528,15 @@ useEffect(() => {
                           display: "flex",
                           alignItems: "center",
                           gap: 8,
-                          fontWeight: 800,
-                          color: ui.text
+                          fontWeight: 500,
+                          color: ui.text,
+                          padding: "4px 10px",
+                          borderRadius: 8,
+                          border: `1px solid ${ui.border2}`,
+                          background: ui.surface2,
+                          cursor: "pointer",
+                          fontFamily: panelFontFamily,
+                          transition: "border-color 120ms ease"
                         }}
                       >
                         <input
@@ -3012,7 +3547,14 @@ useEffect(() => {
                             setIntegratedFilters((prev) => ({ ...prev, [w.id]: next }))
                           }}
                         />
-                        <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                        <span
+                          style={{
+                            whiteSpace: "nowrap",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            fontSize: 13
+                          }}
+                        >
                           {w.title}
                         </span>
                       </label>
@@ -3078,113 +3620,111 @@ useEffect(() => {
             position: "absolute",
             top: 48,
             right: 12,
-            width: 260,
-            borderRadius: 12,
+            width: 202,
+            borderRadius: 16,
             border: `1px solid ${ui.border}`,
             background: ui.surface,
-            boxShadow: ui.shadow,
-            padding: 12,
+            boxShadow: "0 10px 28px rgba(15, 23, 42, 0.25)",
+            padding: "10px 12px",
             zIndex: 50,
-            fontFamily: '"2026", ui-sans-serif'
+            display: "flex",
+            flexDirection: "column",
+            gap: 12,
+            fontFamily: panelFontFamily,
+            color: ui.text
           }}
         >
-            <div style={{ fontWeight: 600, marginBottom: 10 }}>설정</div>
-
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-              <div style={{ fontWeight: 600, color: ui.text2 }}>테마</div>
-              <ThemeToggle />
-            </div>
-
-            <div style={{ height: 10 }} />
-
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-              <div style={{ fontWeight: 600, color: ui.text2 }}>{"제목"}</div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <input
-                  type="number"
-                  inputMode="numeric"
-                  min={FONT_MIN}
-                  max={FONT_MAX}
-                  value={tabFontInput}
-                  onChange={(e) => {
-                    const raw = e.target.value
-                    setTabFontInput(raw)
-                    if (raw.trim() === "") return
-                    const n = Number(raw)
-                    if (!Number.isFinite(n)) return
-                    setTabFontPx(n)
-                  }}
-                  onBlur={(e) => {
-                    const n = Number(e.target.value)
-                    if (!Number.isFinite(n)) {
-                      setTabFontInput(String(tabFontPx))
-                      return
-                    }
-                    const clamped = clamp(n, FONT_MIN, FONT_MAX)
-                    setTabFontPx(clamped)
-                    setTabFontInput(String(clamped))
-                  }}
-                  style={{ ...controlInput, width: 86, textAlign: "right" }}
-                  title={"탭 글씨 크기(px)"}
-                />
-                <div style={{ fontSize: 12, color: ui.text2, fontWeight: 900 }}>px</div>
-              </div>
-            </div>
-
-            <div style={{ height: 10 }} />
-
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-              <div style={{ fontWeight: 600, color: ui.text2 }}>{"본문"}</div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <input
-                  type="number"
-                  inputMode="numeric"
-                  min={FONT_MIN}
-                  max={FONT_MAX}
-                  value={memoFontInput}
-                  onChange={(e) => {
-                    const raw = e.target.value
-                    setMemoFontInput(raw)
-                    if (raw.trim() === "") return
-                    const n = Number(raw)
-                    if (!Number.isFinite(n)) return
-                    setMemoFontPx(n)
-                  }}
-                  onBlur={(e) => {
-                    const n = Number(e.target.value)
-                    if (!Number.isFinite(n)) {
-                      setMemoFontInput(String(memoFontPx))
-                      return
-                    }
-                    const clamped = clamp(n, FONT_MIN, FONT_MAX)
-                    setMemoFontPx(clamped)
-                    setMemoFontInput(String(clamped))
-                  }}
-                  style={{ ...controlInput, width: 86, textAlign: "right" }}
-                  title={"본문 글씨 크기(px)"}
-                />
-                <div style={{ fontSize: 12, color: ui.text2, fontWeight: 900 }}>px</div>
-              </div>
-            </div>
-
-            <div style={{ height: 12 }} />
-
-            <button
-              onClick={() => setSettingsOpen(false)}
-              style={{
-                width: "100%",
-                height: 34,
-                borderRadius: 10,
-                border: `1px solid ${ui.border}`,
-                background: ui.surface2,
-                color: ui.text,
-                cursor: "pointer",
-                fontWeight: 900
-              }}
-            >
-              닫기
-            </button>
+          <div style={settingsRowStyle}>
+            <div style={settingsLabelTextStyle}>테마</div>
+            <ThemeToggle compact />
           </div>
+
+          <div style={settingsRowStyle}>
+            <div style={settingsLabelTextStyle}>제목</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <input
+                type="number"
+                inputMode="numeric"
+                min={FONT_MIN}
+                max={FONT_MAX}
+                value={tabFontInput}
+                onChange={(e) => {
+                  const raw = e.target.value
+                  setTabFontInput(raw)
+                  if (raw.trim() === "") return
+                  const n = Number(raw)
+                  if (!Number.isFinite(n)) return
+                  setTabFontPx(n)
+                }}
+                onBlur={(e) => {
+                  const n = Number(e.target.value)
+                  if (!Number.isFinite(n)) {
+                    setTabFontInput(String(tabFontPx))
+                    return
+                  }
+                  const clamped = clamp(n, FONT_MIN, FONT_MAX)
+                  setTabFontPx(clamped)
+                  setTabFontInput(String(clamped))
+                }}
+                style={{ ...settingsNumberInput, width: 48 }}
+                title={"탭 글씨 크기(px)"}
+              />
+              <div style={{ fontSize: 12, fontWeight: 700, color: ui.text2 }}>px</div>
+            </div>
+          </div>
+
+          <div style={settingsRowStyle}>
+            <div style={settingsLabelTextStyle}>본문</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <input
+                type="number"
+                inputMode="numeric"
+                min={FONT_MIN}
+                max={FONT_MAX}
+                value={memoFontInput}
+                onChange={(e) => {
+                  const raw = e.target.value
+                  setMemoFontInput(raw)
+                  if (raw.trim() === "") return
+                  const n = Number(raw)
+                  if (!Number.isFinite(n)) return
+                  setMemoFontPx(n)
+                }}
+                onBlur={(e) => {
+                  const n = Number(e.target.value)
+                  if (!Number.isFinite(n)) {
+                    setMemoFontInput(String(memoFontPx))
+                    return
+                  }
+                  const clamped = clamp(n, FONT_MIN, FONT_MAX)
+                  setMemoFontPx(clamped)
+                  setMemoFontInput(String(clamped))
+                }}
+                style={{ ...settingsNumberInput, width: 48 }}
+                title={"본문 글씨 크기(px)"}
+              />
+              <div style={{ fontSize: 12, fontWeight: 700, color: ui.text2 }}>px</div>
+            </div>
+          </div>
+
+          <button
+            onClick={() => setSettingsOpen(false)}
+            style={{
+              width: "100%",
+              height: 30,
+              borderRadius: 10,
+              border: `1px solid ${ui.border}`,
+              background: ui.surface2,
+              color: ui.text,
+              cursor: "pointer",
+              fontWeight: 600,
+              fontFamily: panelFontFamily,
+              letterSpacing: "0.04em"
+            }}
+          >
+            닫기
+          </button>
+        </div>
         )}
       </div>
       {/* ✅ 창 탭 바 */}
@@ -3515,11 +4055,13 @@ useEffect(() => {
                     onChange={(e) => {
                       handleLeftMemoChange(e)
                       updateMentionGhost()
+                      updateTabMentionMenu()
                     }}
                     onBlur={onTextareaBlur}
                     onClick={onTextareaSelectOrKeyUp}
                     onKeyUp={onTextareaSelectOrKeyUp}
                     onKeyDown={(e) => {
+                      if (handleTabMentionKeyDown(e)) return
                       if (acceptMentionGhost(e)) return
                       handleBoxEnterKey(
                         e,
@@ -3533,6 +4075,7 @@ useEffect(() => {
                     onScroll={(e) => {
                       syncOverlayScroll(e.currentTarget, leftOverlayInnerRef.current)
                       updateMentionGhost()
+                      updateTabMentionMenu()
                     }}
                     style={memoTextareaStyle}
                     placeholder={`왼쪽 메모장(기존 기능)
@@ -3544,9 +4087,58 @@ useEffect(() => {
 1/5
 09:00 회의
 장보기
-운동
+                    운동
 `}
                   />
+                  {tabMentionMenu.visible && activeWindowId === "all" ? (
+                    <div
+                      ref={tabMentionRef}
+                      style={{
+                        position: "absolute",
+                        top: tabMentionMenu.top,
+                        left: tabMentionMenu.left,
+                        minWidth: 120,
+                        borderRadius: 8,
+                        border: `1px solid ${ui.border}`,
+                        background: ui.surface,
+                        boxShadow: ui.shadow,
+                        zIndex: 5,
+                        display: "flex",
+                        flexDirection: "column",
+                        overflow: "hidden"
+                      }}
+                    >
+                      {editableWindows.map((w) => (
+                        <button
+                          key={w.id}
+                          type="button"
+                          onMouseDown={(e) => {
+                            e.preventDefault()
+                            tabMentionMouseDownRef.current = true
+                            handleTabMentionPick(w.title)
+                          }}
+                          onMouseEnter={() => setTabMentionHoverId(w.id)}
+                          onMouseLeave={() => {
+                            setTabMentionHoverId((prev) => (prev === w.id ? null : prev))
+                          }}
+                          style={{
+                            height: 30,
+                            padding: "0 10px",
+                            border: "none",
+                            background: tabMentionHoverId === w.id ? ui.surface2 : "transparent",
+                            color: ui.text,
+                            textAlign: "left",
+                            cursor: "pointer",
+                            fontWeight: 700,
+                            border: tabMentionHoverId === w.id ? `2px solid ${ui.accent}` : "2px solid transparent",
+                            boxSizing: "border-box"
+                          }}
+                        >
+                          {w.title}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
                 </>
               ) : (
                 <div
@@ -4204,7 +4796,7 @@ useEffect(() => {
                           }}
                           title="전체 일정 보기"
                         >
-                          +{hiddenCount}
+                          {items.length}개
                         </button>
                       ) : (
                         <button
