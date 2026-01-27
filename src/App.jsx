@@ -1057,6 +1057,7 @@ function App() {
   const filterBtnRef = useRef(null)
   const filterPanelRef = useRef(null)
   const tabsScrollRef = useRef(null)
+  const [tabScrollState, setTabScrollState] = useState({ left: false, right: false })
 
   useEffect(() => {
   if (!editingWindowId) return
@@ -1117,12 +1118,38 @@ function App() {
     return () => document.removeEventListener("pointerdown", onDocPointerDown, true)
   }, [filterOpen])
 
+  const updateTabScrollState = useCallback(() => {
+    const el = tabsScrollRef.current
+    if (!el) return
+    const max = Math.max(0, el.scrollWidth - el.clientWidth)
+    const left = el.scrollLeft > 2
+    const right = el.scrollLeft < max - 2
+    setTabScrollState((prev) => (prev.left === left && prev.right === right ? prev : { left, right }))
+  }, [])
+
   function scrollTabs(dir) {
     const el = tabsScrollRef.current
     if (!el) return
     const amount = Math.max(80, Math.floor(el.clientWidth * 0.6))
     el.scrollBy({ left: dir * amount, behavior: "smooth" })
   }
+
+  useEffect(() => {
+    const el = tabsScrollRef.current
+    if (!el) return
+    const onScroll = () => updateTabScrollState()
+    updateTabScrollState()
+    el.addEventListener("scroll", onScroll, { passive: true })
+    window.addEventListener("resize", onScroll)
+    return () => {
+      el.removeEventListener("scroll", onScroll)
+      window.removeEventListener("resize", onScroll)
+    }
+  }, [updateTabScrollState])
+
+  useEffect(() => {
+    updateTabScrollState()
+  }, [updateTabScrollState, windows, tabFontPx, splitRatio, outerCollapsed, layoutPreset])
 
   useEffect(() => {
     function onDocPointerDown(e) {
@@ -1490,6 +1517,11 @@ function App() {
     const next = e.target.value
     if (activeWindowId === "all") updateEditorText(next)
     else setTabEditText(next)
+    const key = getDateKeyAtCaret(next, e.target.selectionStart ?? 0)
+    if (key) {
+      lastCaretDateKeyRef.current = key
+      editSessionRef.current.lastChangeKey = key
+    }
   }
 
 function parseTabEditItemsByDate(tabText, baseYear, title) {
@@ -2129,12 +2161,40 @@ useEffect(() => {
     })
   }
 
+  function beginEditSession(entryKey) {
+    editSessionRef.current = { id: editSessionRef.current.id + 1, entryKey: entryKey ?? null, lastChangeKey: null }
+    lastCaretDateKeyRef.current = entryKey ?? null
+  }
+
+  function getDateKeyAtCaret(textValue, caretPos) {
+    const s = String(textValue ?? "")
+    const caret = clamp(Number(caretPos ?? 0), 0, s.length)
+    const lines = s.split("\n")
+    let lineIndex = 0
+    let acc = 0
+    for (let i = 0; i < lines.length; i++) {
+      const len = lines[i].length
+      if (caret <= acc + len) {
+        lineIndex = i
+        break
+      }
+      acc += len + 1
+      lineIndex = i
+    }
+    for (let i = lineIndex; i >= 0; i--) {
+      const key = getDateKeyFromLine(lines[i], baseYear)
+      if (key) return key
+    }
+    return null
+  }
+
   function enterEditMode() {
     const targetKey = selectedDateKey ?? lastEditedDateKey ?? lastActiveDateKeyRef.current
     if (targetKey) {
       handleReadBlockClick(targetKey)
       return
     }
+    beginEditSession(null)
     setIsEditingLeftMemo(true)
     requestAnimationFrame(() => {
       const el = textareaRef.current
@@ -2144,6 +2204,7 @@ useEffect(() => {
 
   function handleReadBlockClick(dateKey) {
     if (!dateKey) return
+    beginEditSession(dateKey)
     setActiveDateKey(dateKey)
     setIsEditingLeftMemo(true)
     requestAnimationFrame(() => {
@@ -2192,6 +2253,8 @@ useEffect(() => {
   const [lastEditedDateKey, setLastEditedDateKey] = useState(null)
   const [hoveredReadDateKey, setHoveredReadDateKey] = useState(null)
   const lastActiveDateKeyRef = useRef(null)
+  const lastCaretDateKeyRef = useRef(null)
+  const editSessionRef = useRef({ id: 0, entryKey: null, lastChangeKey: null })
   const calendarInteractingRef = useRef(false)
   const [dayListModal, setDayListModal] = useState(null)
   const [dayListEditText, setDayListEditText] = useState("")
@@ -2200,6 +2263,62 @@ useEffect(() => {
     if (!dayListModal) return null
     return parseDashboardBlockContent(dayListEditText)
   }, [dayListModal, dayListEditText])
+  const dayListReadItems = useMemo(() => {
+    if (!dayListView) return null
+    const isAll = activeWindowId === "all"
+    if (isAll) {
+      const filteredGroups = allowedDashboardGroupTitles
+        ? dayListView.groups.filter((group) => allowedDashboardGroupTitles.has(group.title))
+        : dayListView.groups
+      const orderedGroups = filteredGroups
+        .map((group, idx) => ({ group, idx }))
+        .sort((a, b) => {
+          const idxA = windowTitleRank.get(a.group.title)
+          const idxB = windowTitleRank.get(b.group.title)
+          const rankA = idxA != null ? idxA : Number.MAX_SAFE_INTEGER
+          const rankB = idxB != null ? idxB : Number.MAX_SAFE_INTEGER
+          if (rankA !== rankB) return rankA - rankB
+          return a.idx - b.idx
+        })
+        .map((entry) => entry.group)
+      const general = dayListView.general.filter((line) => String(line ?? "").trim())
+      const noTimeGroupItems = []
+      const timedItems = []
+      for (const group of orderedGroups) {
+        for (const item of group.items ?? []) {
+          const text = (item.text ?? "").trim()
+          if (!text) continue
+          const entry = { time: item.time || "", text, title: group.title }
+          if (entry.time) timedItems.push(entry)
+          else noTimeGroupItems.push(entry)
+        }
+      }
+      const timedNoGroup = (dayListView.timed ?? [])
+        .map((item) => ({
+          time: item.time || "",
+          text: (item.text ?? "").trim(),
+          title: ""
+        }))
+        .filter((item) => item.text)
+      timedItems.push(...timedNoGroup)
+      timedItems.sort((a, b) => {
+        const ta = timeToMinutes(a.time)
+        const tb = timeToMinutes(b.time)
+        if (ta !== tb) return ta - tb
+        return 0
+      })
+      return { isAll, general, noTimeGroupItems, timedItems }
+    }
+    const noTimeItems = dayListView.general.filter((line) => String(line ?? "").trim())
+    const timedItems = (dayListView.timed ?? [])
+      .map((item) => ({
+        time: item.time || "",
+        text: (item.text ?? "").trim()
+      }))
+      .filter((item) => item.text)
+    timedItems.sort((a, b) => timeToMinutes(a.time) - timeToMinutes(b.time))
+    return { isAll, noTimeItems, timedItems }
+  }, [dayListView, activeWindowId, windowTitleRank, allowedDashboardGroupTitles])
 
   const setReadBlockRef = useCallback((dateKey) => {
     return (el) => {
@@ -2234,6 +2353,7 @@ useEffect(() => {
   function setActiveDateKey(key) {
     if (!key) return
     lastActiveDateKeyRef.current = key
+    lastCaretDateKeyRef.current = key
     setSelectedDateKey(key)
     setLastEditedDateKey(key)
 
@@ -2331,15 +2451,19 @@ useEffect(() => {
     if (calendarInteractingRef.current) return
     const ta = textareaRef.current
     if (!ta) return
+    const value = ta.value ?? ""
     const caret = ta.selectionStart ?? 0
-    const sourceText = activeWindowId === "all" ? text : tabEditText
-    const sourceBlocks =
-      activeWindowId === "all" ? blocks : parseBlocksAndItems(sourceText ?? "", baseYear).blocks
-    const idx = findBlockIndexByCaret(sourceBlocks, caret)
-    if (idx < 0) return
-    const key = sourceBlocks[idx]?.dateKey
+    const key = getDateKeyAtCaret(value, caret)
     if (!key) return
-    setActiveDateKey(key)
+    lastActiveDateKeyRef.current = key
+    lastCaretDateKeyRef.current = key
+    setSelectedDateKey(key)
+
+    const { y, m } = keyToYMD(key)
+    if (viewRef.current.year !== y || viewRef.current.month !== m) {
+      setView({ year: y, month: m })
+      viewRef.current = { year: y, month: m }
+    }
   }
 
   function updateMentionGhost() {
@@ -2589,6 +2713,15 @@ useEffect(() => {
       return
     }
     if (tabMentionMenu.visible) setTabMentionMenu({ visible: false, top: 0, left: 0 })
+
+    const exitKey =
+      editSessionRef.current.lastChangeKey ||
+      lastCaretDateKeyRef.current ||
+      editSessionRef.current.entryKey ||
+      selectedDateKey ||
+      lastActiveDateKeyRef.current
+    if (exitKey) setLastEditedDateKey(exitKey)
+
     if (activeWindowId !== "all") {
       let nextTabText = tabEditText ?? ""
       let changed = false
@@ -2629,7 +2762,6 @@ useEffect(() => {
       updateEditorText(normalized)
     }
     if (!calendarInteractingRef.current) {
-      if (selectedDateKey) setLastEditedDateKey(selectedDateKey)
       setSelectedDateKey(null)
       lastActiveDateKeyRef.current = null
     }
@@ -2638,15 +2770,16 @@ useEffect(() => {
 
   // ===== 달력 클릭 =====
   function handleDayClick(day) {
+    const { year, month } = viewRef.current
+    const key = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`
     if (!isEditingLeftMemo) {
+      beginEditSession(key)
       setIsEditingLeftMemo(true)
       requestAnimationFrame(() => {
         const el = textareaRef.current
         if (el) el.focus()
       })
     }
-    const { year, month } = viewRef.current
-    const key = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`
     setActiveDateKey(key)
 
     const isAll = activeWindowId === "all"
@@ -2719,6 +2852,7 @@ useEffect(() => {
     const d = today.getDate()
     const key = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`
 
+    if (!isEditingLeftMemo) beginEditSession(key)
     setIsEditingLeftMemo(true)
     requestAnimationFrame(() => {
       const el = textareaRef.current
@@ -3579,6 +3713,8 @@ useEffect(() => {
 
   const showMemoPanel = layoutPreset === "memo-left" ? outerCollapsed !== "left" : outerCollapsed !== "right"
   const showCalendarPanel = layoutPreset === "memo-left" ? outerCollapsed !== "right" : outerCollapsed !== "left"
+  const canScrollTabsLeft = tabScrollState.left
+  const canScrollTabsRight = tabScrollState.right
 
   const memoPanel = (
     <div
@@ -3650,6 +3786,7 @@ useEffect(() => {
           >
               <button
                 onClick={toggleLeftMemo}
+                className="no-hover-outline memo-toggle-button is-left"
                 style={{
                   width: 30,
                   height: 32,
@@ -3672,6 +3809,7 @@ useEffect(() => {
             <div style={{ width: 1, height: 32, background: ui.border2 }} />
               <button
                 onClick={toggleRightMemo}
+                className="no-hover-outline memo-toggle-button is-right"
                 style={{
                   width: 30,
                   height: 32,
@@ -3953,7 +4091,7 @@ useEffect(() => {
       {/* ✅ 창 탭 바 */}
       <div
         style={{
-          padding: "8px 12px",
+          padding: "10px 12px 8px",
           borderBottom: `1px solid ${ui.border}`,
           background: ui.surface2,
           display: "flex",
@@ -3964,8 +4102,9 @@ useEffect(() => {
       >
         <button
           onClick={() => scrollTabs(-1)}
-          className="arrow-button"
-          style={{ ...arrowButton, flexShrink: 0 }}
+          className={`arrow-button${canScrollTabsLeft ? " is-active" : ""}`}
+          style={{ ...arrowButton, flexShrink: 0, cursor: canScrollTabsLeft ? "pointer" : "default" }}
+          disabled={!canScrollTabsLeft}
           title="왼쪽으로 이동"
           aria-label="왼쪽으로 이동"
         >
@@ -3980,7 +4119,8 @@ useEffect(() => {
             whiteSpace: "nowrap",
             display: "flex",
             gap: 6,
-            paddingBottom: 0
+            paddingBottom: 0,
+            paddingTop: 2
           }}
         >
           {windows.map((w) => {
@@ -4158,7 +4298,7 @@ useEffect(() => {
       {/* ❌ 삭제 버튼 (통합 제외) */}
       {!isFixed && (
         <button
-          className="tab-pill__delete"
+          className="tab-pill__delete no-hover-outline"
           onClick={(e) => {
             e.stopPropagation() // 탭 클릭 방지
             setDeleteConfirm({ id: w.id, title: w.title })
@@ -4187,8 +4327,9 @@ useEffect(() => {
 
         <button
           onClick={() => scrollTabs(1)}
-          className="arrow-button"
-          style={{ ...arrowButton, flexShrink: 0 }}
+          className={`arrow-button${canScrollTabsRight ? " is-active" : ""}`}
+          style={{ ...arrowButton, flexShrink: 0, cursor: canScrollTabsRight ? "pointer" : "default" }}
+          disabled={!canScrollTabsRight}
           title="오른쪽으로 이동"
           aria-label="오른쪽으로 이동"
         >
@@ -4303,17 +4444,44 @@ useEffect(() => {
                       updateTabMentionMenu()
                     }}
                     style={memoTextareaStyle}
-                    placeholder={`왼쪽 메모장(기존 기능)
-
-1) 달력에서 날짜를 클릭하면, 메모에 날짜가 자동으로 생깁니다.
-2) 그 아래 줄에 할 일을 적으면 됩니다.
-
-예)
-1/5
-09:00 회의
-장보기
-                    운동
-`}
+                    placeholder={
+                      activeWindowId === "all"
+                        ? [
+                            "[계획 메모장]",
+                            "(+버튼을 눌러 새로운 메모장을 생성)",
+                            "통합 탭에서는 모든 메모장들의 메모를 합쳐서 보여줍니다.",
+                            "",
+                            "1. 날짜를 달력에서 클릭하거나 1/25 처럼 직접 입력",
+                            "2. 날짜 아래에 [시간;@메모장 제목;내용] 형식 맞춰 입력", 
+                        
+                            
+                            "(시간,@메모장 제목은 생략 가능)",
+                            "",
+                            "ex)",
+                            "1/25",
+                            "11:00;@대학;수강신청",
+                            "12:00;@연애;선물 구매",
+                            "",
+                            "1/26",
+                            "10:00;1교시",
+                            "@금융;적금 계좌 개설"
+                          ].join("\n")
+                        : [
+                            "메모장의 제목을 수정하여 원하는 카테고리를 생성하세요",
+                            "",
+                            "이 탭에 적는 내용은 '통합'에 자동으로 합쳐집니다.",
+                            "(여기서는 @탭제목을 직접 쓸 필요 없습니다.)",
+                            "",
+                  
+                            "예)",
+                            "1/4",
+                            "10:00;회의",
+                            "",
+                            "1/5",
+                            "11:00;회의",
+                            "장보기",
+                          ].join("\n")
+                    }
                   />
                   {tabMentionMenu.visible && activeWindowId === "all" ? (
                     <div
@@ -4382,7 +4550,15 @@ useEffect(() => {
                   }}
                 >
                   {(activeWindowId === "all" ? dashboardBlocks : tabReadBlocks).length === 0 ? (
-                    <div style={{ color: ui.text2, fontWeight: 600 }}>내용이 없습니다.</div>
+                    <div
+                      style={{
+                        color: ui.text2,
+                        fontWeight: 600,
+                        lineHeight: 1.45
+                      }}
+                    >
+                      읽기모드입니다. 클릭하여 편집하세요.
+                    </div>
                   ) : (
                     (activeWindowId === "all" ? dashboardBlocks : tabReadBlocks).map((block) => {
                       const { y, m, d } = keyToYMD(block.dateKey)
@@ -4618,9 +4794,24 @@ useEffect(() => {
                 }}
                 onScroll={(e) => syncOverlayScroll(e.currentTarget, rightOverlayInnerRef.current)}
                 style={memoTextareaStyle}
-                placeholder={`오른쪽 메모장 (아무 기능 없음)
+                placeholder={
+                  activeWindowId === "all"
+                    ? [
+                        "[자유 메모장]",
+                        "통합 탭에서는 모든 메모장들의 메모를 합쳐서 보여줍니다.",
+                        "",
+                        "맨 위(섹션 제목 없이)는 공통 메모로 사용하세요.",
+                        "",
+                        "ex)",
+                        "오늘도 화이팅",
+                        "[대학]",
+                        "권교수님 피드백 다시 한 번 생각하기",
+                        "[연애]",
+                        "100일 이벤트 준비하기"
 
-- 일단은 자유 메모로만 사용`}
+                      ].join("\n")
+                    : ["[자유 메모]", "", "해당 메모장에 쓰고 싶은 글을 자유롭게 입력하세요."].join("\n")
+                }
               />
             </div>
           </div>
@@ -4707,6 +4898,7 @@ useEffect(() => {
                 type="number"
                 value={ymYear}
                 onChange={(e) => setYmYear(e.target.value)}
+                className="calendar-ym-control"
                 style={{ ...controlInput, width: 76, padding: "0 24px 0 10px" }}
                 aria-label="연도 입력"
               />
@@ -4729,6 +4921,7 @@ useEffect(() => {
                     const next = Number(ymYear)
                     setYmYear(Number.isFinite(next) ? next + 1 : view.year + 1)
                   }}
+                  className="no-hover-outline ym-spin-button"
                   style={{
                     width: 22,
                     height: 20,
@@ -4756,6 +4949,7 @@ useEffect(() => {
                     const next = Number(ymYear)
                     setYmYear(Number.isFinite(next) ? next - 1 : view.year - 1)
                   }}
+                  className="no-hover-outline ym-spin-button"
                   style={{
                     width: 22,
                     height: 20,
@@ -4783,6 +4977,7 @@ useEffect(() => {
                 <select
                   value={ymMonth}
                   onChange={(e) => setYmMonth(Number(e.target.value))}
+                  className="calendar-ym-control"
                   style={{
                     ...controlInput,
                     width: 72,
@@ -5540,55 +5735,60 @@ useEffect(() => {
                   maxHeight: "60vh",
                   padding: "12px",
                   borderRadius: 10,
-                  border: `1px solid ${ui.border2}`,
-                  background: ui.surface2,
+                  border: `1px solid ${ui.border}`,
+                  background: ui.surface,
                   color: ui.text,
                   fontSize: memoFontPx,
-                  lineHeight: 1.28,
+                  lineHeight: 1.25,
                   fontFamily: "inherit",
-                  fontWeight: 600,
-                  overflowY: "auto"
+                  fontWeight: 400,
+                  overflowY: "auto",
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 2
                 }}
               >
-                {dayListView ? (
-                  <>
-                    {dayListView.general.map((line, idx) => (
-                      <div key={`daylist-general-${idx}`} style={{ color: ui.text, marginBottom: 4 }}>
-                        {line}
-                      </div>
-                    ))}
-                    {dayListView.timed.map((item, idx) => (
-                      <div key={`daylist-timed-${idx}`} style={{ color: ui.text, marginBottom: 4 }}>
-                        {item.time} {item.text}
-                      </div>
-                    ))}
-                    {dayListView.groups
-                      .map((group, idx) => ({ group, idx }))
-                      .sort((a, b) => {
-                        const rankA = windowTitleRank.get(a.group.title) ?? Number.MAX_SAFE_INTEGER
-                        const rankB = windowTitleRank.get(b.group.title) ?? Number.MAX_SAFE_INTEGER
-                        if (rankA !== rankB) return rankA - rankB
-                        return a.idx - b.idx
-                      })
-                      .map((entry) => entry.group)
-                      .map((group, gi) => (
-                        <div key={`daylist-group-${gi}`} style={{ marginTop: gi === 0 && dayListView.general.length ? 12 : 8 }}>
-                          <div style={{ fontWeight: 900 }}>[{group.title}]</div>
-                          <div style={{ marginTop: 4, display: "flex", flexDirection: "column", gap: 2 }}>
-                            {group.items.map((item, ii) => (
-                              <div key={`daylist-group-${gi}-item-${ii}`}>
-                                {item.time ? `${item.time} ` : ""}{item.text}
-                              </div>
-                            ))}
-                          </div>
+                {dayListReadItems ? (
+                  dayListReadItems.isAll ? (
+                    <>
+                      {dayListReadItems.general.map((line, idx) => (
+                        <div key={`daylist-general-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
+                          {line}
                         </div>
                       ))}
-                    {dayListView.general.length === 0 &&
-                      dayListView.groups.length === 0 &&
-                      dayListView.timed.length === 0 && (
-                      <div style={{ color: ui.text2 }}>내용이 없습니다.</div>
-                    )}
-                  </>
+                      {dayListReadItems.noTimeGroupItems.map((item, idx) => (
+                        <div key={`daylist-group-notime-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
+                          [{item.title}] {item.text}
+                        </div>
+                      ))}
+                      {dayListReadItems.timedItems.map((item, idx) => (
+                        <div key={`daylist-timed-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
+                          {item.time} {item.title ? `[${item.title}] ` : ""}{item.text}
+                        </div>
+                      ))}
+                      {dayListReadItems.general.length === 0 &&
+                        dayListReadItems.noTimeGroupItems.length === 0 &&
+                        dayListReadItems.timedItems.length === 0 && (
+                        <div style={{ color: ui.text2 }}>내용이 없습니다.</div>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      {dayListReadItems.noTimeItems.map((line, idx) => (
+                        <div key={`daylist-notime-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
+                          {line}
+                        </div>
+                      ))}
+                      {dayListReadItems.timedItems.map((item, idx) => (
+                        <div key={`daylist-timed-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
+                          {item.time} {item.text}
+                        </div>
+                      ))}
+                      {dayListReadItems.noTimeItems.length === 0 && dayListReadItems.timedItems.length === 0 && (
+                        <div style={{ color: ui.text2 }}>내용이 없습니다.</div>
+                      )}
+                    </>
+                  )
                 ) : (
                   <span style={{ color: ui.text2 }}>내용이 없습니다.</span>
                 )}
@@ -5690,9 +5890,45 @@ useEffect(() => {
           transition: transform 120ms ease, filter 120ms ease, box-shadow 120ms ease, background 120ms ease,
             border-color 120ms ease, color 120ms ease;
         }
-        button:hover:not(:disabled) {
+        button:hover:not(:disabled):not(.no-hover-outline) {
           transform: translateY(-1px);
           filter: brightness(0.98);
+          outline: 2px solid ${ui.accent};
+          outline-offset: -1px;
+        }
+        .no-hover-outline:hover:not(:disabled) {
+          outline: none;
+        }
+        .memo-toggle-button {
+          border-radius: 0;
+        }
+        .memo-toggle-button.is-left {
+          border-radius: 10px 0 0 10px;
+        }
+        .memo-toggle-button.is-right {
+          border-radius: 0 10px 10px 0;
+        }
+        .memo-toggle-button.is-left:hover:not(:disabled) {
+          box-shadow: inset 0 0 0 2px ${ui.accent};
+          background: ${ui.surface2};
+        }
+        .memo-toggle-button.is-right:hover:not(:disabled) {
+          box-shadow: inset 0 0 0 2px ${ui.accent};
+          background: ${ui.surface2};
+        }
+        .ym-spin-button {
+          transition: color 120ms ease, opacity 120ms ease;
+        }
+        .ym-spin-button:hover:not(:disabled) {
+          color: ${ui.text} !important;
+          opacity: 1 !important;
+          background: transparent;
+        }
+        .calendar-ym-control {
+          transition: box-shadow 120ms ease, border-color 120ms ease;
+        }
+        .calendar-ym-control:hover {
+          box-shadow: 0 0 0 1px ${ui.accent}, 0 0 0 3px ${ui.accentSoft};
         }
         .memo-input {
           color: transparent;
@@ -5712,6 +5948,13 @@ useEffect(() => {
         .memo-overlay__fn {
           font-weight: 600;
         }
+        .tab-pill {
+          transition: transform 120ms ease, box-shadow 120ms ease;
+        }
+        .tab-pill:hover {
+          transform: translateY(-0.5px);
+          box-shadow: inset 0 0 0 2px ${ui.accentSoft};
+        }
         .arrow-button {
           --arrow-opacity: 0.35;
           --arrow-border: transparent;
@@ -5719,17 +5962,38 @@ useEffect(() => {
           --arrow-color: ${ui.text2};
           --arrow-shadow: none;
         }
+        .arrow-button.is-active {
+          --arrow-opacity: 0.95;
+          --arrow-border: ${ui.accent};
+          --arrow-bg: ${ui.surface2};
+          --arrow-color: ${ui.text};
+          --arrow-shadow: 0 0 0 2px ${ui.accentSoft};
+        }
         .arrow-button:hover {
           --arrow-opacity: 0.85;
           --arrow-border: ${ui.border2};
           --arrow-bg: ${ui.surface2};
           --arrow-color: ${ui.text};
         }
+        .arrow-button.is-active:hover {
+          --arrow-opacity: 1;
+          --arrow-border: ${ui.accent};
+          --arrow-bg: ${ui.surface2};
+          --arrow-color: ${ui.text};
+          --arrow-shadow: 0 0 0 2px ${ui.accentSoft};
+        }
         .arrow-button:focus-visible {
           --arrow-opacity: 0.9;
           --arrow-border: ${ui.accent};
           --arrow-bg: ${ui.surface2};
           --arrow-color: ${ui.text};
+        }
+        .arrow-button:disabled {
+          --arrow-opacity: 0.2;
+          --arrow-border: transparent;
+          --arrow-bg: transparent;
+          --arrow-color: ${ui.text2};
+          --arrow-shadow: none;
         }
         .tab-pill__delete {
           opacity: 0;
