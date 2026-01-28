@@ -247,6 +247,67 @@ const FIXED_HOLIDAYS_MMDD = {
 
 // 연도별 변동 공휴일 수동 추가용
 const YEAR_HOLIDAYS = {}
+const HOLIDAY_COUNTRY_CODE = "KR"
+const HOLIDAY_CACHE_PREFIX = "planner-holidays"
+const HOLIDAY_CACHE_TTL = 1000 * 60 * 60 * 24 * 30
+
+function getHolidayCacheKey(year, countryCode) {
+  return `${HOLIDAY_CACHE_PREFIX}-${countryCode}-${year}`
+}
+
+function readHolidayCache(year, countryCode = HOLIDAY_COUNTRY_CODE) {
+  if (typeof window === "undefined") return null
+  const key = getHolidayCacheKey(year, countryCode)
+  try {
+    const raw = localStorage.getItem(key)
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== "object") return null
+    const items = parsed.items
+    const fetchedAt = Number(parsed.fetchedAt)
+    if (!items || typeof items !== "object" || !Number.isFinite(fetchedAt)) return null
+    return { items, fetchedAt }
+  } catch {
+    return null
+  }
+}
+
+function writeHolidayCache(year, items, countryCode = HOLIDAY_COUNTRY_CODE) {
+  if (typeof window === "undefined") return
+  const key = getHolidayCacheKey(year, countryCode)
+  try {
+    localStorage.setItem(key, JSON.stringify({ items, fetchedAt: Date.now() }))
+  } catch {}
+}
+
+function isHolidayCacheFresh(entry) {
+  if (!entry) return false
+  return Date.now() - entry.fetchedAt < HOLIDAY_CACHE_TTL
+}
+
+function normalizeHolidayItems(items) {
+  if (!Array.isArray(items)) return {}
+  const map = {}
+  for (const item of items) {
+    if (!item || typeof item !== "object") continue
+    const date = String(item.date ?? "").trim()
+    if (!date) continue
+    const name = String(item.localName || item.name || "").trim()
+    if (!name) continue
+    if (Array.isArray(item.types) && item.types.length > 0 && !item.types.includes("Public")) continue
+    map[date] = name
+  }
+  return map
+}
+
+async function fetchHolidayYear(year, countryCode = HOLIDAY_COUNTRY_CODE) {
+  const y = Number(year)
+  if (!Number.isFinite(y)) return {}
+  const res = await fetch(`https://date.nager.at/api/v3/PublicHolidays/${y}/${countryCode}`)
+  if (!res.ok) throw new Error(`holiday fetch failed: ${res.status}`)
+  const data = await res.json()
+  return normalizeHolidayItems(data)
+}
 
 function getHolidayName(year, month, day) {
   const key = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`
@@ -975,6 +1036,46 @@ function App() {
   useEffect(() => {
     viewRef.current = view
   }, [view])
+
+  const [, setHolidayTick] = useState(0)
+  const holidayLoadingRef = useRef(new Set())
+  const ensureHolidayYear = useCallback((year) => {
+    const y = Number(year)
+    if (!Number.isFinite(y)) return
+    if (YEAR_HOLIDAYS[y]) return
+    if (holidayLoadingRef.current.has(y)) return
+
+    holidayLoadingRef.current.add(y)
+
+    const cached = readHolidayCache(y)
+    if (cached?.items && typeof cached.items === "object") {
+      YEAR_HOLIDAYS[y] = cached.items
+      setHolidayTick((prev) => prev + 1)
+    }
+
+    const shouldFetch = !cached || !isHolidayCacheFresh(cached)
+    if (!shouldFetch) {
+      holidayLoadingRef.current.delete(y)
+      return
+    }
+
+    fetchHolidayYear(y)
+      .then((items) => {
+        if (!items || Object.keys(items).length === 0) return
+        YEAR_HOLIDAYS[y] = items
+        writeHolidayCache(y, items)
+        setHolidayTick((prev) => prev + 1)
+      })
+      .catch(() => {})
+      .finally(() => {
+        holidayLoadingRef.current.delete(y)
+      })
+  }, [])
+
+  useEffect(() => {
+    ensureHolidayYear(baseYear)
+    if (view.year !== baseYear) ensureHolidayYear(view.year)
+  }, [baseYear, view.year, ensureHolidayYear])
 
   // 상시 수정 가능한 연/월 입력값 (즉시 반영)
   const [ymYear, setYmYear] = useState(view.year)
