@@ -21,7 +21,6 @@ const groupLineRegex = /^\s*@([^(]+)\(([^)]*)\)\s*$/
 const groupLineStartRegex = /^\s*@([^(]+)\s*\(\s*$/
 const groupLineTitleOnlyRegex = /^\s*@([^()]+)\s*$/
 const groupLineCloseRegex = /^\s*\)\s*$/
-const emptyGroupLineParenRegex = /^\s*\(\s*\)\s*$/
 const timeTokenRegex = /^(\d{1,2}):(\d{2})$/
 const timeRangeRegex = /^(\d{1,2}):(\d{2})\s*([~-])\s*(\d{1,2}):(\d{2})$/
 const timePrefixRegex = /^(\d{1,2}):(\d{2})(?:\s*([~-])\s*(\d{1,2}):(\d{2}))?(?:\s*;\s*|\s+)(.+)$/
@@ -183,30 +182,6 @@ function replaceGroupTitleInText(text, oldTitle, newTitle) {
   return changed ? nextLines.join("\n") : text
 }
 
-function escapeRegex(value) {
-  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-}
-
-function findRawGroupLineText(body, title) {
-  if (!body || !title) return null
-  const pattern = new RegExp(`[ \\t]*@${escapeRegex(title)}\\s*\\(([\\s\\S]*?)\\)`, "g")
-  const match = pattern.exec(body)
-  if (!match) return null
-  return match[0]
-}
-function findRawGroupLineMatch(body, title) {
-  if (!body || !title) return null
-  const pattern = new RegExp(`[ \\t]*@${escapeRegex(title)}\\s*\\(([\\s\\S]*?)\\)`, "g")
-  const match = pattern.exec(body)
-  return match || null
-}
-function getGroupLineCaretOffset(groupLineText) {
-  const openIdx = groupLineText.indexOf("(")
-  if (openIdx === -1) return 0
-  let offset = openIdx + 1
-  if (groupLineText[offset] === "\n") offset += 1
-  return offset
-}
 function getGroupLineParts(line) {
   const trimmed = (line ?? "").trim()
   if (!trimmed) return null
@@ -350,7 +325,7 @@ function listHolidayCacheEntries(countryCode = HOLIDAY_COUNTRY_CODE) {
       const fetchedAt = cached?.fetchedAt ?? 0
       entries.push({ key, year, fetchedAt })
     }
-  } catch {}
+  } catch (err) { void err }
   return entries
 }
 
@@ -363,7 +338,7 @@ function pruneHolidayCache(countryCode = HOLIDAY_COUNTRY_CODE, maxYears = HOLIDA
   for (const entry of toRemove) {
     try {
       localStorage.removeItem(entry.key)
-    } catch {}
+    } catch (err) { void err }
   }
 }
 
@@ -372,7 +347,7 @@ function writeHolidayCache(year, items, countryCode = HOLIDAY_COUNTRY_CODE) {
   const key = getHolidayCacheKey(year, countryCode)
   try {
     localStorage.setItem(key, JSON.stringify({ items, fetchedAt: Date.now() }))
-  } catch {}
+  } catch (err) { void err }
   pruneHolidayCache(countryCode)
 }
 
@@ -429,11 +404,11 @@ function buildLineStartPositions(s) {
 
 // ===== 날짜 헤더 파서 =====
 const mdOnlyRegex = /^\s*(\d{1,2})\/(\d{1,2})(?:\s+.*)?\s*$/
-const ymdOnlyRegex = /^\s*(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})(?:\s+.*)?\s*$/
+const ymdOnlyRegex = /^\s*(\d{4})[/-](\d{1,2})[/-](\d{1,2})(?:\s+.*)?\s*$/
 const timeOnlyRegex = /^\s*(\d{1,2}):(\d{2})(?:\s*([~-])\s*(\d{1,2}):(\d{2}))?\s+(.+)\s*$/
 const tabTitleRegex = /^\s*\[.+\]\s*$/
 
-function parseBlocksAndItems(rawText, baseYear) {
+function parseBlocksAndItems(rawText, baseYear, { allowAnyYear = false } = {}) {
   const s = rawText ?? ""
   const lines = s.split("\n")
   const lineStarts = buildLineStartPositions(s)
@@ -452,8 +427,11 @@ function parseBlocksAndItems(rawText, baseYear) {
       key = `${baseYear}-${String(Number(m[1])).padStart(2, "0")}-${String(Number(m[2])).padStart(2, "0")}`
     } else {
       m = trimmed.match(ymdOnlyRegex)
-      if (m && Number(m[1]) === baseYear)
-        key = `${baseYear}-${String(Number(m[2])).padStart(2, "0")}-${String(Number(m[3])).padStart(2, "0")}`
+      if (m && (allowAnyYear || Number(m[1]) === baseYear)) {
+        const year = Number(m[1])
+        const normalizedYear = Number.isFinite(year) ? year : baseYear
+        key = `${normalizedYear}-${String(Number(m[2])).padStart(2, "0")}-${String(Number(m[3])).padStart(2, "0")}`
+      }
     }
 
     if (key) {
@@ -545,7 +523,7 @@ function syncOverlayScroll(textarea, overlayInner) {
   overlayInner.style.transform = `translateY(${-textarea.scrollTop}px)`
 }
 
-function normalizePrettyAndMerge(text, baseYear) {
+function normalizePrettyAndMerge(text, baseYear, { allowAnyYear = false } = {}) {
   const s = text ?? ""
   const lines = s.split("\n")
 
@@ -569,11 +547,15 @@ function normalizePrettyAndMerge(text, baseYear) {
 
     let key = null
     let m = trimmed.match(mdOnlyRegex)
-    if (m) key = `${baseYear}-${String(Number(m[1])).padStart(2, "0")}-${String(Number(m[2])).padStart(2, "0")}`
-    else {
+    if (m) {
+      key = `${baseYear}-${String(Number(m[1])).padStart(2, "0")}-${String(Number(m[2])).padStart(2, "0")}`
+    } else {
       m = trimmed.match(ymdOnlyRegex)
-      if (m && Number(m[1]) === baseYear)
-        key = `${baseYear}-${String(Number(m[2])).padStart(2, "0")}-${String(Number(m[3])).padStart(2, "0")}`
+      if (m && (allowAnyYear || Number(m[1]) === baseYear)) {
+        const year = Number(m[1])
+        const normalizedYear = Number.isFinite(year) ? year : baseYear
+        key = `${normalizedYear}-${String(Number(m[2])).padStart(2, "0")}-${String(Number(m[3])).padStart(2, "0")}`
+      }
     }
 
     if (key) {
@@ -622,8 +604,8 @@ function normalizePrettyAndMerge(text, baseYear) {
   })
 
   const outBlocks = blocks.map((b) => {
-    const { m, d } = keyToYMD(b.key)
-    const header = buildHeaderLine(baseYear, m, d)
+    const { y, m, d } = keyToYMD(b.key)
+    const header = buildHeaderLine(y, m, d)
     if (b.body.length === 0) return header
     return `${header}\n${b.body.join("\n")}`.trimEnd()
   })
@@ -848,20 +830,6 @@ function insertDateBlockAt(text, insertPos, headerLine) {
 }
 
 // ===== caret -> 블록 찾기 =====
-function findBlockIndexByCaret(blocks, caretPos) {
-  if (!blocks || blocks.length === 0) return -1
-  let lo = 0
-  let hi = blocks.length - 1
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1
-    const b = blocks[mid]
-    if (caretPos < b.blockStartPos) hi = mid - 1
-    else if (caretPos >= b.blockEndPos) lo = mid + 1
-    else return mid
-  }
-  return Math.max(0, hi)
-}
-
 function afterTwoFrames(fn) {
   requestAnimationFrame(() => requestAnimationFrame(fn))
 }
@@ -899,11 +867,7 @@ function ensureBodyLineForBlock(text, block) {
   const newText = text.slice(0, insertPos) + "\n" + text.slice(insertPos)
   return { newText, caretPos: insertPos }
 }
-function ensureBodyLineForTab(text, block) {
-  return ensureBodyLineForBlock(text, block)
-}
-
-function ensureTabGroupLineAtDate(text, dateKey, title, year = baseYear) {
+function ensureTabGroupLineAtDate(text, dateKey, title, year) {
   const source = text ?? ""
   const parsed = parseBlocksAndItems(source, year)
   const block = parsed.blocks.find((b) => b.dateKey === dateKey)
@@ -969,11 +933,11 @@ function removeEmptyBlockByDateKey(text, baseYear, dateKey) {
   return { newText, changed: true, caretPos }
 }
 
-function removeAllEmptyBlocks(text, baseYear) {
+function removeAllEmptyBlocks(text, baseYear, options = {}) {
   let current = text ?? ""
   let changed = false
   while (true) {
-    const parsed = parseBlocksAndItems(current, baseYear)
+    const parsed = parseBlocksAndItems(current, baseYear, options)
     const emptyBlock = [...parsed.blocks].reverse().find((b) => isBlockBodyEmpty(current, b))
     if (!emptyBlock) break
     current = removeBlockRange(current, emptyBlock).newText
@@ -1002,7 +966,7 @@ function App() {
   function genWindowId() {
   try {
     if (crypto?.randomUUID) return `w-${crypto.randomUUID()}`
-  } catch {}
+  } catch (err) { void err }
   return `w-${Date.now()}-${Math.random().toString(16).slice(2)}`
   }
 
@@ -1033,42 +997,7 @@ function App() {
   function saveWindows(ws) {
   try {
     localStorage.setItem(WINDOWS_KEY, JSON.stringify(ws))
-  } catch {}
-  }
-
-  function loadTabTrash() {
-  try {
-    const raw = localStorage.getItem(TRASH_KEY)
-    if (!raw) return []
-    const parsed = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return []
-    return parsed
-      .map((entry) => {
-        if (!entry || typeof entry !== "object") return null
-        const window = entry.window
-        if (!window || typeof window.id !== "string") return null
-        return {
-          window: {
-            id: window.id,
-            title: typeof window.title === "string" && window.title.trim() ? window.title : "제목없음",
-            color: typeof window.color === "string" ? window.color : "#2563eb",
-            fixed: false
-          },
-          index: Number.isFinite(entry.index) ? entry.index : 1,
-          removedAt: Number.isFinite(entry.removedAt) ? entry.removedAt : Date.now(),
-          storage: entry.storage && typeof entry.storage === "object" ? entry.storage : {}
-        }
-      })
-      .filter(Boolean)
-  } catch {
-    return []
-  }
-  }
-
-  function saveTabTrash(items) {
-  try {
-    localStorage.setItem(TRASH_KEY, JSON.stringify(items))
-  } catch {}
+  } catch (err) { void err }
   }
 
   const WINDOW_COLORS = [
@@ -1091,19 +1020,6 @@ function App() {
     "#e1c2ff", // 657 lavender
     "#ffd1e7" // 656 light pink
   ]
-
-  function nextColor(cur) {
-    const i = WINDOW_COLORS.indexOf(cur)
-    return WINDOW_COLORS[(i + 1) % WINDOW_COLORS.length]
-  }
-
-  function pickNextWindowColor(ws) {
-    const used = new Set(ws.map((w) => w.color))
-    const available = WINDOW_COLORS.find((c) => !used.has(c))
-    return available ?? WINDOW_COLORS[ws.length % WINDOW_COLORS.length]
-  }
-
-
 
   const [text, setText] = useState("")
   const [today, setToday] = useState(() => new Date())
@@ -1345,13 +1261,13 @@ function App() {
         const parsed = JSON.parse(raw)
         if (parsed && typeof parsed === "object") setIntegratedFilters(parsed)
       }
-    } catch {}
+    } catch (err) { void err }
   }, [])
 
   useEffect(() => {
     try {
       localStorage.setItem(FILTER_KEY, JSON.stringify(integratedFilters))
-    } catch {}
+    } catch (err) { void err }
   }, [integratedFilters])
 
   useEffect(() => {
@@ -1414,7 +1330,6 @@ function App() {
       const inTabMenu = tabMenu && tabMenu.contains(t)
       const inLeftMemo = (memo && memo.contains(t)) || inTabMenu
       const inRightMemo = rightMemo && rightMemo.contains(t)
-      const inMemo = inLeftMemo || inRightMemo
 
       if (!inLeftMemo && document.activeElement === memo) {
         onTextareaBlur()
@@ -1507,7 +1422,6 @@ function App() {
   function removeWindow(id) {
     const idx = windows.findIndex((w) => w.id === id)
     if (idx < 0) return
-    const removed = windows[idx]
     const allowedTitles = new Set(windows.filter((w) => w.id !== "all" && w.id !== id).map((w) => w.title))
 
     setWindows((prev) => prev.filter((w) => w.id !== id))
@@ -1548,13 +1462,13 @@ function App() {
         const n = Number(raw)
         if (Number.isFinite(n)) setMemoInnerSplit(clamp(n, 0.15, 0.85))
       }
-    } catch {}
+    } catch (err) { void err }
   }, [])
 
   useEffect(() => {
     try {
       localStorage.setItem(MEMO_INNER_KEY, String(memoInnerSplit))
-    } catch {}
+    } catch (err) { void err }
   }, [memoInnerSplit])
 
   function beginMemoInnerDrag(e) {
@@ -1563,7 +1477,7 @@ function App() {
     memoInnerStartRatioRef.current = memoInnerSplit
     try {
       e.currentTarget.setPointerCapture(e.pointerId)
-    } catch {}
+    } catch (err) { void err }
   }
 
   function onMemoInnerDragMove(e) {
@@ -1602,7 +1516,7 @@ function App() {
         if (typeof parsed.memoFontPx === "number") setMemoFontPx(clamp(parsed.memoFontPx, FONT_MIN, FONT_MAX))
         if (typeof parsed.tabFontPx === "number") setTabFontPx(clamp(parsed.tabFontPx, FONT_MIN, FONT_MAX))
       }
-    } catch {}
+    } catch (err) { void err }
 
     try {
       const raw2 = localStorage.getItem(PREF_KEY)
@@ -1611,7 +1525,7 @@ function App() {
         if (p && (p.theme === "light" || p.theme === "dark")) setTheme(p.theme)
         if (p && (p.layoutPreset === "memo-left" || p.layoutPreset === "calendar-left")) setLayoutPreset(p.layoutPreset)
       }
-    } catch {}
+    } catch (err) { void err }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -1626,13 +1540,13 @@ function App() {
   useEffect(() => {
     try {
       localStorage.setItem(LAYOUT_KEY, JSON.stringify({ splitRatio, memoFontPx, tabFontPx }))
-    } catch {}
+    } catch (err) { void err }
   }, [splitRatio, memoFontPx, tabFontPx])
 
   useEffect(() => {
     try {
       localStorage.setItem(PREF_KEY, JSON.stringify({ theme, layoutPreset }))
-    } catch {}
+    } catch (err) { void err }
   }, [theme, layoutPreset])
 
   // 연도 동기화
@@ -1712,7 +1626,7 @@ function App() {
     try {
       const key = `planner-left-text-${year}`
       localStorage.setItem(key, value)
-    } catch {}
+    } catch (err) { void err }
   }
 
   function getWindowMemoTextSync(year, windowId) {
@@ -1728,7 +1642,7 @@ function App() {
     try {
       const key = `planner-text-${year}-${windowId}`
       localStorage.setItem(key, value ?? "")
-    } catch {}
+    } catch (err) { void err }
   }
 
   function getRightWindowTextSync(year, windowId) {
@@ -1744,7 +1658,7 @@ function App() {
     try {
       const key = `planner-right-text-${year}-${windowId}`
       localStorage.setItem(key, value)
-    } catch {}
+    } catch (err) { void err }
   }
 
   function buildCombinedRightTextForYear(year) {
@@ -1861,18 +1775,6 @@ function parseTabEditItemsByDate(tabText, baseYear, title) {
       if (lines.length > 0) out[dateKey] = lines.join("\n")
     }
     return out
-  }
-
-  function extractGroupLineItems(line, title) {
-    const trimmed = (line ?? "").trim()
-    const match = trimmed.match(groupLineRegex)
-    if (!match) return []
-    const groupTitle = match[1].trim()
-    if (!groupTitle || groupTitle !== title) return []
-    return match[2]
-      .split(/;|\r?\n/)
-      .map((x) => x.trim())
-      .filter((x) => x !== "")
   }
 
 function parseTabEditItemsFromText(tabText, baseYear, title) {
@@ -2002,7 +1904,7 @@ function stripEmptyGroupLines(bodyText) {
         if (!match) match = key.match(/^planner-right-text-(\d{4})-/)
         if (match) years.add(Number(match[1]))
       }
-    } catch {}
+    } catch (err) { void err }
     return years
   }
 
@@ -2030,7 +1932,7 @@ function stripEmptyGroupLines(bodyText) {
           changed = true
           try {
             localStorage.setItem(allKey, nextAll)
-          } catch {}
+          } catch (err) { void err }
           if (isActiveAllYear) updateEditorText(nextAll)
         }
       }
@@ -2045,7 +1947,7 @@ function stripEmptyGroupLines(bodyText) {
             changed = true
           }
         }
-      } catch {}
+      } catch (err) { void err }
     }
 
     try {
@@ -2057,7 +1959,7 @@ function stripEmptyGroupLines(bodyText) {
           changed = true
         }
       }
-    } catch {}
+    } catch (err) { void err }
 
     if (changed) setDashboardSourceTick((x) => x + 1)
   }
@@ -2106,7 +2008,7 @@ function stripEmptyGroupLines(bodyText) {
       try {
         localStorage.removeItem(`planner-text-${year}-${windowId}`)
         localStorage.removeItem(`planner-right-text-${year}-${windowId}`)
-      } catch {}
+      } catch (err) { void err }
     }
     pruneUnknownGroupsFromAllYears(allowedTitles)
   }
@@ -2228,7 +2130,7 @@ useEffect(() => {
   if (activeWindowId === "all") return
   try {
     localStorage.setItem(rightMemoKey, rightMemoText)
-  } catch {}
+  } catch (err) { void err }
 }, [rightMemoKey, rightMemoText, activeWindowId])
 
   const leftOverlayLines = useMemo(() => {
@@ -3054,7 +2956,7 @@ useEffect(() => {
         nextTabText = stripped
         changed = true
       }
-      const cleaned = removeAllEmptyBlocks(nextTabText, baseYear)
+      const cleaned = removeAllEmptyBlocks(nextTabText, baseYear, { allowAnyYear: true })
       if (cleaned.changed) {
         nextTabText = cleaned.newText
         changed = true
@@ -3075,12 +2977,9 @@ useEffect(() => {
     const current = ta.value ?? ""
 
     let normalized = stripEmptyGroupLines(current)
-    normalized = normalizePrettyAndMerge(normalized, baseYear)
-    const key = lastActiveDateKeyRef.current
-    if (key) {
-      const r = removeEmptyBlockByDateKey(normalized, baseYear, key)
-      if (r.changed) normalized = r.newText
-    }
+    const cleaned = removeAllEmptyBlocks(normalized, baseYear, { allowAnyYear: true })
+    if (cleaned.changed) normalized = cleaned.newText
+    normalized = normalizePrettyAndMerge(normalized, baseYear, { allowAnyYear: true })
 
     if (normalized !== current) {
       updateEditorText(normalized)
@@ -3357,7 +3256,7 @@ useEffect(() => {
     dragStartRatioRef.current = splitRatio
     try {
       e.currentTarget.setPointerCapture(e.pointerId)
-    } catch {}
+    } catch (err) { void err }
   }
 
   function onDragMove(e) {
@@ -4843,7 +4742,6 @@ useEffect(() => {
                           style={{
                             height: 30,
                             padding: "0 10px",
-                            border: "none",
                             background: tabMentionHoverId === w.id ? ui.surface2 : "transparent",
                             color: ui.text,
                             textAlign: "left",
@@ -5532,11 +5430,6 @@ useEffect(() => {
               const isSunday = dow === 0
               const isSaturday = dow === 6
 
-              const borderColor = isSelected
-                ? highlightTokens.selected.ring
-                : isToday
-                  ? highlightTokens.today.ring
-                  : ui.border2
               const bgColor = isSelected
                 ? highlightTokens.selected.soft
                 : isToday
