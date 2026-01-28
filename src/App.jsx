@@ -250,6 +250,7 @@ const YEAR_HOLIDAYS = {}
 const HOLIDAY_COUNTRY_CODE = "KR"
 const HOLIDAY_CACHE_PREFIX = "planner-holidays"
 const HOLIDAY_CACHE_TTL = 1000 * 60 * 60 * 24 * 30
+const HOLIDAY_CACHE_MAX_YEARS = 5
 
 function getHolidayCacheKey(year, countryCode) {
   return `${HOLIDAY_CACHE_PREFIX}-${countryCode}-${year}`
@@ -272,12 +273,44 @@ function readHolidayCache(year, countryCode = HOLIDAY_COUNTRY_CODE) {
   }
 }
 
+function listHolidayCacheEntries(countryCode = HOLIDAY_COUNTRY_CODE) {
+  if (typeof window === "undefined") return []
+  const prefix = `${HOLIDAY_CACHE_PREFIX}-${countryCode}-`
+  const entries = []
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i)
+      if (!key || !key.startsWith(prefix)) continue
+      const year = Number(key.slice(prefix.length))
+      if (!Number.isFinite(year)) continue
+      const cached = readHolidayCache(year, countryCode)
+      const fetchedAt = cached?.fetchedAt ?? 0
+      entries.push({ key, year, fetchedAt })
+    }
+  } catch {}
+  return entries
+}
+
+function pruneHolidayCache(countryCode = HOLIDAY_COUNTRY_CODE, maxYears = HOLIDAY_CACHE_MAX_YEARS) {
+  if (typeof window === "undefined") return
+  const entries = listHolidayCacheEntries(countryCode)
+  if (entries.length <= maxYears) return
+  entries.sort((a, b) => (b.fetchedAt || 0) - (a.fetchedAt || 0))
+  const toRemove = entries.slice(maxYears)
+  for (const entry of toRemove) {
+    try {
+      localStorage.removeItem(entry.key)
+    } catch {}
+  }
+}
+
 function writeHolidayCache(year, items, countryCode = HOLIDAY_COUNTRY_CODE) {
   if (typeof window === "undefined") return
   const key = getHolidayCacheKey(year, countryCode)
   try {
     localStorage.setItem(key, JSON.stringify({ items, fetchedAt: Date.now() }))
   } catch {}
+  pruneHolidayCache(countryCode)
 }
 
 function isHolidayCacheFresh(entry) {
@@ -3533,6 +3566,18 @@ useEffect(() => {
   }, [])
 
   const ui = themes[theme] ?? themes.light
+  const highlightTokens = useMemo(
+    () => ({
+      today: {
+        ring: ui.todayRing,
+        soft: ui.todaySoft,
+        pillText: theme === "dark" ? "#818fc6" : ui.todayRing
+      },
+      selected: { ring: ui.accent, soft: ui.accentSoft },
+      hover: { ring: ui.accent }
+    }),
+    [theme, ui]
+  )
 
   const iconButton = {
     width: 28,
@@ -4669,8 +4714,11 @@ useEffect(() => {
                       const activeWindow = windows.find((w) => w.id === activeWindowId)
                       const isToday = block.dateKey === todayKey
                       const isHovered = hoveredReadDateKey === block.dateKey
-                      const blockBorderColor = isHovered ? ui.accent : isToday ? ui.todayRing : "transparent"
-                      const todayPillTextColor = theme === "dark" ? "#818fc6" : ui.todayRing
+                      const blockBorderColor = isHovered
+                        ? highlightTokens.hover.ring
+                        : isToday
+                          ? highlightTokens.today.ring
+                          : "transparent"
                       const groups = isAll ? block.groups : []
                       const groupItemCount = isAll
                         ? groups.reduce((sum, group) => sum + (group.items?.length ?? 0), 0)
@@ -4752,9 +4800,9 @@ useEffect(() => {
                             borderRadius: 10,
                             padding: "6px 8px",
                             paddingLeft: isToday ? 14 : 8,
-                            boxShadow: isToday ? `0 0 0 2px ${ui.todaySoft}` : "none",
+                            boxShadow: isToday ? `0 0 0 2px ${highlightTokens.today.soft}` : "none",
                             background: isToday
-                              ? `linear-gradient(90deg, ${ui.todaySoft}, rgba(0,0,0,0) 55%)`
+                              ? `linear-gradient(90deg, ${highlightTokens.today.soft}, rgba(0,0,0,0) 55%)`
                               : "transparent"
                           }}
                         >
@@ -4768,7 +4816,7 @@ useEffect(() => {
                                 bottom: 6,
                                 width: 4,
                                 borderRadius: 999,
-                                background: ui.todayRing
+                                background: highlightTokens.today.ring
                               }}
                             />
                           )}
@@ -4790,9 +4838,9 @@ useEffect(() => {
                                     borderRadius: 999,
                                     fontSize: 11,
                                     fontWeight: 900,
-                                    color: todayPillTextColor,
-                                    border: `1px solid ${todayPillTextColor}`,
-                                    background: ui.todaySoft
+                                    color: highlightTokens.today.pillText,
+                                    border: `1px solid ${highlightTokens.today.pillText}`,
+                                    background: highlightTokens.today.soft
                                   }}
                                 >
                                   오늘
@@ -5304,8 +5352,16 @@ useEffect(() => {
               const isSunday = dow === 0
               const isSaturday = dow === 6
 
-              const borderColor = isSelected ? ui.accent : isToday ? ui.todayRing : ui.border2
-              const bgColor = isSelected ? ui.accentSoft : isToday ? ui.todaySoft : ui.surface
+              const borderColor = isSelected
+                ? highlightTokens.selected.ring
+                : isToday
+                  ? highlightTokens.today.ring
+                  : ui.border2
+              const bgColor = isSelected
+                ? highlightTokens.selected.soft
+                : isToday
+                  ? highlightTokens.today.soft
+                  : ui.surface
 
               const dayColor = isHoliday || isSunday ? ui.holiday : isSaturday ? ui.saturday : ui.text
 
@@ -5361,7 +5417,7 @@ useEffect(() => {
                       left: 0,
                       right: 0,
                       height: 2,
-                      background: ui.accent
+                      background: highlightTokens.selected.ring
                     }}
                   />
                   )}
@@ -5374,7 +5430,7 @@ useEffect(() => {
                         left: 0,
                         right: 0,
                         height: 2,
-                        background: ui.todayRing,
+                        background: highlightTokens.today.ring,
                         opacity: 0.9
                       }}
                     />
