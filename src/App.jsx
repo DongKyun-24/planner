@@ -4207,16 +4207,6 @@ useEffect(() => {
                     fontFamily: panelFontFamily
                   }}
                 >
-                  <div
-                    style={{
-                      fontWeight: 900,
-                      marginBottom: 2,
-                      color: ui.text,
-                      letterSpacing: "0.01em"
-                    }}
-                  >
-                    통합 필터
-                  </div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                     {editableWindows.map((w) => (
                       <label
