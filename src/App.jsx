@@ -120,6 +120,69 @@ function normalizeGroupLineNewlines(text) {
   })
 }
 
+function normalizeWindowTitle(value) {
+  const trimmed = String(value ?? "").trim()
+  return trimmed ? trimmed : "제목없음"
+}
+
+function makeUniqueWindowTitle(baseTitle, windows, ignoreId = null) {
+  const desired = normalizeWindowTitle(baseTitle)
+  const existing = new Set(
+    (windows ?? []).filter((w) => w && w.id !== ignoreId).map((w) => String(w.title ?? "").trim())
+  )
+  if (!existing.has(desired)) return desired
+
+  let i = 2
+  let next = `${desired} (${i})`
+  while (existing.has(next)) {
+    i += 1
+    next = `${desired} (${i})`
+  }
+  return next
+}
+
+function replaceGroupTitleInText(text, oldTitle, newTitle) {
+  if (!text || !oldTitle || !newTitle || oldTitle === newTitle) return text ?? ""
+  const lines = String(text).split("\n")
+  let changed = false
+
+  const nextLines = lines.map((line) => {
+    const trimmed = line.trim()
+    if (!trimmed) return line
+    const indent = line.match(/^\s*/)?.[0] ?? ""
+
+    const semicolon = parseDashboardSemicolonLine(trimmed, { allowEmptyText: true })
+    if (semicolon && semicolon.group === oldTitle) {
+      const timePrefix = semicolon.time ? `${semicolon.time};` : ""
+      const textPart = semicolon.text ?? ""
+      changed = true
+      return `${indent}${timePrefix}@${newTitle};${textPart}`
+    }
+
+    let m = trimmed.match(groupLineRegex)
+    if (m && m[1].trim() === oldTitle) {
+      changed = true
+      return `${indent}@${newTitle}(${m[2]})`
+    }
+
+    m = trimmed.match(groupLineStartRegex)
+    if (m && m[1].trim() === oldTitle) {
+      changed = true
+      return `${indent}@${newTitle}(`
+    }
+
+    m = trimmed.match(groupLineTitleOnlyRegex)
+    if (m && m[1].trim() === oldTitle) {
+      changed = true
+      return `${indent}@${newTitle}`
+    }
+
+    return line
+  })
+
+  return changed ? nextLines.join("\n") : text
+}
+
 function escapeRegex(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 }
@@ -932,6 +995,7 @@ function App() {
   const WINDOWS_KEY = "planner-windows-v1"
   const TRASH_KEY = "planner-tab-trash-v1"
   const TRASH_MAX = 20
+  const LEGACY_KEY = "planner-text"
 
   const DEFAULT_WINDOWS = [{ id: "all", title: "통합", color: "#2563eb", fixed: true }]
 
@@ -1042,13 +1106,35 @@ function App() {
 
 
   const [text, setText] = useState("")
-  const today = useMemo(() => new Date(), [])
+  const [today, setToday] = useState(() => new Date())
   const todayKey = useMemo(() => {
     const y = today.getFullYear()
     const m = String(today.getMonth() + 1).padStart(2, "0")
     const d = String(today.getDate()).padStart(2, "0")
     return `${y}-${m}-${d}`
   }, [today])
+
+  useEffect(() => {
+    let timeoutId = null
+    let intervalId = null
+
+    const schedule = () => {
+      const now = new Date()
+      const next = new Date(now)
+      next.setHours(24, 0, 0, 0)
+      const ms = Math.max(0, next.getTime() - now.getTime())
+      timeoutId = setTimeout(() => {
+        setToday(new Date())
+        intervalId = setInterval(() => setToday(new Date()), 24 * 60 * 60 * 1000)
+      }, ms)
+    }
+
+    schedule()
+    return () => {
+      if (timeoutId) clearTimeout(timeoutId)
+      if (intervalId) clearInterval(intervalId)
+    }
+  }, [])
 
   // ===== 연도(메모 기준) =====
   const [baseYear, setBaseYear] = useState(today.getFullYear())
@@ -1203,15 +1289,23 @@ function App() {
 }, [editingWindowId])
 
 
+  const colorPickerWindow = useMemo(
+    () => windows.find((w) => w.id === colorPickerId) ?? null,
+    [windows, colorPickerId]
+  )
+
   useEffect(() => {
   if (!colorPickerId) return
 
   function onDocPointerDown(e) {
     const panel = colorPickerPanelRef.current
-    if (!panel) return
     const t = e.target
     if (!(t instanceof Node)) return
-    if (panel.contains(t)) return
+    if (t instanceof Element) {
+      const trigger = t.closest("[data-color-picker-trigger='true']")
+      if (trigger) return
+    }
+    if (panel && panel.contains(t)) return
     setColorPickerId(null)
     setColorPickerPos(null)
   }
@@ -1219,6 +1313,30 @@ function App() {
   document.addEventListener("pointerdown", onDocPointerDown, true)
   return () => document.removeEventListener("pointerdown", onDocPointerDown, true)
 }, [colorPickerId])
+
+  useLayoutEffect(() => {
+    if (!colorPickerId || !colorPickerPos) return
+    const panel = colorPickerPanelRef.current
+    if (!panel) return
+
+    const rect = panel.getBoundingClientRect()
+    const pad = 8
+    let nextLeft = colorPickerPos.left
+    let nextTop = colorPickerPos.top
+
+    if (rect.right > window.innerWidth - pad) {
+      nextLeft = Math.max(pad, window.innerWidth - rect.width - pad)
+    }
+    if (rect.left < pad) nextLeft = pad
+    if (rect.bottom > window.innerHeight - pad) {
+      nextTop = Math.max(pad, window.innerHeight - rect.height - pad)
+    }
+    if (rect.top < pad) nextTop = pad
+
+    if (nextLeft !== colorPickerPos.left || nextTop !== colorPickerPos.top) {
+      setColorPickerPos({ left: nextLeft, top: nextTop })
+    }
+  }, [colorPickerId, colorPickerPos])
   
   useEffect(() => {
     try {
@@ -1354,14 +1472,31 @@ function App() {
     saveWindows(windows)
   }, [windows])
 
+  function commitWindowTitleChange(windowId, rawTitle) {
+    const target = windows.find((w) => w.id === windowId)
+    if (!target) return
+    const normalized = normalizeWindowTitle(rawTitle)
+    const nextTitle = makeUniqueWindowTitle(normalized, windows, windowId)
+    if (nextTitle === target.title) {
+      setEditingWindowId(null)
+      return
+    }
+    setWindows((prev) => prev.map((w) => (w.id === windowId ? { ...w, title: nextTitle } : w)))
+    migrateGroupTitleAcrossAllYears(target.title, nextTitle)
+    setEditingWindowId(null)
+  }
+
   function addWindow() {
     const id = genWindowId()
-    const newWin = {
-      id,
-      title: "제목없음",
-      color: "#22c55e"
-    }
-    setWindows((prev) => [...prev, newWin])
+    setWindows((prev) => {
+      const title = makeUniqueWindowTitle("제목없음", prev)
+      const newWin = {
+        id,
+        title,
+        color: "#22c55e"
+      }
+      return [...prev, newWin]
+    })
     setActiveWindowId(id)
     requestAnimationFrame(() => {
       const el = tabsScrollRef.current
@@ -1550,7 +1685,6 @@ function App() {
   // ===== 저장(연도별) =====
   const memoKey = useMemo(() => `planner-text-${baseYear}-${activeWindowId}`, [baseYear, activeWindowId])
   const legacyLeftKey = useMemo(() => `planner-left-text-${baseYear}`, [baseYear])
-  const LEGACY_KEY = "planner-text"
   const suppressSaveRef = useRef(false)
 
   // ✅ 오른쪽 메모(연도별)
@@ -1870,6 +2004,62 @@ function stripEmptyGroupLines(bodyText) {
       }
     } catch {}
     return years
+  }
+
+  function migrateGroupTitleAcrossAllYears(oldTitle, newTitle) {
+    if (!oldTitle || !newTitle || oldTitle === newTitle) return
+
+    let changed = false
+    const years = collectStoredYears()
+
+    for (const year of years) {
+      const allKey = `planner-text-${year}-all`
+      const isActiveAllYear = activeWindowId === "all" && baseYearRef.current === year
+      const storedAll = (() => {
+        try {
+          return localStorage.getItem(allKey)
+        } catch {
+          return null
+        }
+      })()
+      const sourceAll = isActiveAllYear ? textRef.current ?? "" : storedAll
+
+      if (sourceAll != null) {
+        const nextAll = replaceGroupTitleInText(sourceAll, oldTitle, newTitle)
+        if (nextAll !== sourceAll) {
+          changed = true
+          try {
+            localStorage.setItem(allKey, nextAll)
+          } catch {}
+          if (isActiveAllYear) updateEditorText(nextAll)
+        }
+      }
+
+      const legacyLeftKey = `planner-left-text-${year}`
+      try {
+        const legacyLeft = localStorage.getItem(legacyLeftKey)
+        if (legacyLeft != null) {
+          const nextLeft = replaceGroupTitleInText(legacyLeft, oldTitle, newTitle)
+          if (nextLeft !== legacyLeft) {
+            localStorage.setItem(legacyLeftKey, nextLeft)
+            changed = true
+          }
+        }
+      } catch {}
+    }
+
+    try {
+      const legacy = localStorage.getItem(LEGACY_KEY)
+      if (legacy != null) {
+        const nextLegacy = replaceGroupTitleInText(legacy, oldTitle, newTitle)
+        if (nextLegacy !== legacy) {
+          localStorage.setItem(LEGACY_KEY, nextLegacy)
+          changed = true
+        }
+      }
+    } catch {}
+
+    if (changed) setDashboardSourceTick((x) => x + 1)
   }
 
   function pruneUnknownGroupsFromYear(year, allowedTitles, { skipTick = false } = {}) {
@@ -2195,7 +2385,7 @@ useEffect(() => {
       applyTabEditToAll()
     }, 250)
     return () => clearTimeout(timer)
-  }, [activeWindowId, isEditingLeftMemo, tabEditText])
+  }, [activeWindowId, baseYear, isEditingLeftMemo, tabEditText, windows])
   const itemsByDate = useMemo(() => {
     if (activeWindowId === "all") {
       const out = {}
@@ -4330,6 +4520,7 @@ useEffect(() => {
         return next
       })
     }}
+    data-color-picker-trigger="true"
     aria-label="색상 선택"
     title={isFixed ? "" : "색상 선택"}
     style={{
@@ -4345,51 +4536,6 @@ useEffect(() => {
   />
 )}
 
-      {!isFixed && colorPickerId === w.id && colorPickerPos && (
-  <div
-    ref={colorPickerPanelRef}
-    onClick={(e) => e.stopPropagation()}
-    style={{
-      position: "fixed",
-      top: colorPickerPos.top,
-      left: colorPickerPos.left,
-      zIndex: 100,
-      background: ui.surface,
-      border: `1px solid ${ui.border}`,
-      boxShadow: ui.shadow,
-      borderRadius: 12,
-      padding: 6,
-      display: "grid",
-      gridTemplateColumns: "repeat(6, 14px)",
-      gap: 6
-    }}
-  >
-    {WINDOW_COLORS.map((c) => (
-      <button
-        key={c}
-        type="button"
-        onClick={(e) => {
-          e.stopPropagation()
-          setWindows((prev) => prev.map((x) => (x.id === w.id ? { ...x, color: c } : x)))
-          setColorPickerId(null)
-          setColorPickerPos(null)
-        }}
-        aria-label={`색상 ${c}`}
-        title={c}
-        style={{
-          width: 14,
-          height: 14,
-          borderRadius: 999,
-          background: c,
-          border: c === w.color ? `2px solid ${ui.accent}` : `1px solid ${ui.border}`,
-          cursor: "pointer",
-          padding: 0
-        }}
-      />
-    ))}
-  </div>
-)}
-
 
 
       {/* 제목 */}
@@ -4400,9 +4546,7 @@ useEffect(() => {
     defaultValue={w.title}
     onClick={(e) => e.stopPropagation()}
     onBlur={(e) => {
-      const v = e.target.value.trim() || "제목없음"
-      setWindows((prev) => prev.map((x) => (x.id === w.id ? { ...x, title: v } : x)))
-      setEditingWindowId(null)
+      commitWindowTitleChange(w.id, e.target.value)
     }}
     onKeyDown={(e) => {
       if (e.key === "Enter") e.currentTarget.blur()
@@ -4485,6 +4629,52 @@ useEffect(() => {
           +
         </button>
       </div>
+      {colorPickerWindow && colorPickerPos && (
+        <div
+          ref={colorPickerPanelRef}
+          onClick={(e) => e.stopPropagation()}
+          style={{
+            position: "fixed",
+            top: colorPickerPos.top,
+            left: colorPickerPos.left,
+            zIndex: 120,
+            background: ui.surface,
+            border: `1px solid ${ui.border}`,
+            boxShadow: ui.shadow,
+            borderRadius: 12,
+            padding: 6,
+            display: "grid",
+            gridTemplateColumns: "repeat(6, 14px)",
+            gap: 6
+          }}
+        >
+          {WINDOW_COLORS.map((c) => (
+            <button
+              key={c}
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation()
+                setWindows((prev) =>
+                  prev.map((x) => (x.id === colorPickerWindow.id ? { ...x, color: c } : x))
+                )
+                setColorPickerId(null)
+                setColorPickerPos(null)
+              }}
+              aria-label={`색상 ${c}`}
+              title={c}
+              style={{
+                width: 14,
+                height: 14,
+                borderRadius: 999,
+                background: c,
+                border: c === colorPickerWindow.color ? `2px solid ${ui.accent}` : `1px solid ${ui.border}`,
+                cursor: "pointer",
+                padding: 0
+              }}
+            />
+          ))}
+        </div>
+      )}
       {/* ✅ 메모 2분할 + 내부 드래그 */}
       <div style={{ flex: "1 1 auto", minHeight: 0, padding: "6px 8px", marginTop: 0 }}>
         <div
