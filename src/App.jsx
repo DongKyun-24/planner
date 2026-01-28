@@ -3132,8 +3132,8 @@ useEffect(() => {
       accentSoft: "rgba(126,166,255,0.16)",
       shadow: "0 8px 20px rgba(0,0,0,0.4)",
       radius: 12,
-      todayRing: "#7ea6ff",
-      todaySoft: "rgba(126,166,255,0.16)",
+      todayRing: "#475786",
+      todaySoft: "rgba(74, 88, 140, 0.22)",
       holiday: "#ff8f8f",
       saturday: "#8bb3ff"
     }
@@ -4569,6 +4569,7 @@ useEffect(() => {
                       const isToday = block.dateKey === todayKey
                       const isHovered = hoveredReadDateKey === block.dateKey
                       const blockBorderColor = isHovered ? ui.accent : isToday ? ui.todayRing : "transparent"
+                      const todayPillTextColor = theme === "dark" ? "#818fc6" : ui.todayRing
                       const groups = isAll ? block.groups : []
                       const groupItemCount = isAll
                         ? groups.reduce((sum, group) => sum + (group.items?.length ?? 0), 0)
@@ -4688,8 +4689,8 @@ useEffect(() => {
                                     borderRadius: 999,
                                     fontSize: 11,
                                     fontWeight: 900,
-                                    color: ui.todayRing,
-                                    border: `1px solid ${ui.todayRing}`,
+                                    color: todayPillTextColor,
+                                    border: `1px solid ${todayPillTextColor}`,
                                     background: ui.todaySoft
                                   }}
                                 >
