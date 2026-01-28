@@ -4566,6 +4566,9 @@ useEffect(() => {
                       const isCollapsed = Boolean(collapsedForActive[block.dateKey])
                       const isAll = activeWindowId === "all"
                       const activeWindow = windows.find((w) => w.id === activeWindowId)
+                      const isToday = block.dateKey === todayKey
+                      const isHovered = hoveredReadDateKey === block.dateKey
+                      const blockBorderColor = isHovered ? ui.accent : isToday ? ui.todayRing : "transparent"
                       const groups = isAll ? block.groups : []
                       const groupItemCount = isAll
                         ? groups.reduce((sum, group) => sum + (group.items?.length ?? 0), 0)
@@ -4642,11 +4645,31 @@ useEffect(() => {
                             marginBottom: 16,
                             scrollMarginTop: READ_SCROLL_MARGIN_TOP,
                             cursor: "pointer",
-                            border: hoveredReadDateKey === block.dateKey ? `1px solid ${ui.accent}` : "1px solid transparent", 
+                            position: "relative",
+                            border: `1px solid ${blockBorderColor}`,
                             borderRadius: 10,
-                            padding: "6px 8px"
+                            padding: "6px 8px",
+                            paddingLeft: isToday ? 14 : 8,
+                            boxShadow: isToday ? `0 0 0 2px ${ui.todaySoft}` : "none",
+                            background: isToday
+                              ? `linear-gradient(90deg, ${ui.todaySoft}, rgba(0,0,0,0) 55%)`
+                              : "transparent"
                           }}
                         >
+                          {isToday && (
+                            <div
+                              aria-hidden="true"
+                              style={{
+                                position: "absolute",
+                                left: 4,
+                                top: 6,
+                                bottom: 6,
+                                width: 4,
+                                borderRadius: 999,
+                                background: ui.todayRing
+                              }}
+                            />
+                          )}
                           <div
                             style={{
                               display: "flex",
@@ -4656,7 +4679,24 @@ useEffect(() => {
                               fontWeight: 900
                             }}
                           >
-                            <div>{header}</div>
+                            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                              <div>{header}</div>
+                              {isToday && (
+                                <span
+                                  style={{
+                                    padding: "2px 6px",
+                                    borderRadius: 999,
+                                    fontSize: 11,
+                                    fontWeight: 900,
+                                    color: ui.todayRing,
+                                    border: `1px solid ${ui.todayRing}`,
+                                    background: ui.todaySoft
+                                  }}
+                                >
+                                  오늘
+                                </span>
+                              )}
+                            </div>
                             <button
                               type="button"
                               onClick={(e) => {
