@@ -1,950 +1,56 @@
 ﻿import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
-
-// ===== 달력 보조 =====
-function daysInMonth(year, month) {
-  return new Date(year, month, 0).getDate()
-}
-function dayOfWeek(year, month, day) {
-  return new Date(year, month - 1, day).getDay()
-}
-function keyToYMD(key) {
-  return {
-    y: Number(key.slice(0, 4)),
-    m: Number(key.slice(5, 7)),
-    d: Number(key.slice(8, 10))
-  }
-}
-function keyToTime(key) {
-  return new Date(key).getTime()
-}
-const groupLineRegex = /^\s*@([^(]+)\(([^)]*)\)\s*$/
-const groupLineStartRegex = /^\s*@([^(]+)\s*\(\s*$/
-const groupLineTitleOnlyRegex = /^\s*@([^()]+)\s*$/
-const groupLineCloseRegex = /^\s*\)\s*$/
-const timeTokenRegex = /^(\d{1,2}):(\d{2})$/
-const timeRangeRegex = /^(\d{1,2}):(\d{2})\s*([~-])\s*(\d{1,2}):(\d{2})$/
-const timePrefixRegex = /^(\d{1,2}):(\d{2})(?:\s*([~-])\s*(\d{1,2}):(\d{2}))?(?:\s*;\s*|\s+)(.+)$/
-
-function normalizeTimeToken(token) {
-  const match = String(token ?? "").trim().match(timeTokenRegex)
-  if (!match) return ""
-  const hh = String(Number(match[1])).padStart(2, "0")
-  return `${hh}:${match[2]}`
-}
-
-function normalizeTimeRangeToken(token) {
-  const match = String(token ?? "").trim().match(timeRangeRegex)
-  if (!match) return ""
-  const startH = String(Number(match[1])).padStart(2, "0")
-  const endH = String(Number(match[4])).padStart(2, "0")
-  return `${startH}:${match[2]}${match[3]}${endH}:${match[5]}`
-}
-
-function normalizeTimeTokenOrRange(token) {
-  return normalizeTimeToken(token) || normalizeTimeRangeToken(token)
-}
-
-function parseTimePrefix(value) {
-  const trimmed = String(value ?? "").trim()
-  if (!trimmed) return null
-  const match = trimmed.match(timePrefixRegex)
-  if (!match) return null
-  const rawTime = match[3] ? `${match[1]}:${match[2]}${match[3]}${match[4]}:${match[5]}` : `${match[1]}:${match[2]}`
-  const time = normalizeTimeTokenOrRange(rawTime)
-  const text = (match[6] ?? "").trim()
-  if (!text) return null
-  return { time, text }
-}
-
-function timeToMinutes(value) {
-  const trimmed = String(value ?? "").trim()
-  let match = trimmed.match(timeTokenRegex)
-  if (match) return Number(match[1]) * 60 + Number(match[2])
-  match = trimmed.match(timeRangeRegex)
-  if (match) return Number(match[1]) * 60 + Number(match[2])
-  return Number.MAX_SAFE_INTEGER
-}
-
-function parseDashboardSemicolonLine(value, { allowEmptyText = false } = {}) {
-  const raw = String(value ?? "").trim()
-  if (!raw.includes(";")) return null
-  const parts = raw.split(";")
-  if (parts.length < 2) return null
-
-  const first = parts[0].trim()
-  const time = normalizeTimeTokenOrRange(first)
-  let group = ""
-  let text = ""
-
-  if (time) {
-    const second = (parts[1] ?? "").trim()
-    const maybeGroup = second.startsWith("@") ? second.slice(1).trim() : ""
-    if (maybeGroup) {
-      group = maybeGroup
-      text = parts.slice(2).join(";").trim()
-    } else {
-      text = parts.slice(1).join(";").trim()
-    }
-  } else if (first.startsWith("@")) {
-    group = first.slice(1).trim()
-    text = parts.slice(1).join(";").trim()
-  } else {
-    return null
-  }
-
-  if (!allowEmptyText && !text) return null
-  return { time: time || "", group, text }
-}
-
-function addGroupItem(groupIndex, groups, title, item) {
-  if (!title) return
-  const existing = groupIndex.get(title)
-  if (existing) existing.items.push(item)
-  else {
-    const entry = { title, items: [item] }
-    groupIndex.set(title, entry)
-    groups.push(entry)
-  }
-}
-
-function normalizeGroupLineNewlines(text) {
-  const s = (text ?? "").replace(/\r\n/g, "\n")
-  const tightened = s.replace(/@([^(]+)\s*\(\s*/g, (full, title) => `@${String(title).trim()}(`)
-  return tightened.replace(/@([^(]+)\(([\s\S]*?)\)/g, (full, title, inner) => {
-    const normalizedInner = inner
-      .replace(/\r?\n+/g, ";")
-      .replace(/\s+/g, " ")
-      .trim()
-    return `@${String(title).trim()}(${normalizedInner})`
-  })
-}
-
-function normalizeWindowTitle(value) {
-  const trimmed = String(value ?? "").trim()
-  return trimmed ? trimmed : "제목없음"
-}
-
-function makeUniqueWindowTitle(baseTitle, windows, ignoreId = null) {
-  const desired = normalizeWindowTitle(baseTitle)
-  const existing = new Set(
-    (windows ?? []).filter((w) => w && w.id !== ignoreId).map((w) => String(w.title ?? "").trim())
-  )
-  if (!existing.has(desired)) return desired
-
-  let i = 2
-  let next = `${desired} (${i})`
-  while (existing.has(next)) {
-    i += 1
-    next = `${desired} (${i})`
-  }
-  return next
-}
-
-function replaceGroupTitleInText(text, oldTitle, newTitle) {
-  if (!text || !oldTitle || !newTitle || oldTitle === newTitle) return text ?? ""
-  const lines = String(text).split("\n")
-  let changed = false
-
-  const nextLines = lines.map((line) => {
-    const trimmed = line.trim()
-    if (!trimmed) return line
-    const indent = line.match(/^\s*/)?.[0] ?? ""
-
-    const semicolon = parseDashboardSemicolonLine(trimmed, { allowEmptyText: true })
-    if (semicolon && semicolon.group === oldTitle) {
-      const timePrefix = semicolon.time ? `${semicolon.time};` : ""
-      const textPart = semicolon.text ?? ""
-      changed = true
-      return `${indent}${timePrefix}@${newTitle};${textPart}`
-    }
-
-    let m = trimmed.match(groupLineRegex)
-    if (m && m[1].trim() === oldTitle) {
-      changed = true
-      return `${indent}@${newTitle}(${m[2]})`
-    }
-
-    m = trimmed.match(groupLineStartRegex)
-    if (m && m[1].trim() === oldTitle) {
-      changed = true
-      return `${indent}@${newTitle}(`
-    }
-
-    m = trimmed.match(groupLineTitleOnlyRegex)
-    if (m && m[1].trim() === oldTitle) {
-      changed = true
-      return `${indent}@${newTitle}`
-    }
-
-    return line
-  })
-
-  return changed ? nextLines.join("\n") : text
-}
-
-function getGroupLineParts(line) {
-  const trimmed = (line ?? "").trim()
-  if (!trimmed) return null
-  const indent = (line ?? "").match(/^\s*/)?.[0] ?? ""
-  let m = trimmed.match(groupLineRegex)
-  if (m) {
-    const title = m[1].trim()
-    if (!title) return null
-    return { prefix: `${indent}@${title}`, suffix: `(${m[2]})` }
-  }
-  m = trimmed.match(groupLineStartRegex)
-  if (m) {
-    const title = m[1].trim()
-    if (!title) return null
-    return { prefix: `${indent}@${title}`, suffix: "(" }
-  }
-  m = trimmed.match(groupLineTitleOnlyRegex)
-  if (m) {
-    const title = m[1].trim()
-    if (!title) return null
-    return { prefix: `${indent}@${title}`, suffix: "" }
-  }
-  return null
-}
-
-function parseDashboardBlockContent(body) {
-  const general = []
-  const groups = []
-  const groupIndex = new Map()
-  const timed = []
-  const lines = normalizeGroupLineNewlines(body).split("\n")
-  let order = 0
-  for (const raw of lines) {
-    const trimmed = raw.trim()
-    if (!trimmed) continue
-    const semicolon = parseDashboardSemicolonLine(trimmed)
-    if (semicolon) {
-      if (semicolon.group) {
-        addGroupItem(groupIndex, groups, semicolon.group, { text: semicolon.text, time: semicolon.time, order })
-      } else if (semicolon.time) {
-        timed.push({ time: semicolon.time, text: semicolon.text, order })
-      } else {
-        general.push(semicolon.text)
-      }
-      order++
-      continue
-    }
-    const emptySemicolon = parseDashboardSemicolonLine(trimmed, { allowEmptyText: true })
-    if (emptySemicolon && !emptySemicolon.text) continue
-
-    const match = trimmed.match(groupLineRegex)
-    if (match) {
-      const title = match[1].trim()
-      const inner = match[2]
-      if (!title) continue
-      const items = inner
-        .split(";")
-        .map((x) => x.trim())
-        .filter((x) => x !== "")
-      for (const item of items) {
-        const parsed = parseTimePrefix(item)
-        addGroupItem(groupIndex, groups, title, {
-          text: parsed ? parsed.text : item,
-          time: parsed ? parsed.time : "",
-          order
-        })
-        order++
-      }
-      continue
-    }
-
-    const timeLine = parseTimePrefix(trimmed)
-    if (timeLine) {
-      timed.push({ time: timeLine.time, text: timeLine.text, order })
-      order++
-      continue
-    }
-
-    general.push(trimmed)
-    order++
-  }
-  return { general, groups, timed }
-}
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n))
-}
-
-// ===== 요일/공휴일 =====
-const WEEKDAYS_KO = ["일", "월", "화", "수", "목", "금", "토"]
-
-const FIXED_HOLIDAYS_MMDD = {
-  "01-01": "신정",
-  "03-01": "삼일절",
-  "05-05": "어린이날",
-  "06-06": "현충일",
-  "08-15": "광복절",
-  "10-03": "개천절",
-  "10-09": "한글날",
-  "12-25": "크리스마스"
-}
-
-// 연도별 변동 공휴일 수동 추가용
-const YEAR_HOLIDAYS = {}
-const HOLIDAY_COUNTRY_CODE = "KR"
-const HOLIDAY_CACHE_PREFIX = "planner-holidays"
-const HOLIDAY_CACHE_TTL = 1000 * 60 * 60 * 24 * 30
-const HOLIDAY_CACHE_MAX_YEARS = 5
-
-function getHolidayCacheKey(year, countryCode) {
-  return `${HOLIDAY_CACHE_PREFIX}-${countryCode}-${year}`
-}
-
-function readHolidayCache(year, countryCode = HOLIDAY_COUNTRY_CODE) {
-  if (typeof window === "undefined") return null
-  const key = getHolidayCacheKey(year, countryCode)
-  try {
-    const raw = localStorage.getItem(key)
-    if (!raw) return null
-    const parsed = JSON.parse(raw)
-    if (!parsed || typeof parsed !== "object") return null
-    const items = parsed.items
-    const fetchedAt = Number(parsed.fetchedAt)
-    if (!items || typeof items !== "object" || !Number.isFinite(fetchedAt)) return null
-    return { items, fetchedAt }
-  } catch {
-    return null
-  }
-}
-
-function listHolidayCacheEntries(countryCode = HOLIDAY_COUNTRY_CODE) {
-  if (typeof window === "undefined") return []
-  const prefix = `${HOLIDAY_CACHE_PREFIX}-${countryCode}-`
-  const entries = []
-  try {
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i)
-      if (!key || !key.startsWith(prefix)) continue
-      const year = Number(key.slice(prefix.length))
-      if (!Number.isFinite(year)) continue
-      const cached = readHolidayCache(year, countryCode)
-      const fetchedAt = cached?.fetchedAt ?? 0
-      entries.push({ key, year, fetchedAt })
-    }
-  } catch (err) { void err }
-  return entries
-}
-
-function pruneHolidayCache(countryCode = HOLIDAY_COUNTRY_CODE, maxYears = HOLIDAY_CACHE_MAX_YEARS) {
-  if (typeof window === "undefined") return
-  const entries = listHolidayCacheEntries(countryCode)
-  if (entries.length <= maxYears) return
-  entries.sort((a, b) => (b.fetchedAt || 0) - (a.fetchedAt || 0))
-  const toRemove = entries.slice(maxYears)
-  for (const entry of toRemove) {
-    try {
-      localStorage.removeItem(entry.key)
-    } catch (err) { void err }
-  }
-}
-
-function writeHolidayCache(year, items, countryCode = HOLIDAY_COUNTRY_CODE) {
-  if (typeof window === "undefined") return
-  const key = getHolidayCacheKey(year, countryCode)
-  try {
-    localStorage.setItem(key, JSON.stringify({ items, fetchedAt: Date.now() }))
-  } catch (err) { void err }
-  pruneHolidayCache(countryCode)
-}
-
-function isHolidayCacheFresh(entry) {
-  if (!entry) return false
-  return Date.now() - entry.fetchedAt < HOLIDAY_CACHE_TTL
-}
-
-function normalizeHolidayItems(items) {
-  if (!Array.isArray(items)) return {}
-  const map = {}
-  for (const item of items) {
-    if (!item || typeof item !== "object") continue
-    const date = String(item.date ?? "").trim()
-    if (!date) continue
-    const name = String(item.localName || item.name || "").trim()
-    if (!name) continue
-    if (Array.isArray(item.types) && item.types.length > 0 && !item.types.includes("Public")) continue
-    map[date] = name
-  }
-  return map
-}
-
-async function fetchHolidayYear(year, countryCode = HOLIDAY_COUNTRY_CODE) {
-  const y = Number(year)
-  if (!Number.isFinite(y)) return {}
-  const res = await fetch(`https://date.nager.at/api/v3/PublicHolidays/${y}/${countryCode}`)
-  if (!res.ok) throw new Error(`holiday fetch failed: ${res.status}`)
-  const data = await res.json()
-  return normalizeHolidayItems(data)
-}
-
-function getHolidayName(year, month, day) {
-  const key = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`
-  const mmdd = `${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`
-  const byYear = YEAR_HOLIDAYS[year]?.[key]
-  return byYear || FIXED_HOLIDAYS_MMDD[mmdd] || ""
-}
-
-function buildHeaderLine(year, month, day) {
-  const w = WEEKDAYS_KO[dayOfWeek(year, month, day)]
-  const holiday = getHolidayName(year, month, day)
-  return holiday ? `${month}/${day} (${w}) ${holiday}` : `${month}/${day} (${w})`
-}
-
-// ===== 라인 시작 위치 배열(문자 인덱스) =====
-function buildLineStartPositions(s) {
-  const starts = [0]
-  for (let i = 0; i < s.length; i++) {
-    if (s[i] === "\n") starts.push(i + 1)
-  }
-  return starts
-}
-
-// ===== 날짜 헤더 파서 =====
-const mdOnlyRegex = /^\s*(\d{1,2})\/(\d{1,2})(?:\s+.*)?\s*$/
-const ymdOnlyRegex = /^\s*(\d{4})[/-](\d{1,2})[/-](\d{1,2})(?:\s+.*)?\s*$/
-const timeOnlyRegex = /^\s*(\d{1,2}):(\d{2})(?:\s*([~-])\s*(\d{1,2}):(\d{2}))?\s+(.+)\s*$/
-const tabTitleRegex = /^\s*\[.+\]\s*$/
-
-function parseBlocksAndItems(rawText, baseYear, { allowAnyYear = false } = {}) {
-  const s = rawText ?? ""
-  const lines = s.split("\n")
-  const lineStarts = buildLineStartPositions(s)
-
-  const blocks = []
-  const items = {}
-
-  // 1) 헤더 라인 찾기
-  for (let i = 0; i < lines.length; i++) {
-    const raw = lines[i]
-    const trimmed = raw.trim()
-
-    let key = null
-    let m = trimmed.match(mdOnlyRegex)
-    if (m) {
-      key = `${baseYear}-${String(Number(m[1])).padStart(2, "0")}-${String(Number(m[2])).padStart(2, "0")}`
-    } else {
-      m = trimmed.match(ymdOnlyRegex)
-      if (m && (allowAnyYear || Number(m[1]) === baseYear)) {
-        const year = Number(m[1])
-        const normalizedYear = Number.isFinite(year) ? year : baseYear
-        key = `${normalizedYear}-${String(Number(m[2])).padStart(2, "0")}-${String(Number(m[3])).padStart(2, "0")}`
-      }
-    }
-
-    if (key) {
-      const headerStartPos = lineStarts[i] ?? 0
-      const headerEndPos = headerStartPos + raw.length
-      const bodyStartPos = headerEndPos + 1
-      blocks.push({
-        dateKey: key,
-        blockStartPos: headerStartPos,
-        headerStartPos,
-        headerEndPos,
-        bodyStartPos,
-        blockEndPos: s.length
-      })
-    }
-  }
-
-  // 2) 블록 끝 범위 설정
-  for (let bi = 0; bi < blocks.length; bi++) {
-    const cur = blocks[bi]
-    const next = blocks[bi + 1]
-    cur.blockEndPos = next ? next.blockStartPos : s.length
-  }
-
-  // 3) 달력 요약용 items 생성
-  for (let bi = 0; bi < blocks.length; bi++) {
-    const b = blocks[bi]
-    const body = s.slice(b.bodyStartPos, b.blockEndPos)
-    const bodyLines = body.split("\n")
-
-    let globalLineIndex = s.slice(0, b.bodyStartPos).split("\n").length - 1
-    for (let li = 0; li < bodyLines.length; li++) {
-      const line = bodyLines[li]
-      const t = line.trim()
-      if (!t) {
-        globalLineIndex++
-        continue
-      }
-
-      let time = ""
-      let text = t
-      const mm = t.match(timeOnlyRegex)
-      if (mm) {
-        const hh = String(Number(mm[1])).padStart(2, "0")
-        if (mm[3]) {
-          const endH = String(Number(mm[4])).padStart(2, "0")
-          time = `${hh}:${mm[2]}${mm[3]}${endH}:${mm[5]}`
-          text = mm[6]
-        } else {
-          time = `${hh}:${mm[2]}`
-          text = mm[6]
-        }
-      }
-
-      if (!items[b.dateKey]) items[b.dateKey] = []
-      items[b.dateKey].push({
-        id: `b${bi}-l${li}`,
-        time,
-        text,
-        lineIndex: globalLineIndex
-      })
-      globalLineIndex++
-    }
-  }
-
-  return { blocks, items }
-}
-
-function isMemoHeaderLine(line) {
-  const trimmed = line.trim()
-  if (!trimmed) return false
-  return tabTitleRegex.test(trimmed) || mdOnlyRegex.test(trimmed) || ymdOnlyRegex.test(trimmed)
-}
-
-function buildMemoOverlayLines(text) {
-  const lines = (text ?? "").split("\n")
-  const overlay = []
-
-  for (const line of lines) {
-    let isHeader = isMemoHeaderLine(line)
-    overlay.push({ text: line, isHeader, groupParts: getGroupLineParts(line) })
-  }
-
-  return overlay
-}
-
-function syncOverlayScroll(textarea, overlayInner) {
-  if (!textarea || !overlayInner) return
-  overlayInner.style.transform = `translateY(${-textarea.scrollTop}px)`
-}
-
-function normalizePrettyAndMerge(text, baseYear, { allowAnyYear = false } = {}) {
-  const s = text ?? ""
-  const lines = s.split("\n")
-
-  const preamble = []
-  const rawBlocks = []
-
-  let currentKey = null
-  let currentBody = []
-  let seenAnyDate = false
-
-  function flush() {
-    if (!currentKey) return
-    rawBlocks.push({ key: currentKey, bodyLines: currentBody })
-    currentKey = null
-    currentBody = []
-  }
-
-  for (let i = 0; i < lines.length; i++) {
-    const raw = lines[i]
-    const trimmed = raw.trim()
-
-    let key = null
-    let m = trimmed.match(mdOnlyRegex)
-    if (m) {
-      key = `${baseYear}-${String(Number(m[1])).padStart(2, "0")}-${String(Number(m[2])).padStart(2, "0")}`
-    } else {
-      m = trimmed.match(ymdOnlyRegex)
-      if (m && (allowAnyYear || Number(m[1]) === baseYear)) {
-        const year = Number(m[1])
-        const normalizedYear = Number.isFinite(year) ? year : baseYear
-        key = `${normalizedYear}-${String(Number(m[2])).padStart(2, "0")}-${String(Number(m[3])).padStart(2, "0")}`
-      }
-    }
-
-    if (key) {
-      seenAnyDate = true
-      flush()
-      currentKey = key
-      currentBody = []
-      continue
-    }
-
-    if (!seenAnyDate) preamble.push(raw)
-    else if (currentKey) currentBody.push(raw)
-  }
-  flush()
-
-  if (rawBlocks.length === 0) return s.trimEnd()
-
-  const merged = new Map()
-  const order = []
-  for (const b of rawBlocks) {
-    if (!merged.has(b.key)) {
-      merged.set(b.key, { key: b.key, chunks: [b.bodyLines], idx: order.length })
-      order.push(b.key)
-    } else {
-      merged.get(b.key).chunks.push(b.bodyLines)
-    }
-  }
-
-  const blocks = order.map((k) => {
-    const v = merged.get(k)
-    const out = []
-    for (const chunk of v.chunks) {
-      for (const line of chunk) {
-        if (line.trim() === "") continue
-        out.push(line)
-      }
-    }
-    return { key: v.key, idx: v.idx, body: out }
-  })
-
-  blocks.sort((a, b) => {
-    const ta = keyToTime(a.key)
-    const tb = keyToTime(b.key)
-    if (ta !== tb) return ta - tb
-    return a.idx - b.idx
-  })
-
-  const outBlocks = blocks.map((b) => {
-    const { y, m, d } = keyToYMD(b.key)
-    const header = buildHeaderLine(y, m, d)
-    if (b.body.length === 0) return header
-    return `${header}\n${b.body.join("\n")}`.trimEnd()
-  })
-
-  const pre = preamble.join("\n").trimEnd()
-  const body = outBlocks.join("\n\n").trimEnd()
-  return pre ? `${pre}\n\n${body}` : body
-}
-
-// ===== textarea 픽셀 스크롤용 미러 =====
-function getDateKeyFromLine(line, baseYear) {
-  const trimmed = line.trim()
-  let m = trimmed.match(mdOnlyRegex)
-  if (m) {
-    return `${baseYear}-${String(Number(m[1])).padStart(2, "0")}-${String(Number(m[2])).padStart(2, "0")}`
-  }
-  m = trimmed.match(ymdOnlyRegex)
-  if (m && Number(m[1]) === baseYear) {
-    return `${baseYear}-${String(Number(m[2])).padStart(2, "0")}-${String(Number(m[3])).padStart(2, "0")}`
-  }
-  return null
-}
-
-function buildCombinedRightText(commonText, windows, filters, windowTexts) {
-  const lines = []
-  if ((commonText ?? "").trim()) lines.push(commonText.trimEnd())
-
-  let prevSectionHadBody = false
-
-  for (const w of windows) {
-    if (filters && filters[w.id] === false) continue
-    const body = (windowTexts[w.id] ?? "").trimEnd()
-    if (prevSectionHadBody) lines.push("")
-    lines.push(`[${w.title}]`)
-    if (body) {
-      lines.push(body)
-      prevSectionHadBody = true
-    } else {
-      prevSectionHadBody = false
-    }
-  }
-
-  return lines.join("\n").trimEnd()
-}
-
-function splitCombinedRightText(text, windows) {
-  const titleToId = new Map(windows.map((w) => [w.title, w.id]))
-  const commonLines = []
-  const windowLinesById = new Map(windows.map((w) => [w.id, []]))
-  const seenWindowIds = new Set()
-  let currentSection = "all"
-
-  const lines = (text ?? "").split("\n")
-  for (const rawLine of lines) {
-    const headerMatch = rawLine.match(/^\s*\[(.+)\](.*)$/)
-    if (headerMatch) {
-      const title = headerMatch[1]
-      const id = titleToId.get(title)
-      if (id) {
-        currentSection = id
-        seenWindowIds.add(id)
-        const rest = (headerMatch[2] ?? "").replace(/^\s+/, "")
-        if (rest) {
-          const bucket = windowLinesById.get(currentSection) ?? []
-          bucket.push(rest)
-          windowLinesById.set(currentSection, bucket)
-        }
-        continue
-      }
-    }
-
-    if (currentSection === "all") {
-      commonLines.push(rawLine)
-    } else {
-      const bucket = windowLinesById.get(currentSection) ?? []
-      bucket.push(rawLine)
-      windowLinesById.set(currentSection, bucket)
-    }
-  }
-
-  return { commonLines, windowLinesById, seenWindowIds }
-}
-
-function getDateBlockBodyText(text, baseYear, dateKey) {
-  const parsed = parseBlocksAndItems(text, baseYear)
-  const block = parsed.blocks.find((b) => b.dateKey === dateKey)
-  if (!block) return ""
-  const body = text.slice(block.bodyStartPos, block.blockEndPos)
-  return body.replace(/^\n+/, "").replace(/\n+$/, "")
-}
-
-function updateDateBlockBody(text, baseYear, dateKey, bodyText) {
-  const normalized = (bodyText ?? "").replace(/\r\n/g, "\n").trimEnd()
-  const parsed = parseBlocksAndItems(text, baseYear)
-  const block = parsed.blocks.find((b) => b.dateKey === dateKey)
-  if (!block) {
-    const { y, m, d } = keyToYMD(dateKey)
-    const headerLine = buildHeaderLine(y, m, d)
-    const targetTime = keyToTime(dateKey)
-    const sorted = [...parsed.blocks].sort(
-      (a, b) => keyToTime(a.dateKey) - keyToTime(b.dateKey) || a.blockStartPos - b.blockStartPos
-    )
-    let insertPos = text.length
-    for (const b of sorted) {
-      if (keyToTime(b.dateKey) > targetTime) {
-        insertPos = b.blockStartPos
-        break
-      }
-    }
-    const inserted = insertDateBlockAt(text, insertPos, headerLine)
-    return updateDateBlockBody(inserted.newText, baseYear, dateKey, bodyText)
-  }
-
-  const after = text.slice(block.blockEndPos)
-  let body = ""
-  if (normalized) {
-    body = normalized + (after.length > 0 ? "\n\n" : "")
-  } else if (after.length > 0) {
-    body = "\n"
-  }
-  return text.slice(0, block.bodyStartPos) + body + after
-}
-
-function syncMirrorStyleFromTextarea(ta, mirror) {
-  const cs = window.getComputedStyle(ta)
-  mirror.style.width = cs.width
-  mirror.style.fontFamily = cs.fontFamily
-  mirror.style.fontSize = cs.fontSize
-  mirror.style.fontWeight = cs.fontWeight
-  mirror.style.fontStyle = cs.fontStyle
-  mirror.style.letterSpacing = cs.letterSpacing
-  mirror.style.lineHeight = cs.lineHeight
-  mirror.style.padding = cs.padding
-  mirror.style.border = cs.border
-  mirror.style.boxSizing = cs.boxSizing
-  mirror.style.whiteSpace = cs.whiteSpace
-  mirror.style.wordBreak = cs.wordBreak
-  mirror.style.overflowWrap = cs.overflowWrap
-  mirror.style.tabSize = cs.tabSize
-}
-function clampMemoCaretBelowHeader(text, caretPos) {
-  if (caretPos <= 0) return 0
-  const beforeLineBreak = text.lastIndexOf("\n", caretPos - 1)
-  const lineStart = beforeLineBreak === -1 ? 0 : beforeLineBreak + 1
-  const lineEnd = text.indexOf("\n", lineStart)
-  const line = text.slice(lineStart, lineEnd === -1 ? text.length : lineEnd)
-  if (isMemoHeaderLine(line)) {
-    return lineEnd === -1 ? text.length : lineEnd + 1
-  }
-  return caretPos
-}
-function normalizeCaretForTextarea(ta, caretPos) {
-  if (!ta) return caretPos ?? 0
-  const text = ta.value ?? ""
-  const safePos = Math.max(0, Math.min(text.length, caretPos ?? 0))
-  return clampMemoCaretBelowHeader(text, safePos)
-}
-function getLineHeightPx(ta) {
-  const lh = window.getComputedStyle(ta).lineHeight
-  const n = Number(String(lh).replace("px", ""))
-  return Number.isFinite(n) && n > 0 ? n : 20
-}
-function measureCharTopPx(ta, mirror, marker, s, charPos) {
-  const pos = Math.max(0, Math.min(charPos ?? 0, s.length))
-  syncMirrorStyleFromTextarea(ta, mirror)
-
-  const before = s.slice(0, pos)
-  const after = s.slice(pos)
-
-  mirror.innerHTML = ""
-  mirror.appendChild(document.createTextNode(before))
-  marker.textContent = "\u200b"
-  mirror.appendChild(marker)
-  mirror.appendChild(document.createTextNode(after))
-
-  return marker.offsetTop
-}
-function measureCharPosPx(ta, mirror, marker, s, charPos) {
-  const pos = Math.max(0, Math.min(charPos ?? 0, s.length))
-  syncMirrorStyleFromTextarea(ta, mirror)
-
-  const before = s.slice(0, pos)
-  const after = s.slice(pos)
-
-  mirror.innerHTML = ""
-  mirror.appendChild(document.createTextNode(before))
-  marker.textContent = "\u200b"
-  mirror.appendChild(marker)
-  mirror.appendChild(document.createTextNode(after))
-
-  return { top: marker.offsetTop, left: marker.offsetLeft }
-}
-function scrollCharPosToTopOffset(ta, mirror, marker, s, charPos, topOffsetLines = 1) {
-  const topPx = measureCharTopPx(ta, mirror, marker, s, charPos)
-  const lh = getLineHeightPx(ta)
-  const desiredVisibleY = topOffsetLines * lh
-
-  const target = Math.max(0, topPx - desiredVisibleY)
-  const maxTop = Math.max(0, ta.scrollHeight - ta.clientHeight)
-  ta.scrollTop = Math.min(target, maxTop)
-}
-
-// ===== 블록 기반 삽입 =====
-function insertDateBlockAt(text, insertPos, headerLine) {
-  const before = text.slice(0, insertPos)
-  const after = text.slice(insertPos)
-
-  let prefix = ""
-  if (before.length > 0) {
-    if (before.endsWith("\n\n")) prefix = ""
-    else if (before.endsWith("\n")) prefix = "\n"
-    else prefix = "\n\n"
-  }
-
-  let insert = `${prefix}${headerLine}\n\n`
-  if (after.length > 0) insert += "\n"
-
-  const newText = before + insert + after
-  const headerStartPos = (before + prefix).length
-  const bodyStartPos = headerStartPos + headerLine.length + 1
-  return { newText, headerStartPos, bodyStartPos }
-}
-
-// ===== caret -> 블록 찾기 =====
-function afterTwoFrames(fn) {
-  requestAnimationFrame(() => requestAnimationFrame(fn))
-}
-
-function ensureOneBlankLineAtBlockEnd(text, block) {
-  const endPos = block.blockEndPos
-  let i = endPos - 1
-  let nl = 0
-  while (i >= 0 && text[i] === "\n") {
-    nl++
-    i--
-  }
-
-  const need = Math.max(0, 2 - nl)
-  if (need === 0) {
-    const caretPos = Math.max(0, endPos - 1)
-    return { newText: text, caretPos }
-  }
-
-  const insert = "\n".repeat(need)
-  const newText = text.slice(0, endPos) + insert + text.slice(endPos)
-  const newEndPos = endPos + insert.length
-  const caretPos = Math.max(0, newEndPos - 1)
-  return { newText, caretPos }
-}
-function ensureBodyLineForBlock(text, block) {
-  const body = text.slice(block.bodyStartPos, block.blockEndPos)
-  if (body.trim().length > 0) {
-    return ensureOneBlankLineAtBlockEnd(text, block)
-  }
-  const insertPos = block.bodyStartPos
-  if (text[insertPos] === "\n") {
-    return { newText: text, caretPos: insertPos }
-  }
-  const newText = text.slice(0, insertPos) + "\n" + text.slice(insertPos)
-  return { newText, caretPos: insertPos }
-}
-function ensureTabGroupLineAtDate(text, dateKey, title, year) {
-  const source = text ?? ""
-  const parsed = parseBlocksAndItems(source, year)
-  const block = parsed.blocks.find((b) => b.dateKey === dateKey)
-  if (!block || !title) return { newText: source, caretPos: null, headerPos: null }
-
-  const body = source.slice(block.bodyStartPos, block.blockEndPos)
-  if (body.trim().length > 0) {
-    return { newText: source, caretPos: block.bodyStartPos, headerPos: block.headerStartPos }
-  }
-
-  const ensured = ensureBodyLineForBlock(source, block)
-  return { newText: ensured.newText, caretPos: ensured.caretPos ?? block.bodyStartPos, headerPos: block.headerStartPos }
-}
-
-// ===== (추가) 빈 날짜 블록 삭제 유틸 =====
-function blockHasMeaningfulBody(text, block) {
-  const body = text.slice(block.bodyStartPos, block.blockEndPos)
-  const normalized = normalizeGroupLineNewlines(body)
-  const lines = normalized.split("\n")
-  for (const rawLine of lines) {
-    const trimmed = rawLine.trim()
-    if (!trimmed) continue
-    const semicolon = parseDashboardSemicolonLine(trimmed, { allowEmptyText: true })
-    if (semicolon) {
-      if (!semicolon.text) continue
-      return true
-    }
-    const match = trimmed.match(groupLineRegex)
-    if (match) {
-      if (match[2].trim().length > 0) return true
-      continue
-    }
-    return true
-  }
-  return false
-}
-
-function isBlockBodyEmpty(text, block) {
-  return !blockHasMeaningfulBody(text, block)
-}
-
-function removeBlockRange(text, block) {
-  let start = block.blockStartPos
-  const end = block.blockEndPos
-
-  while (start > 0 && text[start - 1] === "\n" && text[start] === "\n") {
-    start--
-  }
-
-  let out = text.slice(0, start) + text.slice(end)
-  out = out.replace(/\n{3,}/g, "\n\n").trimEnd()
-
-  const caretPos = Math.min(start, out.length)
-  return { newText: out, caretPos }
-}
-
-function removeEmptyBlockByDateKey(text, baseYear, dateKey) {
-  const parsed = parseBlocksAndItems(text, baseYear)
-  const b = parsed.blocks.find((x) => x.dateKey === dateKey)
-  if (!b) return { newText: text, changed: false, caretPos: null }
-  if (!isBlockBodyEmpty(text, b)) return { newText: text, changed: false, caretPos: null }
-  const { newText, caretPos } = removeBlockRange(text, b)
-  return { newText, changed: true, caretPos }
-}
-
-function removeAllEmptyBlocks(text, baseYear, options = {}) {
-  let current = text ?? ""
-  let changed = false
-  while (true) {
-    const parsed = parseBlocksAndItems(current, baseYear, options)
-    const emptyBlock = [...parsed.blocks].reverse().find((b) => isBlockBodyEmpty(current, b))
-    if (!emptyBlock) break
-    current = removeBlockRange(current, emptyBlock).newText
-    changed = true
-  }
-  return { newText: current, changed }
-}
+import CalendarPanel from "./components/CalendarPanel"
+import DayListModal from "./components/DayListModal"
+import DeleteConfirmModal from "./components/DeleteConfirmModal"
+import FilterPanel from "./components/FilterPanel"
+import MemoEditor from "./components/MemoEditor"
+import MemoReadView from "./components/MemoReadView"
+import RightMemoEditor from "./components/RightMemoEditor"
+import SettingsPanel from "./components/SettingsPanel"
+import WindowTabs from "./components/WindowTabs"
+import { themes } from "./styles/themes"
+import { daysInMonth, dayOfWeek, keyToYMD, keyToTime, clamp } from "./utils/dateUtils"
+import {
+  YEAR_HOLIDAYS,
+  readHolidayCache,
+  isHolidayCacheFresh,
+  fetchHolidayYear,
+  writeHolidayCache,
+  buildHeaderLine
+} from "./utils/holiday"
+import {
+  groupLineRegex,
+  groupLineStartRegex,
+  groupLineTitleOnlyRegex,
+  groupLineCloseRegex,
+  parseTimePrefix,
+  timeToMinutes,
+  parseDashboardSemicolonLine,
+  normalizeGroupLineNewlines,
+  normalizeWindowTitle,
+  makeUniqueWindowTitle,
+  replaceGroupTitleInText,
+  parseDashboardBlockContent,
+  parseBlocksAndItems,
+  buildMemoOverlayLines,
+  syncOverlayScroll,
+  normalizePrettyAndMerge,
+  getDateKeyFromLine,
+  buildCombinedRightText,
+  splitCombinedRightText,
+  getDateBlockBodyText,
+  updateDateBlockBody,
+  normalizeCaretForTextarea,
+  getLineHeightPx,
+  measureCharPosPx,
+  scrollCharPosToTopOffset,
+  insertDateBlockAt,
+  afterTwoFrames,
+  ensureBodyLineForBlock,
+  ensureTabGroupLineAtDate,
+  removeEmptyBlockByDateKey,
+  removeAllEmptyBlocks
+} from "./utils/plannerText"
 
 function App() {
   const textareaRef = useRef(null)
@@ -957,8 +63,6 @@ function App() {
 
   // ===== 창(캘린더) 탭 =====
   const WINDOWS_KEY = "planner-windows-v1"
-  const TRASH_KEY = "planner-tab-trash-v1"
-  const TRASH_MAX = 20
   const LEGACY_KEY = "planner-text"
 
   const DEFAULT_WINDOWS = [{ id: "all", title: "통합", color: "#2563eb", fixed: true }]
@@ -1142,7 +246,7 @@ function App() {
   const [tabFontPx, setTabFontPx] = useState(15)
   const [tabFontInput, setTabFontInput] = useState("15")
 
-  // ✅ 설정 패널(톱니) 토글
+  // ? 설정 패널(톱니) 토글
   const [settingsOpen, setSettingsOpen] = useState(false)
   const settingsBtnRef = useRef(null)
   const settingsPanelRef = useRef(null)
@@ -1155,7 +259,7 @@ function App() {
   const [layoutPreset, setLayoutPreset] = useState("memo-left") // "memo-left" | "calendar-left"
   const isSwapped = layoutPreset === "calendar-left"
 
-  // ===== ✅ 메모 패널 내부(좌/우 메모) 스플릿 =====
+  // ===== ? 메모 패널 내부(좌/우 메모) 스플릿 =====
   const MEMO_INNER_KEY = "planner-memo-inner-split"
   const MIN_MEMO_LEFT_PX = 240
   const MIN_MEMO_RIGHT_PX = 240
@@ -1166,7 +270,7 @@ function App() {
   const [memoInnerSplit, setMemoInnerSplit] = useState(DEFAULT_MEMO_INNER_SPLIT)
   const [memoInnerCollapsed, setMemoInnerCollapsed] = useState("none") // "none" | "left" | "right"
   const [memoCollapsedByWindow, setMemoCollapsedByWindow] = useState(() => ({}))
-  const [rightMemoText, setRightMemoText] = useState("") // ✅ 오른쪽 메모(기능 없음)
+  const [rightMemoText, setRightMemoText] = useState("") // ? 오른쪽 메모(기능 없음)
   const [tabEditText, setTabEditText] = useState("")
   const [dashboardSourceTick, setDashboardSourceTick] = useState(0)
   const [isEditingLeftMemo, setIsEditingLeftMemo] = useState(false)
@@ -1177,15 +281,12 @@ function App() {
   const [tabMentionHoverId, setTabMentionHoverId] = useState(null)
   const tabMentionRef = useRef(null)
   const tabMentionMouseDownRef = useRef(false)
-  // ✅ 창 목록/활성 탭
+  // ? 창 목록/활성 탭
   const [windows, setWindows] = useState(() => loadWindows())
   const [activeWindowId, setActiveWindowId] = useState("all")
   const [editingWindowId, setEditingWindowId] = useState(null)
   const [deleteConfirm, setDeleteConfirm] = useState(null)
   const titleInputRef = useRef(null)
-  const [colorPickerId, setColorPickerId] = useState(null)
-  const [colorPickerPos, setColorPickerPos] = useState(null) // 어떤 탭의 색상 팔레트를 열지
-  const colorPickerPanelRef = useRef(null)
   const draggingWindowIdRef = useRef(null)
   const FILTER_KEY = "planner-integrated-filters-v1"
   const [integratedFilters, setIntegratedFilters] = useState({})
@@ -1205,54 +306,6 @@ function App() {
 }, [editingWindowId])
 
 
-  const colorPickerWindow = useMemo(
-    () => windows.find((w) => w.id === colorPickerId) ?? null,
-    [windows, colorPickerId]
-  )
-
-  useEffect(() => {
-  if (!colorPickerId) return
-
-  function onDocPointerDown(e) {
-    const panel = colorPickerPanelRef.current
-    const t = e.target
-    if (!(t instanceof Node)) return
-    if (t instanceof Element) {
-      const trigger = t.closest("[data-color-picker-trigger='true']")
-      if (trigger) return
-    }
-    if (panel && panel.contains(t)) return
-    setColorPickerId(null)
-    setColorPickerPos(null)
-  }
-
-  document.addEventListener("pointerdown", onDocPointerDown, true)
-  return () => document.removeEventListener("pointerdown", onDocPointerDown, true)
-}, [colorPickerId])
-
-  useLayoutEffect(() => {
-    if (!colorPickerId || !colorPickerPos) return
-    const panel = colorPickerPanelRef.current
-    if (!panel) return
-
-    const rect = panel.getBoundingClientRect()
-    const pad = 8
-    let nextLeft = colorPickerPos.left
-    let nextTop = colorPickerPos.top
-
-    if (rect.right > window.innerWidth - pad) {
-      nextLeft = Math.max(pad, window.innerWidth - rect.width - pad)
-    }
-    if (rect.left < pad) nextLeft = pad
-    if (rect.bottom > window.innerHeight - pad) {
-      nextTop = Math.max(pad, window.innerHeight - rect.height - pad)
-    }
-    if (rect.top < pad) nextTop = pad
-
-    if (nextLeft !== colorPickerPos.left || nextTop !== colorPickerPos.top) {
-      setColorPickerPos({ left: nextLeft, top: nextTop })
-    }
-  }, [colorPickerId, colorPickerPos])
   
   useEffect(() => {
     try {
@@ -1569,7 +622,7 @@ function App() {
     setYmMonth(view.month)
   }, [view.year, view.month])
 
-  // ✅ 연/월 상시 수정: 입력 변경 즉시 view 반영(약간의 안전장치)
+  // ? 연/월 상시 수정: 입력 변경 즉시 view 반영(약간의 안전장치)
   useEffect(() => {
     const y = Number(ymYear)
     if (!Number.isFinite(y) || y < 1) return
@@ -1601,7 +654,7 @@ function App() {
   const legacyLeftKey = useMemo(() => `planner-left-text-${baseYear}`, [baseYear])
   const suppressSaveRef = useRef(false)
 
-  // ✅ 오른쪽 메모(연도별)
+  // ? 오른쪽 메모(연도별)
   const rightMemoKey = useMemo(
     () => `planner-right-text-${baseYear}-${activeWindowId}`,
     [baseYear, activeWindowId]
@@ -2096,7 +1149,7 @@ function stripEmptyGroupLines(bodyText) {
     setText("")
   }, [memoKey, legacyLeftKey])
 
-  // ✅ 오른쪽 메모(연도별) 로드
+  // ? 오른쪽 메모(연도별) 로드
 useEffect(() => {
   suppressRightSaveRef.current = true
   try {
@@ -2121,7 +1174,7 @@ useEffect(() => {
     localStorage.setItem(memoKey, text)
   }, [memoKey, text])
 
-  // ✅ 오른쪽 메모(연도별) 저장
+  // ? 오른쪽 메모(연도별) 저장
 useEffect(() => {
   if (suppressRightSaveRef.current) {
     suppressRightSaveRef.current = false
@@ -3261,7 +2314,7 @@ useEffect(() => {
 
   function onDragMove(e) {
     if (outerCollapsed !== "none") return
-    // ✅ 메모 내부 드래그 중이면, 바깥 스플릿은 반응하지 않게
+    // ? 메모 내부 드래그 중이면, 바깥 스플릿은 반응하지 않게
     if (memoInnerDraggingRef.current) return
     if (!draggingRef.current) return
     const el = layoutRef.current
@@ -3324,335 +2377,6 @@ useEffect(() => {
   }
 
   // ===== 테마 토큰 =====
-  const THEME_ORDER = ["light", "navy", "dark", "sky", "mint"]
-  const themes = useMemo(() => {
-    const light = {
-      bg: "#f6f7fb",
-      surface: "#ffffff",
-      surface2: "#fbfbfd",
-      text: "#0f172a",
-      text2: "#475569",
-      border: "#e2e8f0",
-      border2: "#cbd5e1",
-      accent: "#2563eb",
-      accentSoft: "#dbeafe",
-      shadow: "0 6px 20px rgba(15, 23, 42, 0.08)",
-      radius: 12,
-      todayRing: "#0ea5e9",
-      todaySoft: "#e0f2fe",
-      holiday: "#dc2626",
-      saturday: "#2563eb"
-    }
-    const dark = {
-      bg: "#1b1c1f",
-      surface: "#202226",
-      surface2: "#25282d",
-      text: "#e6e8ec",
-      text2: "#bac0c9",
-      border: "#3a3d45",
-      border2: "#454955",
-      accent: "#7ea6ff",
-      accentSoft: "rgba(126,166,255,0.16)",
-      shadow: "0 8px 20px rgba(0,0,0,0.4)",
-      radius: 12,
-      todayRing: "#475786",
-      todaySoft: "rgba(74, 88, 140, 0.22)",
-      holiday: "#ff8f8f",
-      saturday: "#8bb3ff"
-    }
-    const navy = {
-      bg: "#0b142f",
-      surface: "#111b38",
-      surface2: "#18254c",
-      text: "#e8edff",
-      text2: "#a1b1da",
-      border: "#2d3a63",
-      border2: "#1f2951",
-      accent: "#6e8bff",
-      accentSoft: "rgba(109,154,255,0.22)",
-      shadow: "0 12px 40px rgba(8, 10, 26, 0.75)",
-      radius: 16,
-      todayRing: "#5f7dff",
-      todaySoft: "rgba(95, 125, 255, 0.24)",
-      holiday: "#ff8282",
-      saturday: "#9cb5ff"
-    }
-    const sage = {
-      bg: "#f4fbf8",
-      surface: "#ffffff",
-      surface2: "#f1f6f3",
-      text: "#0f1b14",
-      text2: "#5a6b5b",
-      border: "#d6e4d7",
-      border2: "#c6d7c7",
-      accent: "#34a853",
-      accentSoft: "rgba(52,168,83,0.18)",
-      shadow: "0 12px 32px rgba(15, 23, 42, 0.12)",
-      radius: 12,
-      todayRing: "#34a853",
-      todaySoft: "rgba(52,168,83,0.2)",
-      holiday: "#e44b4b",
-      saturday: "#31a0a2"
-    }
-    const sunset = {
-      bg: "#fff8f3",
-      surface: "#fffdf9",
-      surface2: "#fff5ee",
-      text: "#1f1b18",
-      text2: "#6e5a4c",
-      border: "#f3dcd0",
-      border2: "#eccfc0",
-      accent: "#f97316",
-      accentSoft: "rgba(249,115,22,0.18)",
-      shadow: "0 14px 38px rgba(15, 23, 42, 0.18)",
-      radius: 12,
-      todayRing: "#f97316",
-      todaySoft: "rgba(249,115,22,0.2)",
-      holiday: "#ff5f5f",
-      saturday: "#fb923c"
-    }
-    const berry = {
-      bg: "#1c0c1b",
-      surface: "#2b0f2b",
-      surface2: "#33132e",
-      text: "#f4d9ff",
-      text2: "#d6b9ff",
-      border: "#3c173f",
-      border2: "#2f0d30",
-      accent: "#e879f9",
-      accentSoft: "rgba(232,121,249,0.2)",
-      shadow: "0 16px 36px rgba(12, 2, 24, 0.65)",
-      radius: 12,
-      todayRing: "#e879f9",
-      todaySoft: "rgba(232,121,249,0.3)",
-      holiday: "#ff7fbf",
-      saturday: "#c084fc"
-    }
-    const mint = {
-      bg: "#edfff7",
-      surface: "#ffffff",
-      surface2: "#f3fff9",
-      text: "#0f2a1e",
-      text2: "#4c6b5f",
-      border: "#c5e9db",
-      border2: "#b4ddcf",
-      accent: "#22b8cf",
-      accentSoft: "rgba(34,184,207,0.25)",
-      shadow: "0 12px 30px rgba(15, 23, 42, 0.12)",
-      radius: 12,
-      todayRing: "#22b8cf",
-      todaySoft: "rgba(34,184,207,0.25)",
-      holiday: "#ff6f61",
-      saturday: "#12b5d8"
-    }
-    const charcoal = {
-      bg: "#020204",
-      surface: "#020204",
-      surface2: "#0b0d11",
-      text: "#f5f5f5",
-      text2: "#c8c8c8",
-      border: "#2d2d2d",
-      border2: "#1a1a1a",
-      accent: "#ffffff",
-      accentSoft: "rgba(255,255,255,0.15)",
-      shadow: "0 18px 48px rgba(0, 0, 0, 0.6)",
-      radius: 12,
-      todayRing: "#ffffff",
-      todaySoft: "rgba(255,255,255,0.25)",
-      holiday: "#ff4b4b",
-      saturday: "#94a3b8"
-    }
-    const ivory = {
-      bg: "#fdfdfd",
-      surface: "#ffffff",
-      surface2: "#f8f8f8",
-      text: "#0a0a0a",
-      text2: "#525252",
-      border: "#e1e1e1",
-      border2: "#d1d1d1",
-      accent: "#0f172a",
-      accentSoft: "rgba(15,23,42,0.08)",
-      shadow: "0 12px 26px rgba(15, 23, 42, 0.12)",
-      radius: 12,
-      todayRing: "#0f172a",
-      todaySoft: "rgba(15,23,42,0.15)",
-      holiday: "#ef4444",
-      saturday: "#1d4ed8"
-    }
-    const stone = {
-      bg: "#f3f4f6",
-      surface: "#ffffff",
-      surface2: "#f2f3f5",
-      text: "#0f172a",
-      text2: "#475569",
-      border: "#d1d5db",
-      border2: "#cbd5e1",
-      accent: "#64748b",
-      accentSoft: "rgba(100,116,139,0.2)",
-      shadow: "0 12px 32px rgba(15, 23, 42, 0.15)",
-      radius: 12,
-      todayRing: "#64748b",
-      todaySoft: "rgba(100,116,139,0.25)",
-      holiday: "#f87171",
-      saturday: "#94a3b8"
-    }
-    const rose = {
-      bg: "#fff5f8",
-      surface: "#fff9fb",
-      surface2: "#fbeef4",
-      text: "#2d0b1c",
-      text2: "#6c495f",
-      border: "#f1d6e0",
-      border2: "#e9c5d5",
-      accent: "#f43f5e",
-      accentSoft: "rgba(244,63,94,0.15)",
-      shadow: "0 12px 32px rgba(112, 15, 47, 0.25)",
-      radius: 12,
-      todayRing: "#f43f5e",
-      todaySoft: "rgba(244,63,94,0.25)",
-      holiday: "#f43f5e",
-      saturday: "#a855f7"
-    }
-    const pistachio = {
-      bg: "#f2fbf1",
-      surface: "#ffffff",
-      surface2: "#f4fcf4",
-      text: "#0f2f1c",
-      text2: "#567057",
-      border: "#d9eed7",
-      border2: "#cde1cb",
-      accent: "#16a34a",
-      accentSoft: "rgba(22,163,74,0.2)",
-      shadow: "0 12px 30px rgba(8, 30, 10, 0.15)",
-      radius: 12,
-      todayRing: "#16a34a",
-      todaySoft: "rgba(22,163,74,0.25)",
-      holiday: "#ef4444",
-      saturday: "#10b981"
-    }
-    const sky = {
-      bg: "#edf4ff",
-      surface: "#ffffff",
-      surface2: "#ecf4ff",
-      text: "#102a43",
-      text2: "#52607e",
-      border: "#dbe9ff",
-      border2: "#c3d7ff",
-      accent: "#2563eb",
-      accentSoft: "rgba(37,99,235,0.2)",
-      shadow: "0 12px 26px rgba(14, 33, 88, 0.16)",
-      radius: 12,
-      todayRing: "#2563eb",
-      todaySoft: "rgba(37,99,235,0.25)",
-      holiday: "#dc2626",
-      saturday: "#2563eb"
-    }
-    const copper = {
-      bg: "#2a1b0c",
-      surface: "#302316",
-      surface2: "#3b2c1a",
-      text: "#f7f2eb",
-      text2: "#d2c8bb",
-      border: "#4a3927",
-      border2: "#3a2d1f",
-      accent: "#f97316",
-      accentSoft: "rgba(249,115,22,0.25)",
-      shadow: "0 18px 40px rgba(9, 5, 2, 0.7)",
-      radius: 12,
-      todayRing: "#f97316",
-      todaySoft: "rgba(249,115,22,0.3)",
-      holiday: "#ff5f5f",
-      saturday: "#fb923c"
-    }
-    const peach = {
-      bg: "#fff8f2",
-      surface: "#fffdf7",
-      surface2: "#fff4ed",
-      text: "#2f1b11",
-      text2: "#7b5b4c",
-      border: "#f6d7c8",
-      border2: "#f0cdbd",
-      accent: "#fb923c",
-      accentSoft: "rgba(251,146,60,0.2)",
-      shadow: "0 12px 26px rgba(95, 45, 15, 0.17)",
-      radius: 12,
-      todayRing: "#fb923c",
-      todaySoft: "rgba(251,146,60,0.25)",
-      holiday: "#ef4444",
-      saturday: "#fb7185"
-    }
-    const storm = {
-      bg: "#1c2231",
-      surface: "#1f2637",
-      surface2: "#262b3f",
-      text: "#edf2ff",
-      text2: "#a0aec0",
-      border: "#2d3748",
-      border2: "#1a2232",
-      accent: "#22d3ee",
-      accentSoft: "rgba(34,211,238,0.2)",
-      shadow: "0 20px 40px rgba(0, 0, 0, 0.65)",
-      radius: 12,
-      todayRing: "#22d3ee",
-      todaySoft: "rgba(34,211,238,0.25)",
-      holiday: "#f87171",
-      saturday: "#38bdf8"
-    }
-    const gold = {
-      bg: "#fffdf4",
-      surface: "#fffaf1",
-      surface2: "#fff4e7",
-      text: "#3b2d1f",
-      text2: "#7c6c54",
-      border: "#f6e0c9",
-      border2: "#efd3b7",
-      accent: "#facc15",
-      accentSoft: "rgba(250,204,21,0.2)",
-      shadow: "0 12px 28px rgba(120, 88, 30, 0.25)",
-      radius: 12,
-      todayRing: "#facc15",
-      todaySoft: "rgba(250,204,21,0.25)",
-      holiday: "#ff5f5f",
-      saturday: "#fbbf24"
-    }
-    const lavender = {
-      bg: "#f8f5ff",
-      surface: "#fff8ff",
-      surface2: "#f4efff",
-      text: "#221337",
-      text2: "#624e7f",
-      border: "#e5dbf8",
-      border2: "#dacff7",
-      accent: "#c084fc",
-      accentSoft: "rgba(192,132,252,0.18)",
-      shadow: "0 16px 32px rgba(78, 60, 94, 0.25)",
-      radius: 12,
-      todayRing: "#c084fc",
-      todaySoft: "rgba(192,132,252,0.25)",
-      holiday: "#f472b6",
-      saturday: "#a855f7"
-    }
-    return {
-      light,
-      dark,
-      navy,
-      sage,
-      sunset,
-      berry,
-      mint,
-      stone,
-      charcoal,
-      ivory,
-      rose,
-      pistachio,
-      sky,
-      copper,
-      peach,
-      storm,
-      gold,
-      lavender
-    }
-  }, [])
 
   const ui = themes[theme] ?? themes.light
   const highlightTokens = useMemo(
@@ -3845,77 +2569,7 @@ useEffect(() => {
   const leftMemoFlex = isLeftCollapsed ? "0 0 0px" : isRightCollapsed ? "1 1 0" : `0 0 ${memoInnerSplit * 100}%`
   const rightMemoFlex = isRightCollapsed ? "0 0 0px" : "1 1 0"
 
-  function ThemeToggle({ compact = false }) {
-    const baseBorder = ui.border2
-    const dotColors = {
-      light: "#ffffff",
-      dark: "#0b1220",
-      navy: "#152248",
-      sage: "#d2f1dc",
-      sunset: "#ffe3d0",
-      berry: "#ffe4ff",
-      mint: "#dafff8",
-      stone: "#f7f8fb",
-      charcoal: "#0f0f0f",
-      ivory: "#fefefe",
-      rose: "#ffe3ec",
-      pistachio: "#e4f8e9",
-      sky: "#e1edff",
-      copper: "#f7d8b5",
-      peach: "#ffe8d0",
-      storm: "#1e2636",
-      gold: "#fff5d4",
-      lavender: "#f6edff"
-    }
-
-    const dotSize = compact ? 14 : 16
-    const gap = compact ? 4 : 6
-    const containerWidth = `calc(${dotSize * 5}px + ${gap * 4}px)`
-
-    return (
-      <div
-        role="group"
-        aria-label="테마 선택"
-        style={{
-          width: containerWidth,
-          minHeight: dotSize + gap * 2,
-          borderRadius: 999,
-          display: "grid",
-          gridTemplateColumns: `repeat(5, ${dotSize}px)`,
-          gap,
-          padding: compact ? "6px 4px" : "6px 5px",
-          justifyContent: "center"
-        }}
-      >
-        {THEME_ORDER.map((name) => {
-          const isActive = theme === name
-          return (
-            <button
-              key={name}
-              type="button"
-              onClick={() => setTheme(name)}
-              title={`${name} 테마`}
-              aria-label={`${name} 테마`}
-              style={{
-                width: dotSize,
-                height: dotSize,
-                borderRadius: 999,
-                border: `1.5px solid ${isActive ? ui.accent : baseBorder}`,
-                background: dotColors[name],
-                boxShadow: isActive
-                  ? "0 0 0 2px rgba(59, 130, 246, 0.25)"
-                  : "inset 0 0 0 0.5px rgba(0,0,0,0.12)",
-                cursor: "pointer",
-                padding: 0
-              }}
-            />
-          )
-        })}
-      </div>
-    )
-  }
-
-  // ✅ "설정 창 밖 클릭" 처리: 패널/버튼 밖이면 닫기
+  // ? "설정 창 밖 클릭" 처리: 패널/버튼 밖이면 닫기
   useEffect(() => {
     if (!settingsOpen) return
 
@@ -4087,66 +2741,14 @@ useEffect(() => {
                 <span style={{ display: "inline-block", transform: "translateY(-1.5px)" }}>≡</span>
               </button>
               {filterOpen && (
-                <div
-                  ref={filterPanelRef}
-                  style={{
-                    position: "absolute",
-                    top: 40,
-                    right: 0,
-                    width: 230,
-                    borderRadius: 16,
-                    border: `1px solid ${ui.border}`,
-                    background: ui.surface,
-                    boxShadow: "0 18px 40px rgba(15, 23, 42, 0.3)",
-                    padding: "12px 14px",
-                    zIndex: 60,
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: 6,
-                    fontFamily: panelFontFamily
-                  }}
-                >
-                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                    {editableWindows.map((w) => (
-                      <label
-                        key={w.id}
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 8,
-                          fontWeight: 500,
-                          color: ui.text,
-                          padding: "4px 10px",
-                          borderRadius: 8,
-                          border: `1px solid ${ui.border2}`,
-                          background: ui.surface2,
-                          cursor: "pointer",
-                          fontFamily: panelFontFamily,
-                          transition: "border-color 120ms ease"
-                        }}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={integratedFilters[w.id] !== false}
-                          onChange={(e) => {
-                            const next = e.target.checked
-                            setIntegratedFilters((prev) => ({ ...prev, [w.id]: next }))
-                          }}
-                        />
-                        <span
-                          style={{
-                            whiteSpace: "nowrap",
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                            fontSize: 13
-                          }}
-                        >
-                          {w.title}
-                        </span>
-                      </label>
-                    ))}
-                  </div>
-                </div>
+                <FilterPanel
+                  filterPanelRef={filterPanelRef}
+                  editableWindows={editableWindows}
+                  integratedFilters={integratedFilters}
+                  setIntegratedFilters={setIntegratedFilters}
+                  ui={ui}
+                  panelFontFamily={panelFontFamily}
+                />
               )}
             </div>
           )}
@@ -4200,371 +2802,53 @@ useEffect(() => {
         </div>
 
         {settingsOpen && (
-        <div
-          ref={settingsPanelRef}
-          style={{
-            position: "absolute",
-            top: 48,
-            right: 12,
-            width: 202,
-            borderRadius: 16,
-            border: `1px solid ${ui.border}`,
-            background: ui.surface,
-            boxShadow: "0 10px 28px rgba(15, 23, 42, 0.25)",
-            padding: "10px 12px",
-            zIndex: 50,
-            display: "flex",
-            flexDirection: "column",
-            gap: 12,
-            fontFamily: panelFontFamily,
-            color: ui.text
-          }}
-        >
-          <div style={settingsRowStyle}>
-            <div style={settingsLabelTextStyle}>테마</div>
-            <ThemeToggle compact />
-          </div>
-
-          <div style={settingsRowStyle}>
-            <div style={settingsLabelTextStyle}>제목</div>
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <input
-                type="number"
-                inputMode="numeric"
-                min={FONT_MIN}
-                max={FONT_MAX}
-                value={tabFontInput}
-                onChange={(e) => {
-                  const raw = e.target.value
-                  setTabFontInput(raw)
-                  if (raw.trim() === "") return
-                  const n = Number(raw)
-                  if (!Number.isFinite(n)) return
-                  setTabFontPx(n)
-                }}
-                onBlur={(e) => {
-                  const n = Number(e.target.value)
-                  if (!Number.isFinite(n)) {
-                    setTabFontInput(String(tabFontPx))
-                    return
-                  }
-                  const clamped = clamp(n, FONT_MIN, FONT_MAX)
-                  setTabFontPx(clamped)
-                  setTabFontInput(String(clamped))
-                }}
-                style={{ ...settingsNumberInput, width: 48 }}
-                title={"탭 글씨 크기(px)"}
-              />
-              <div style={{ fontSize: 12, fontWeight: 700, color: ui.text2 }}>px</div>
-            </div>
-          </div>
-
-          <div style={settingsRowStyle}>
-            <div style={settingsLabelTextStyle}>본문</div>
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <input
-                type="number"
-                inputMode="numeric"
-                min={FONT_MIN}
-                max={FONT_MAX}
-                value={memoFontInput}
-                onChange={(e) => {
-                  const raw = e.target.value
-                  setMemoFontInput(raw)
-                  if (raw.trim() === "") return
-                  const n = Number(raw)
-                  if (!Number.isFinite(n)) return
-                  setMemoFontPx(n)
-                }}
-                onBlur={(e) => {
-                  const n = Number(e.target.value)
-                  if (!Number.isFinite(n)) {
-                    setMemoFontInput(String(memoFontPx))
-                    return
-                  }
-                  const clamped = clamp(n, FONT_MIN, FONT_MAX)
-                  setMemoFontPx(clamped)
-                  setMemoFontInput(String(clamped))
-                }}
-                style={{ ...settingsNumberInput, width: 48 }}
-                title={"본문 글씨 크기(px)"}
-              />
-              <div style={{ fontSize: 12, fontWeight: 700, color: ui.text2 }}>px</div>
-            </div>
-          </div>
-
-          <button
-            onClick={() => setSettingsOpen(false)}
-            style={{
-              width: "100%",
-              height: 30,
-              borderRadius: 10,
-              border: `1px solid ${ui.border}`,
-              background: ui.surface2,
-              color: ui.text,
-              cursor: "pointer",
-              fontWeight: 600,
-              fontFamily: panelFontFamily,
-              letterSpacing: "0.04em"
-            }}
-          >
-            닫기
-          </button>
-        </div>
+          <SettingsPanel
+            settingsPanelRef={settingsPanelRef}
+            ui={ui}
+            panelFontFamily={panelFontFamily}
+            settingsRowStyle={settingsRowStyle}
+            settingsLabelTextStyle={settingsLabelTextStyle}
+            settingsNumberInput={settingsNumberInput}
+            theme={theme}
+            setTheme={setTheme}
+            FONT_MIN={FONT_MIN}
+            FONT_MAX={FONT_MAX}
+            tabFontInput={tabFontInput}
+            setTabFontInput={setTabFontInput}
+            tabFontPx={tabFontPx}
+            setTabFontPx={setTabFontPx}
+            memoFontInput={memoFontInput}
+            setMemoFontInput={setMemoFontInput}
+            memoFontPx={memoFontPx}
+            setMemoFontPx={setMemoFontPx}
+            onClose={() => setSettingsOpen(false)}
+          />
         )}
       </div>
-      {/* ✅ 창 탭 바 */}
-      <div
-        style={{
-          padding: "10px 12px 8px",
-          borderBottom: `1px solid ${ui.border}`,
-          background: ui.surface2,
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
-          minWidth: 0
-        }}
-      >
-        <button
-          onClick={() => scrollTabs(-1)}
-          className={`arrow-button${canScrollTabsLeft ? " is-active" : ""}`}
-          style={{ ...arrowButton, flexShrink: 0, cursor: canScrollTabsLeft ? "pointer" : "default" }}
-          disabled={!canScrollTabsLeft}
-          title="왼쪽으로 이동"
-          aria-label="왼쪽으로 이동"
-        >
-          ◀
-        </button>
-        <div
-          className="tabs-scroll"
-          ref={tabsScrollRef}
-          style={{
-            flex: "1 1 auto",
-            overflowX: "auto",
-            whiteSpace: "nowrap",
-            display: "flex",
-            gap: 6,
-            paddingBottom: 0,
-            paddingTop: 2
-          }}
-        >
-          {windows.map((w) => {
-  const isActive = activeWindowId === w.id
-  const isFixed = w.fixed || w.id === "all"
-  const isIntegrated = w.id === "all"
-
-  return (
-    <div
-      key={w.id}
-      className={`tab-pill${isActive ? " is-active" : ""}`}
-      data-window-id={w.id}
-                style={{
-                  position: "relative",
-                  display: "inline-flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  borderRadius: 6,
-                  border: `1px solid ${isActive ? ui.accent : ui.border}`,
-                  background: isActive ? ui.accentSoft : ui.surface,
-                  padding: isIntegrated ? "0 10px" : "0 2px 0 8px",
-                  minWidth: isIntegrated ? 88 : undefined,
-                  height: Math.max(30, tabFontPx + 14),
-                  gap: isIntegrated ? 6 : 4,
-                  cursor: "pointer",
-                  flexShrink: 0
-                }}
-      onClick={() => setActiveWindowId(w.id)}
-      title={w.title}
-      draggable={!isFixed}
-      onDragStart={(e) => {
-        if (isFixed) return
-        draggingWindowIdRef.current = w.id
-        e.dataTransfer.effectAllowed = "move"
-      }}
-      onDragOver={(e) => {
-        if (isFixed) return
-        e.preventDefault()
-        e.dataTransfer.dropEffect = "move"
-      }}
-      onDrop={(e) => {
-        e.preventDefault()
-        const dragId = draggingWindowIdRef.current
-        draggingWindowIdRef.current = null
-        if (!dragId || isFixed) return
-        reorderWindows(dragId, w.id)
-      }}
-    >
-      {/* 색 점 (통합 탭은 숨김) */}
-{w.id !== "all" && (
-  <button
-    type="button"
-    onClick={(e) => {
-      e.stopPropagation()
-      if (isFixed) return
-      const rect = e.currentTarget.getBoundingClientRect()
-      setColorPickerId((prev) => {
-        const next = prev === w.id ? null : w.id
-        if (next) setColorPickerPos({ top: rect.bottom + 8, left: rect.left })
-        else setColorPickerPos(null)
-        return next
-      })
-    }}
-    data-color-picker-trigger="true"
-    aria-label="색상 선택"
-    title={isFixed ? "" : "색상 선택"}
-    style={{
-      width: 10,
-      height: 10,
-      borderRadius: 999,
-      background: w.color,
-      border: `1px solid ${ui.border}`,
-      cursor: isFixed ? "default" : "pointer",
-      padding: 0,
-      display: "inline-block"
-    }}
-  />
-)}
-
-
-
-      {/* 제목 */}
-      {editingWindowId === w.id ? (
-  <input
-    ref={titleInputRef}
-    autoFocus
-    defaultValue={w.title}
-    onClick={(e) => e.stopPropagation()}
-    onBlur={(e) => {
-      commitWindowTitleChange(w.id, e.target.value)
-    }}
-    onKeyDown={(e) => {
-      if (e.key === "Enter") e.currentTarget.blur()
-      if (e.key === "Escape") setEditingWindowId(null)
-    }}
-    style={{
-      width: 90,
-      fontWeight: 900,
-      border: "none",
-      outline: "none",
-      background: "transparent",
-      color: ui.text,
-      fontSize: tabFontPx
-    }}
-  />
-) : (
-                  <span
-                    onDoubleClick={(e) => {
-                      e.stopPropagation()
-                      if (isFixed && w.id !== "all") return
-                      setEditingWindowId(w.id)
-                    }}
-    style={{
-      maxWidth: 100,
-      overflow: "hidden",
-      textOverflow: "ellipsis",
-      fontWeight: 900,
-      whiteSpace: "nowrap",
-      cursor: isFixed ? "default" : "text",
-      fontSize: tabFontPx,
-      lineHeight: 1.1
-    }}
-  >
-    {w.title}
-  </span>
-)}
-
-
-      {/* ❌ 삭제 버튼 (통합 제외) */}
-      {!isFixed && (
-        <button
-          className="tab-pill__delete no-hover-outline"
-          onClick={(e) => {
-            e.stopPropagation() // 탭 클릭 방지
-            setDeleteConfirm({ id: w.id, title: w.title })
-          }}
-          aria-label="탭 삭제"
-          title="탭 삭제"
-          style={{
-            border: "none",
-            background: "transparent",
-            color: ui.text2,
-            cursor: "pointer",
-            fontWeight: 900,
-            fontSize: 14,
-            lineHeight: 1,
-            padding: "0 4px"
-          }}
-        >
-          ×
-        </button>
-      )}
-    </div>
-  )
-})}
-
-        </div>
-
-        <button
-          onClick={() => scrollTabs(1)}
-          className={`arrow-button${canScrollTabsRight ? " is-active" : ""}`}
-          style={{ ...arrowButton, flexShrink: 0, cursor: canScrollTabsRight ? "pointer" : "default" }}
-          disabled={!canScrollTabsRight}
-          title="오른쪽으로 이동"
-          aria-label="오른쪽으로 이동"
-        >
-          ▶
-        </button>
-        <button onClick={addWindow} style={{ ...iconButton, flexShrink: 0 }} title="새 창 추가" aria-label="새 창 추가">
-          +
-        </button>
-      </div>
-      {colorPickerWindow && colorPickerPos && (
-        <div
-          ref={colorPickerPanelRef}
-          onClick={(e) => e.stopPropagation()}
-          style={{
-            position: "fixed",
-            top: colorPickerPos.top,
-            left: colorPickerPos.left,
-            zIndex: 120,
-            background: ui.surface,
-            border: `1px solid ${ui.border}`,
-            boxShadow: ui.shadow,
-            borderRadius: 12,
-            padding: 6,
-            display: "grid",
-            gridTemplateColumns: "repeat(6, 14px)",
-            gap: 6
-          }}
-        >
-          {WINDOW_COLORS.map((c) => (
-            <button
-              key={c}
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation()
-                setWindows((prev) =>
-                  prev.map((x) => (x.id === colorPickerWindow.id ? { ...x, color: c } : x))
-                )
-                setColorPickerId(null)
-                setColorPickerPos(null)
-              }}
-              aria-label={`색상 ${c}`}
-              title={c}
-              style={{
-                width: 14,
-                height: 14,
-                borderRadius: 999,
-                background: c,
-                border: c === colorPickerWindow.color ? `2px solid ${ui.accent}` : `1px solid ${ui.border}`,
-                cursor: "pointer",
-                padding: 0
-              }}
-            />
-          ))}
-        </div>
-      )}
-      {/* ✅ 메모 2분할 + 내부 드래그 */}
+      <WindowTabs
+        windows={windows}
+        activeWindowId={activeWindowId}
+        setActiveWindowId={setActiveWindowId}
+        editingWindowId={editingWindowId}
+        setEditingWindowId={setEditingWindowId}
+        titleInputRef={titleInputRef}
+        commitWindowTitleChange={commitWindowTitleChange}
+        tabFontPx={tabFontPx}
+        setDeleteConfirm={setDeleteConfirm}
+        draggingWindowIdRef={draggingWindowIdRef}
+        reorderWindows={reorderWindows}
+        addWindow={addWindow}
+        scrollTabs={scrollTabs}
+        tabsScrollRef={tabsScrollRef}
+        canScrollTabsLeft={canScrollTabsLeft}
+        canScrollTabsRight={canScrollTabsRight}
+        ui={ui}
+        arrowButton={arrowButton}
+        iconButton={iconButton}
+        WINDOW_COLORS={WINDOW_COLORS}
+        setWindows={setWindows}
+      />
+      {/* ? 메모 2분할 + 내부 드래그 */}
       <div style={{ flex: "1 1 auto", minHeight: 0, padding: "6px 8px", marginTop: 0 }}>
         <div
           ref={memoInnerWrapRef}
@@ -4591,172 +2875,90 @@ useEffect(() => {
           >
             <div style={memoInputWrap}>
               {isEditingLeftMemo ? (
-                <>
-                  <div style={memoOverlay} aria-hidden="true">
-                    <div ref={leftOverlayInnerRef} style={{ transform: "translateY(0px)", willChange: "transform" }}>
-                      {leftOverlayLines.map((line, i) => (
-                        <div
-                          key={`memo-left-line-${i}`}
-                          className={
-                            line.isHeader ? "memo-overlay__line memo-overlay__line--header" : "memo-overlay__line"
-                          }
-                        >
-                      {line.groupParts ? (
-                        <>
-                          {line.groupParts.prefix}
-                          {line.groupParts.suffix ? <span>{line.groupParts.suffix}</span> : null}
-                        </>
-                      ) : line.text === "" ? (
-                        " "
-                      ) : (
-                        line.text
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                  {mentionGhostText ? (
-                    <div
-                      aria-hidden="true"
-                      style={{
-                        position: "absolute",
-                        top: mentionGhostPos.top,
-                        left: mentionGhostPos.left,
-                        fontSize: memoFontPx,
-                        lineHeight: 1.55,
-                        fontFamily: "inherit",
-                        fontWeight: 400,
-                        color: ui.text2,
-                        whiteSpace: "pre",
-                        pointerEvents: "none",
-                        zIndex: 2
-                      }}
-                    >
-                      {mentionGhostText}
-                    </div>
-                  ) : null}
-                  <textarea
-                    ref={textareaRef}
-                    className="memo-input"
-                    value={activeWindowId === "all" ? text : tabEditText}
-                    onFocus={() => {
-                      setIsEditingLeftMemo(true)
-                      requestAnimationFrame(() => updateMentionGhost())
-                    }}
-                    onChange={(e) => {
-                      handleLeftMemoChange(e)
-                      updateMentionGhost()
-                      updateTabMentionMenu()
-                    }}
-                    onBlur={onTextareaBlur}
-                    onClick={onTextareaSelectOrKeyUp}
-                    onKeyUp={onTextareaSelectOrKeyUp}
-                    onKeyDown={(e) => {
-                      if (handleTabMentionKeyDown(e)) return
-                      if (acceptMentionGhost(e)) return
-                      handleBoxEnterKey(
-                        e,
-                        activeWindowId === "all" ? text : tabEditText,
-                        textareaRef,
-                        activeWindowId === "all" ? updateEditorText : setTabEditText
-                      )
-                    }}
-                    onSelect={onTextareaSelectOrKeyUp}
-                    onWheel={onMemoWheel}
-                    onScroll={(e) => {
-                      syncOverlayScroll(e.currentTarget, leftOverlayInnerRef.current)
-                      updateMentionGhost()
-                      updateTabMentionMenu()
-                    }}
-                    style={memoTextareaStyle}
-                    placeholder={
-                      activeWindowId === "all"
-                        ? [
-                            "[계획 메모장]",
-                            "(+버튼을 눌러 새로운 메모장을 생성)",
-                            "통합 탭에서는 모든 메모장들의 메모를 합쳐서 보여줍니다.",
-                            "",
-                            "1. 날짜를 달력에서 클릭하거나 1/25 처럼 직접 입력",
-                            "2. 날짜 아래에 [시간;@메모장 제목;내용] 형식 맞춰 입력", 
-                        
-                            
-                            "(시간,@메모장 제목은 생략 가능)",
-                            "",
-                            "ex)",
-                            "1/25",
-                            "11:00;@대학;수강신청",
-                            "12:00;@연애;선물 구매",
-                            "",
-                            "1/26",
-                            "10:00;1교시",
-                            "@금융;적금 계좌 개설"
-                          ].join("\n")
-                        : [
-                            "메모장의 제목을 수정하여 원하는 카테고리를 생성하세요",
-                            "",
-                            "이 탭에 적는 내용은 '통합'에 자동으로 합쳐집니다.",
-                            "(여기서는 @탭제목을 직접 쓸 필요 없습니다.)",
-                            "",
-                  
-                            "예)",
-                            "1/4",
-                            "10:00;회의",
-                            "",
-                            "1/5",
-                            "11:00;회의",
-                            "장보기",
-                          ].join("\n")
-                    }
-                  />
-                  {tabMentionMenu.visible && activeWindowId === "all" ? (
-                    <div
-                      ref={tabMentionRef}
-                      style={{
-                        position: "absolute",
-                        top: tabMentionMenu.top,
-                        left: tabMentionMenu.left,
-                        minWidth: 120,
-                        borderRadius: 8,
-                        border: `1px solid ${ui.border}`,
-                        background: ui.surface,
-                        boxShadow: ui.shadow,
-                        zIndex: 5,
-                        display: "flex",
-                        flexDirection: "column",
-                        overflow: "hidden"
-                      }}
-                    >
-                      {editableWindows.map((w) => (
-                        <button
-                          key={w.id}
-                          type="button"
-                          onMouseDown={(e) => {
-                            e.preventDefault()
-                            tabMentionMouseDownRef.current = true
-                            handleTabMentionPick(w.title)
-                          }}
-                          onMouseEnter={() => setTabMentionHoverId(w.id)}
-                          onMouseLeave={() => {
-                            setTabMentionHoverId((prev) => (prev === w.id ? null : prev))
-                          }}
-                          style={{
-                            height: 30,
-                            padding: "0 10px",
-                            background: tabMentionHoverId === w.id ? ui.surface2 : "transparent",
-                            color: ui.text,
-                            textAlign: "left",
-                            cursor: "pointer",
-                            fontWeight: 700,
-                            border: tabMentionHoverId === w.id ? `2px solid ${ui.accent}` : "2px solid transparent",
-                            boxSizing: "border-box"
-                          }}
-                        >
-                          {w.title}
-                        </button>
-                      ))}
-                    </div>
-                  ) : null}
-                </>
+                <MemoEditor
+                  ui={ui}
+                  memoOverlayStyle={memoOverlay}
+                  memoTextareaStyle={memoTextareaStyle}
+                  leftOverlayLines={leftOverlayLines}
+                  leftOverlayInnerRef={leftOverlayInnerRef}
+                  mentionGhostText={mentionGhostText}
+                  mentionGhostPos={mentionGhostPos}
+                  memoFontPx={memoFontPx}
+                  textareaRef={textareaRef}
+                  value={activeWindowId === "all" ? text : tabEditText}
+                  onFocus={() => {
+                    setIsEditingLeftMemo(true)
+                    requestAnimationFrame(() => updateMentionGhost())
+                  }}
+                  onChange={(e) => {
+                    handleLeftMemoChange(e)
+                    updateMentionGhost()
+                    updateTabMentionMenu()
+                  }}
+                  onBlur={onTextareaBlur}
+                  onClick={onTextareaSelectOrKeyUp}
+                  onKeyUp={onTextareaSelectOrKeyUp}
+                  onKeyDown={(e) => {
+                    if (handleTabMentionKeyDown(e)) return
+                    if (acceptMentionGhost(e)) return
+                    handleBoxEnterKey(
+                      e,
+                      activeWindowId === "all" ? text : tabEditText,
+                      textareaRef,
+                      activeWindowId === "all" ? updateEditorText : setTabEditText
+                    )
+                  }}
+                  onSelect={onTextareaSelectOrKeyUp}
+                  onWheel={onMemoWheel}
+                  onScroll={(e) => {
+                    syncOverlayScroll(e.currentTarget, leftOverlayInnerRef.current)
+                    updateMentionGhost()
+                    updateTabMentionMenu()
+                  }}
+                  placeholder={
+                    activeWindowId === "all"
+                      ? [
+                          "[계획 메모장]",
+                          "(+버튼을 눌러 새로운 메모장을 생성)",
+                          "통합 탭에서는 모든 메모장들의 메모를 합쳐서 보여줍니다.",
+                          "",
+                          "1. 날짜를 달력에서 클릭하거나 1/25 처럼 직접 입력",
+                          "2. 날짜 아래에 [시간;@메모장 제목;내용] 형식 맞춰 입력",
+                          "(시간,@메모장 제목은 생략 가능)",
+                          "",
+                          "ex)",
+                          "1/25",
+                          "11:00;@대학;수강신청",
+                          "12:00;@연애;선물 구매",
+                          "",
+                          "1/26",
+                          "10:00;1교시",
+                          "@금융;적금 계좌 개설"
+                        ].join("\n")
+                      : [
+                          "메모장의 제목을 수정하여 원하는 카테고리를 생성하세요",
+                          "",
+                          "이 탭에 적는 내용은 '통합'에 자동으로 합쳐집니다.",
+                          "(여기서는 @탭제목을 직접 쓸 필요 없습니다.)",
+                          "",
+                          "예)",
+                          "1/4",
+                          "10:00;회의",
+                          "",
+                          "1/5",
+                          "11:00;회의",
+                          "장보기"
+                        ].join("\n")
+                  }
+                  showTabMentionMenu={tabMentionMenu.visible && activeWindowId === "all"}
+                  tabMentionMenu={tabMentionMenu}
+                  tabMentionRef={tabMentionRef}
+                  editableWindows={editableWindows}
+                  tabMentionHoverId={tabMentionHoverId}
+                  setTabMentionHoverId={setTabMentionHoverId}
+                  handleTabMentionPick={handleTabMentionPick}
+                  tabMentionMouseDownRef={tabMentionMouseDownRef}
+                />
               ) : (
                 <div
                   onClick={enterEditMode}
@@ -4773,235 +2975,25 @@ useEffect(() => {
                     lineHeight: 1.25
                   }}
                 >
-                  {(activeWindowId === "all" ? dashboardBlocks : tabReadBlocks).length === 0 ? (
-                    <div
-                      style={{
-                        color: ui.text2,
-                        fontWeight: 600,
-                        lineHeight: 1.45
-                      }}
-                    >
-                      읽기모드입니다. 클릭하여 편집하세요.
-                    </div>
-                  ) : (
-                    (activeWindowId === "all" ? dashboardBlocks : tabReadBlocks).map((block) => {
-                      const { y, m, d } = keyToYMD(block.dateKey)
-                      const header = buildHeaderLine(y, m, d)
-                      const isCollapsed = Boolean(collapsedForActive[block.dateKey])
-                      const isAll = activeWindowId === "all"
-                      const activeWindow = windows.find((w) => w.id === activeWindowId)
-                      const isToday = block.dateKey === todayKey
-                      const isHovered = hoveredReadDateKey === block.dateKey
-                      const blockBorderColor = isHovered
-                        ? highlightTokens.hover.ring
-                        : isToday
-                          ? highlightTokens.today.ring
-                          : "transparent"
-                      const groups = isAll ? block.groups : []
-                      const groupItemCount = isAll
-                        ? groups.reduce((sum, group) => sum + (group.items?.length ?? 0), 0)
-                        : 0
-                      const hasContent = isAll
-                        ? block.general.length > 0 || (block.timed?.length ?? 0) > 0 || groupItemCount > 0
-                        : Array.isArray(block.items) && block.items.length > 0
-                      if (!hasContent) return null
-                      const noTimeGroupItems = []
-                      const timedItems = []
-                      if (isAll) {
-                        for (const group of groups) {
-                          for (const item of group.items ?? []) {
-                            const text = (item.text ?? "").trim()
-                            if (!text) continue
-                            const entry = {
-                              time: item.time || "",
-                              text,
-                              title: group.title,
-                              order: item.order ?? 0
-                            }
-                            if (entry.time) timedItems.push(entry)
-                            else noTimeGroupItems.push(entry)
-                          }
-                        }
-                        const timedNoGroup = (block.timed ?? [])
-                          .map((item) => ({
-                            time: item.time || "",
-                            text: (item.text ?? "").trim(),
-                            title: "",
-                            order: item.order ?? 0
-                          }))
-                          .filter((item) => item.text)
-                        timedItems.push(...timedNoGroup)
-                        noTimeGroupItems.sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
-                        timedItems.sort((a, b) => {
-                          const ta = timeToMinutes(a.time)
-                          const tb = timeToMinutes(b.time)
-                          if (ta !== tb) return ta - tb
-                          return (a.order ?? 0) - (b.order ?? 0)
-                        })
-                      }
-                      const tabNoTimeItems = []
-                      const tabTimedItems = []
-                      if (!isAll && Array.isArray(block.items)) {
-                        for (const item of block.items) {
-                          const text = (item.text ?? "").trim()
-                          if (!text) continue
-                          const entry = { time: item.time || "", text, order: item.order ?? 0 }
-                          if (entry.time) tabTimedItems.push(entry)
-                          else tabNoTimeItems.push(entry)
-                        }
-                        tabNoTimeItems.sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
-                        tabTimedItems.sort((a, b) => {
-                          const ta = timeToMinutes(a.time)
-                          const tb = timeToMinutes(b.time)
-                          if (ta !== tb) return ta - tb
-                          return (a.order ?? 0) - (b.order ?? 0)
-                        })
-                      }
-                      return (
-                        <div
-                          key={block.dateKey}
-                          ref={setReadBlockRef(block.dateKey)}
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            handleReadBlockClick(block.dateKey)
-                          }}
-                          onMouseEnter={() => setHoveredReadDateKey(block.dateKey)}
-                          onMouseLeave={() => {
-                            setHoveredReadDateKey((prev) => (prev === block.dateKey ? null : prev))
-                          }}
-                          style={{
-                            marginBottom: 16,
-                            scrollMarginTop: READ_SCROLL_MARGIN_TOP,
-                            cursor: "pointer",
-                            position: "relative",
-                            border: `1px solid ${blockBorderColor}`,
-                            borderRadius: 10,
-                            padding: "6px 8px",
-                            paddingLeft: isToday ? 14 : 8,
-                            boxShadow: isToday ? `0 0 0 2px ${highlightTokens.today.soft}` : "none",
-                            background: isToday
-                              ? `linear-gradient(90deg, ${highlightTokens.today.soft}, rgba(0,0,0,0) 55%)`
-                              : "transparent"
-                          }}
-                        >
-                          {isToday && (
-                            <div
-                              aria-hidden="true"
-                              style={{
-                                position: "absolute",
-                                left: 4,
-                                top: 6,
-                                bottom: 6,
-                                width: 4,
-                                borderRadius: 999,
-                                background: highlightTokens.today.ring
-                              }}
-                            />
-                          )}
-                          <div
-                            style={{
-                              display: "flex",
-                              alignItems: "center",
-                              justifyContent: "space-between",
-                              gap: 8,
-                              fontWeight: 900
-                            }}
-                          >
-                            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                              <div>{header}</div>
-                              {isToday && (
-                                <span
-                                  style={{
-                                    padding: "2px 6px",
-                                    borderRadius: 999,
-                                    fontSize: 11,
-                                    fontWeight: 900,
-                                    color: highlightTokens.today.pillText,
-                                    border: `1px solid ${highlightTokens.today.pillText}`,
-                                    background: highlightTokens.today.soft
-                                  }}
-                                >
-                                  오늘
-                                </span>
-                              )}
-                            </div>
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation()
-                                toggleDashboardCollapse(block.dateKey)
-                              }}
-                              style={{
-                                border: `1px solid ${ui.border}`,
-                                background: ui.surface,
-                                color: ui.text2,
-                                borderRadius: 999,
-                                width: 24,
-                                height: 24,
-                                cursor: "pointer",
-                                fontWeight: 900,
-                                lineHeight: 1
-                              }}
-                              title={isCollapsed ? "펼치기" : "접기"}
-                            >
-                              {isCollapsed ? "▸" : "▾"}
-                            </button>
-                          </div>
-                          {!isCollapsed && (
-                            <div style={{ marginTop: 4, display: "flex", flexDirection: "column", gap: 2 }}>
-                              {isAll ? (
-                                <>
-                                  {block.general.map((line, idx) => (
-                                    <div
-                                      key={`${block.dateKey}-general-${idx}`}
-                                      style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}
-                                    >
-                                      {line}
-                                    </div>
-                                  ))}
-                                  {noTimeGroupItems.map((item, idx) => (
-                                    <div
-                                      key={`${block.dateKey}-group-notime-${idx}`}
-                                      style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}
-                                    >
-                                      [{item.title}] {item.text}
-                                    </div>
-                                  ))}
-                                  {timedItems.map((item, idx) => (
-                                    <div
-                                      key={`${block.dateKey}-timed-${idx}`}
-                                      style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}
-                                    >
-                                      {item.time} {item.title ? `[${item.title}] ` : ""}{item.text}
-                                    </div>
-                                  ))}
-                                </>
-                              ) : (
-                                <>
-                                  {tabNoTimeItems.map((item, ii) => (
-                                    <div
-                                      key={`${block.dateKey}-${activeWindow?.id ?? "tab"}-notime-${ii}`}
-                                      style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}
-                                    >
-                                      {item.text}
-                                    </div>
-                                  ))}
-                                  {tabTimedItems.map((item, ii) => (
-                                    <div
-                                      key={`${block.dateKey}-${activeWindow?.id ?? "tab"}-time-${ii}`}
-                                      style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}
-                                    >
-                                      {item.time} {item.text}
-                                    </div>
-                                  ))}
-                                </>
-                              )}
-                            </div>
-                          )}
-                        </div>
-                      )
-                    })
-                  )}
+                  <MemoReadView
+                    blocks={activeWindowId === "all" ? dashboardBlocks : tabReadBlocks}
+                    isAll={activeWindowId === "all"}
+                    ui={ui}
+                    highlightTokens={highlightTokens}
+                    todayKey={todayKey}
+                    hoveredReadDateKey={hoveredReadDateKey}
+                    setHoveredReadDateKey={setHoveredReadDateKey}
+                    collapsedForActive={collapsedForActive}
+                    toggleDashboardCollapse={toggleDashboardCollapse}
+                    timeToMinutes={timeToMinutes}
+                    keyToYMD={keyToYMD}
+                    buildHeaderLine={buildHeaderLine}
+                    activeWindowId={activeWindowId}
+                    setReadBlockRef={setReadBlockRef}
+                    handleReadBlockClick={handleReadBlockClick}
+                    readScrollMarginTop={READ_SCROLL_MARGIN_TOP}
+                  />
+
                 </div>
               )}
             </div>
@@ -5016,52 +3008,22 @@ useEffect(() => {
             }}
           >
             <div style={memoInputWrap}>
-              <div style={memoOverlay} aria-hidden="true">
-                <div ref={rightOverlayInnerRef} style={{ transform: "translateY(0px)", willChange: "transform" }}>
-                  {rightOverlayLines.map((line, i) => (
-                    <div
-                      key={`memo-right-line-${i}`}
-                      className={line.isHeader ? "memo-overlay__line memo-overlay__line--header" : "memo-overlay__line"}
-                    >
-                      {line.groupParts ? (
-                        <>
-                          {line.groupParts.prefix}
-                          {line.groupParts.suffix ? <span>{line.groupParts.suffix}</span> : null}
-                        </>
-                      ) : line.text === "" ? (
-                        " "
-                      ) : (
-                        line.text
-                      )}
-                    </div>
-                  ))}
-                </div>
-              </div>
-              <textarea
-                ref={rightTextareaRef}
-                className="memo-input"
-                value={rightMemoText}
-                onChange={(e) => {
-                  const next = e.target.value
-                  setRightMemoText(next)
-                  if (activeWindowId === "all") {
-                    syncCombinedRightText(next)
-                  }
-                }}
-                onBlur={(e) => {
-                  if (activeWindowId !== "all") return
-                  const raw = e.currentTarget.value
-                  const sanitized = ensureRightMemoSectionHeaders(raw)
-                  if (sanitized === raw) return
-                  setRightMemoText(sanitized)
-                  syncCombinedRightText(sanitized)
-                }}
+              <RightMemoEditor
+                memoOverlayStyle={memoOverlay}
+                memoTextareaStyle={memoTextareaStyle}
+                rightOverlayLines={rightOverlayLines}
+                rightOverlayInnerRef={rightOverlayInnerRef}
+                rightTextareaRef={rightTextareaRef}
+                rightMemoText={rightMemoText}
+                setRightMemoText={setRightMemoText}
+                activeWindowId={activeWindowId}
+                syncCombinedRightText={syncCombinedRightText}
+                ensureRightMemoSectionHeaders={ensureRightMemoSectionHeaders}
                 onFocus={() => {
                   setSelectedDateKey(null)
                   lastActiveDateKeyRef.current = null
                 }}
                 onScroll={(e) => syncOverlayScroll(e.currentTarget, rightOverlayInnerRef.current)}
-                style={memoTextareaStyle}
                 placeholder={
                   activeWindowId === "all"
                     ? [
@@ -5076,7 +3038,6 @@ useEffect(() => {
                         "권교수님 피드백 다시 한 번 생각하기",
                         "[연애]",
                         "100일 이벤트 준비하기"
-
                       ].join("\n")
                     : ["[자유 메모]", "", "해당 메모장에 쓰고 싶은 글을 자유롭게 입력하세요."].join("\n")
                 }
@@ -5127,550 +3088,38 @@ useEffect(() => {
 
   // ===== 달력 패널 =====
   const calendarPanel = (
-    <div
-      ref={calendarPanelRef}
-      style={{
-        flex: "1 1 0",
-        minWidth: 0,
-        minHeight: 0,
-        borderRadius: 8,
-        background: ui.surface,
-        fontFamily: "inherit",
-        border: `1px solid ${ui.border}`,
-        boxShadow: ui.shadow,
-        overflow: "hidden",
-        display: "flex",
-        flexDirection: "column"
-      }}
-    >
-      <div
-        ref={calendarTopRef}
-        style={{
-          padding: "8px 12px",
-          borderBottom: `1px solid ${ui.border}`,
-          background: ui.surface2
-        }}
-      >
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: 10,
-            minWidth: 0
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
-            <div style={{ position: "relative", display: "inline-flex", alignItems: "center" }}>
-              <input
-                type="number"
-                value={ymYear}
-                onChange={(e) => setYmYear(e.target.value)}
-                className="calendar-ym-control"
-                style={{ ...controlInput, width: 76, padding: "0 24px 0 10px" }}
-                aria-label="연도 입력"
-              />
-              <span
-                aria-hidden="true"
-                style={{
-                  position: "absolute",
-                  right: 2,
-                  top: "50%",
-                  marginTop: 0.5,
-                  transform: "translateY(-50%)",
-                  display: "inline-flex",
-                  flexDirection: "column",
-                  gap: 0
-                }}
-              >
-                <button
-                  type="button"
-                  onClick={() => {
-                    const next = Number(ymYear)
-                    setYmYear(Number.isFinite(next) ? next + 1 : view.year + 1)
-                  }}
-                  className="no-hover-outline ym-spin-button"
-                  style={{
-                    width: 22,
-                    height: 20,
-                    padding: 0,
-                    border: "none",
-                    background: "transparent",
-                    color: ui.text2,
-                    opacity: 0.6,
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    cursor: "pointer",
-                    lineHeight: 0,
-                    marginBottom: -5
-                  }}
-                  aria-label="연도 증가"
-                >
-                  <svg width="22" height="20" viewBox="0 0 20 20" aria-hidden="true">
-                    <path d="M5 12l5-6 5 6z" fill="currentColor" />
-                  </svg>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    const next = Number(ymYear)
-                    setYmYear(Number.isFinite(next) ? next - 1 : view.year - 1)
-                  }}
-                  className="no-hover-outline ym-spin-button"
-                  style={{
-                    width: 22,
-                    height: 20,
-                    padding: 0,
-                    border: "none",
-                    background: "transparent",
-                    color: ui.text2,
-                    opacity: 0.6,
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    cursor: "pointer",
-                    lineHeight: 0,
-                    marginTop: -5
-                  }}
-                  aria-label="연도 감소"
-                >
-                  <svg width="22" height="20" viewBox="0 0 20 20" aria-hidden="true">
-                    <path d="M5 8l5 6 5-6z" fill="currentColor" />
-                  </svg>
-                </button>
-              </span>
-            </div>
-            <div style={{ position: "relative", display: "inline-flex", alignItems: "center" }}>
-                <select
-                  value={ymMonth}
-                  onChange={(e) => setYmMonth(Number(e.target.value))}
-                  className="calendar-ym-control"
-                  style={{
-                    ...controlInput,
-                    width: 72,
-                    padding: "0 20px 0 18px",
-                    appearance: "none",
-                    WebkitAppearance: "none",
-                    MozAppearance: "none"
-                  }}
-                aria-label="월 선택"
-              >
-                {Array.from({ length: 12 }).map((_, i) => {
-                  const m = i + 1
-                  return (
-                    <option key={m} value={m}>
-                      {m}월
-                    </option>
-                  )
-                })}
-              </select>
-                <span
-                  aria-hidden="true"
-                  style={{
-                    position: "absolute",
-                    right: 2,
-                    top: "50%",
-                    marginTop: 0,
-                    transform: "translateY(-50%)",
-                    pointerEvents: "none",
-                    color: ui.text2,
-                    opacity: 0.5
-                  }}
-                >
-                  <svg width="18" height="12" viewBox="0 0 20 20" aria-hidden="true">
-                    <path
-                      d="M4 7l6 6 6-6"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2.2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    />
-                  </svg>
-                </span>
-            </div>
-
-            <button
-              onClick={goPrevMonth}
-              className="arrow-button"
-              style={arrowButton}
-              title="이전 달"
-              aria-label="이전 달"
-            >
-              ◀
-            </button>
-            <button
-              onClick={goNextMonth}
-              className="arrow-button"
-              style={arrowButton}
-              title="다음 달"
-              aria-label="다음 달"
-            >
-              ▶
-            </button>
-          </div>
-
-          <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
-            {(layoutPreset === "calendar-left" || outerCollapsed === "left") && (
-              <button
-                onClick={() => setLayoutPreset((p) => (p === "memo-left" ? "calendar-left" : "memo-left"))}
-                style={{ ...pillButton, padding: "0 10px" }}
-                title="메모/달력 위치 변경"
-                aria-label="메모/달력 위치 변경"
-              >
-                ⇆
-              </button>
-            )}
-          </div>
-        </div>
-      </div>
-
-      <div
-        ref={calendarBodyRef}
-        style={{
-          padding: 6,
-          overflow: "auto",
-          minHeight: 0
-        }}
-      >
-        <div
-          style={{
-            border: `1px solid ${ui.border2}`,
-            borderRadius: 8,
-            overflow: "hidden",
-            background: ui.surface
-          }}
-        >
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns: "repeat(7, 1fr)",
-                gap: 0,
-                fontWeight: 800,
-                color: ui.text2,
-                fontSize: 11,
-                textAlign: "center",
-                userSelect: "none",
-                background: ui.surface2
-              }}
-            >
-              {[
-                { label: "Sun", color: ui.holiday },
-                { label: "Mon", color: ui.text2 },
-                { label: "Tue", color: ui.text2 },
-                { label: "Wed", color: ui.text2 },
-                { label: "Thu", color: ui.text2 },
-                { label: "Fri", color: ui.text2 },
-                { label: "Sat", color: ui.saturday }
-              ].map((w, i) => (
-                <div
-                  key={`weekday-${i}`}
-                  style={{
-                    padding: "4px 0 6px",
-                    lineHeight: 1,
-                    borderRight: i % 7 === 6 ? "none" : `1px solid ${ui.border2}`,
-                    borderBottom: "none",
-                    color: w.color
-                  }}
-                >
-                  {w.label}
-                </div>
-              ))}
-            </div>
-
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "repeat(7, 1fr)",
-              gap: 0,
-              gridAutoRows: `${calendarCellH}px`
-            }}
-          >
-            {Array.from({ length: firstWeekday }).map((_, i) => {
-              const col = i % 7
-              const row = Math.floor(i / 7)
-              const isLastCol = col === 6
-              const isLastRow = row === weeks - 1
-              return (
-                <div
-                  key={`empty-${i}`}
-                  style={{
-                    borderRight: isLastCol ? "none" : `1px solid ${ui.border2}`,
-                    borderBottom: isLastRow ? "none" : `1px solid ${ui.border2}`,
-                    background: ui.surface
-                  }}
-                />
-              )
-            })}
-
-            {Array.from({ length: lastDay }).map((_, i) => {
-              const day = i + 1
-              const key = `${viewYear}-${String(viewMonth).padStart(2, "0")}-${String(day).padStart(2, "0")}`
-              const cellIndex = firstWeekday + i
-              const col = cellIndex % 7
-              const row = Math.floor(cellIndex / 7)
-              const isLastCol = col === 6
-              const isLastRow = row === weeks - 1
-
-              const items = itemsByDate[key] || []
-              const itemLineH = 14
-              const headerH = 28
-              const maxItems = Math.max(1, Math.floor((calendarCellH - headerH) / itemLineH))
-              const visibleCount = Math.min(items.length, maxItems)
-              const recent = visibleCount > 0 ? items.slice(0, visibleCount) : []
-              const hiddenCount = items.length - visibleCount
-
-              const isSelected = selectedDateKey === key
-              const isToday = key === todayKey
-
-              const dow = dayOfWeek(viewYear, viewMonth, day)
-              const holidayName = getHolidayName(viewYear, viewMonth, day)
-              const isHoliday = Boolean(holidayName)
-              const isSunday = dow === 0
-              const isSaturday = dow === 6
-
-              const bgColor = isSelected
-                ? highlightTokens.selected.soft
-                : isToday
-                  ? highlightTokens.today.soft
-                  : ui.surface
-
-              const dayColor = isHoliday || isSunday ? ui.holiday : isSaturday ? ui.saturday : ui.text
-
-              return (
-                <div
-                  key={key}
-                  className="calendar-day-cell"
-                  onPointerDown={() => {
-                    calendarInteractingRef.current = true
-                  }}
-                  onPointerUp={() => {
-                    setTimeout(() => {
-                      calendarInteractingRef.current = false
-                    }, 0)
-                  }}
-                  onPointerCancel={() => {
-                    calendarInteractingRef.current = false
-                  }}
-                  onClick={() => handleDayClick(day)}
-                  style={{
-                    borderRight: isLastCol ? "none" : `1px solid ${ui.border2}`,
-                    borderBottom: isLastRow ? "none" : `1px solid ${ui.border2}`,
-                    borderRadius: 0,
-                    padding: "2px 4px",
-                    boxSizing: "border-box",
-                    overflow: "hidden",
-                    cursor: "pointer",
-                    userSelect: "none",
-                    background: bgColor,
-                    boxShadow: isSelected
-                      ? theme === "dark"
-                        ? "0 0 0 1px rgba(96,165,250,0.22)"
-                        : "0 2px 10px rgba(37, 99, 235, 0.12)"
-                      : "none",
-                    transition: "transform 80ms ease, box-shadow 120ms ease, background 120ms ease",
-                    position: "relative",
-                    display: "flex",
-                    flexDirection: "column",
-                    minWidth: 0
-                  }}
-                  onMouseEnter={(e) => {
-                    e.currentTarget.style.transform = "translateY(-1px)"
-                  }}
-                  onMouseLeave={(e) => {
-                    e.currentTarget.style.transform = "translateY(0px)"
-                  }}
-                >
-                  {isSelected && (
-                  <div
-                    style={{
-                      position: "absolute",
-                      top: 0,
-                      left: 0,
-                      right: 0,
-                      height: 2,
-                      background: highlightTokens.selected.ring
-                    }}
-                  />
-                  )}
-
-                  {isToday && !isSelected && (
-                    <div
-                      style={{
-                        position: "absolute",
-                        top: 0,
-                        left: 0,
-                        right: 0,
-                        height: 2,
-                        background: highlightTokens.today.ring,
-                        opacity: 0.9
-                      }}
-                    />
-                  )}
-
-                  <div
-                    style={{
-                      display: "flex",
-                      alignItems: "flex-start",
-                      justifyContent: "space-between",
-                      gap: 8
-                    }}
-                  >
-                    <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
-                      <div
-                        style={{
-                          fontWeight: 900,
-                          fontSize: 11,
-                          color: dayColor,
-                          lineHeight: 1,
-                          marginTop: 0
-                        }}
-                      >
-                        {day}
-                      </div>
-                      {holidayName ? (
-                        <div
-                          style={{
-                            fontSize: 10,
-                            fontWeight: 900,
-                            color: ui.holiday,
-                            lineHeight: 1,
-                            whiteSpace: "nowrap",
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                            maxWidth: 60
-                          }}
-                          title={holidayName}
-                        >
-                          {holidayName}
-                        </div>
-                      ) : null}
-                    </div>
-
-                    {items.length > 0 ? (
-                      hiddenCount > 0 ? (
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            openDayList(key, items)
-                          }}
-                          style={{
-                            fontSize: 10,
-                            fontWeight: 900,
-                            padding: "1px 6px",
-                            borderRadius: 999,
-                            border: `1px solid ${ui.border}`,
-                            background: ui.surface,
-                            color: ui.text2,
-                            flexShrink: 0,
-                            cursor: "pointer"
-                          }}
-                          title="전체 일정 보기"
-                        >
-                          {items.length}개
-                        </button>
-                      ) : (
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            openDayList(key, items)
-                          }}
-                          style={{
-                            fontSize: 10,
-                            fontWeight: 900,
-                            padding: "1px 6px",
-                            borderRadius: 999,
-                            border: `1px solid ${ui.border}`,
-                            background: ui.surface,
-                            color: ui.text2,
-                            flexShrink: 0,
-                            cursor: "pointer"
-                          }}
-                          title="메모 항목 보기"
-                        >
-                          {items.length}개
-                        </button>
-                      )
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          openDayList(key, items)
-                        }}
-                        style={{
-                          fontSize: 10,
-                          fontWeight: 900,
-                          padding: "1px 6px",
-                          borderRadius: 999,
-                          border: `1px solid ${ui.border}`,
-                          background: ui.surface,
-                          color: ui.text2,
-                          flexShrink: 0,
-                          cursor: "pointer"
-                        }}
-                        title="메모 추가"
-                      >
-                        +
-                      </button>
-                    )}
-                  </div>
-
-                  <div
-                    style={{
-                      marginTop: 2,
-                      fontSize: 10,
-                      lineHeight: 1.2,
-                      color: ui.text,
-                      minWidth: 0
-                    }}
-                  >
-                    {recent.map((it) => (
-                      <div
-                        key={it.id}
-                        style={{
-                          whiteSpace: "nowrap",
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          display: "flex",
-                          gap: 4,
-                          minWidth: 0
-                        }}
-                      >
-                        {it.color && (
-                          <span
-                            title={it.sourceTitle ? `[${it.sourceTitle}]` : "항목"}
-                            style={{
-                              width: 6,
-                              height: 6,
-                              borderRadius: 999,
-                              background: it.color,
-                              flexShrink: 0,
-                              marginTop: 4
-                            }}
-                          />
-                        )}
-                        {it.time ? (
-                          <span style={{ color: ui.text2, fontWeight: 900, flexShrink: 0, fontSize: 9 }}>
-                            {it.time}
-                          </span>
-                        ) : null}
-                        <span style={{ fontWeight: 650, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" }}>
-                          {it.text}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        </div>
-      </div>
-    </div>
+    <CalendarPanel
+      calendarPanelRef={calendarPanelRef}
+      calendarTopRef={calendarTopRef}
+      calendarBodyRef={calendarBodyRef}
+      ymYear={ymYear}
+      setYmYear={setYmYear}
+      ymMonth={ymMonth}
+      setYmMonth={setYmMonth}
+      goPrevMonth={goPrevMonth}
+      goNextMonth={goNextMonth}
+      layoutPreset={layoutPreset}
+      outerCollapsed={outerCollapsed}
+      setLayoutPreset={setLayoutPreset}
+      pillButton={pillButton}
+      controlInput={controlInput}
+      arrowButton={arrowButton}
+      ui={ui}
+      calendarCellH={calendarCellH}
+      firstWeekday={firstWeekday}
+      weeks={weeks}
+      lastDay={lastDay}
+      itemsByDate={itemsByDate}
+      selectedDateKey={selectedDateKey}
+      todayKey={todayKey}
+      highlightTokens={highlightTokens}
+      theme={theme}
+      viewYear={viewYear}
+      viewMonth={viewMonth}
+      openDayList={openDayList}
+      handleDayClick={handleDayClick}
+      calendarInteractingRef={calendarInteractingRef}
+    />
   )
 
   const dividerLeft =
@@ -5888,260 +3337,29 @@ useEffect(() => {
         </div>
       </div>
 
-      {dayListModal && (
-        <div
-          onClick={() => setDayListModal(null)}
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(15, 23, 42, 0.35)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            padding: 16,
-            zIndex: 200
-          }}
-        >
-          <div
-            onClick={(e) => e.stopPropagation()}
-            style={{
-              width: "min(520px, 92vw)",
-              maxHeight: "80vh",
-              background: ui.surface,
-              color: ui.text,
-              borderRadius: 12,
-              border: `1px solid ${ui.border}`,
-              boxShadow: ui.shadow,
-              padding: 14,
-              display: "flex",
-              flexDirection: "column",
-              gap: 10
-            }}
-          >
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-              <div style={{ fontWeight: 900 }}>{dayListTitle}</div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <button
-                  type="button"
-                  onClick={() => setDayListMode("read")}
-                  style={{
-                    height: 28,
-                    padding: "0 10px",
-                    borderRadius: 8,
-                    border: `1px solid ${ui.border}`,
-                    background: dayListMode === "read" ? ui.accent : ui.surface,
-                    color: dayListMode === "read" ? "#fff" : ui.text,
-                    cursor: "pointer",
-                    fontWeight: 800
-                  }}
-                >
-                  읽기모드
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setDayListMode("edit")}
-                  style={{
-                    height: 28,
-                    padding: "0 10px",
-                    borderRadius: 8,
-                    border: `1px solid ${ui.border}`,
-                    background: dayListMode === "edit" ? ui.accent : ui.surface,
-                    color: dayListMode === "edit" ? "#fff" : ui.text,
-                    cursor: "pointer",
-                    fontWeight: 800
-                  }}
-                >
-                  편집모드
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setDayListModal(null)}
-                  style={{
-                    height: 28,
-                    padding: "0 10px",
-                    borderRadius: 8,
-                    border: `1px solid ${ui.border}`,
-                    background: ui.surface2,
-                    color: ui.text,
-                    cursor: "pointer",
-                    fontWeight: 800
-                  }}
-                >
-                  닫기
-                </button>
-              </div>
-            </div>
-            {dayListMode === "edit" ? (
-              <textarea
-                value={dayListEditText}
-                onChange={(e) => {
-                  const next = e.target.value
-                  setDayListEditText(next)
-                  applyDayListEdit(next)
-                }}
-                placeholder="할 일을 입력하세요"
-                style={{
-                  marginTop: 10,
-                  width: "100%",
-                  minHeight: 260,
-                  maxHeight: "60vh",
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: `1px solid ${ui.border2}`,
-                  background: ui.surface2,
-                  color: ui.text,
-                  fontSize: 13,
-                  lineHeight: 1.6,
-                  fontFamily: "inherit",
-                  fontWeight: 600,
-                  resize: "vertical"
-                }}
-              />
-            ) : (
-              <div
-                style={{
-                  marginTop: 10,
-                  width: "100%",
-                  minHeight: 260,
-                  maxHeight: "60vh",
-                  padding: "12px",
-                  borderRadius: 10,
-                  border: `1px solid ${ui.border}`,
-                  background: ui.surface,
-                  color: ui.text,
-                  fontSize: memoFontPx,
-                  lineHeight: 1.25,
-                  fontFamily: "inherit",
-                  fontWeight: 400,
-                  overflowY: "auto",
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: 2
-                }}
-              >
-                {dayListReadItems ? (
-                  dayListReadItems.isAll ? (
-                    <>
-                      {dayListReadItems.general.map((line, idx) => (
-                        <div key={`daylist-general-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
-                          {line}
-                        </div>
-                      ))}
-                      {dayListReadItems.noTimeGroupItems.map((item, idx) => (
-                        <div key={`daylist-group-notime-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
-                          [{item.title}] {item.text}
-                        </div>
-                      ))}
-                      {dayListReadItems.timedItems.map((item, idx) => (
-                        <div key={`daylist-timed-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
-                          {item.time} {item.title ? `[${item.title}] ` : ""}{item.text}
-                        </div>
-                      ))}
-                      {dayListReadItems.general.length === 0 &&
-                        dayListReadItems.noTimeGroupItems.length === 0 &&
-                        dayListReadItems.timedItems.length === 0 && (
-                        <div style={{ color: ui.text2 }}>내용이 없습니다.</div>
-                      )}
-                    </>
-                  ) : (
-                    <>
-                      {dayListReadItems.noTimeItems.map((line, idx) => (
-                        <div key={`daylist-notime-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
-                          {line}
-                        </div>
-                      ))}
-                      {dayListReadItems.timedItems.map((item, idx) => (
-                        <div key={`daylist-timed-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
-                          {item.time} {item.text}
-                        </div>
-                      ))}
-                      {dayListReadItems.noTimeItems.length === 0 && dayListReadItems.timedItems.length === 0 && (
-                        <div style={{ color: ui.text2 }}>내용이 없습니다.</div>
-                      )}
-                    </>
-                  )
-                ) : (
-                  <span style={{ color: ui.text2 }}>내용이 없습니다.</span>
-                )}
-              </div>
-            )}
-          </div>
-        </div>
-      )}
+      <DayListModal
+        open={Boolean(dayListModal)}
+        onClose={() => setDayListModal(null)}
+        ui={ui}
+        dayListTitle={dayListTitle}
+        dayListMode={dayListMode}
+        setDayListMode={setDayListMode}
+        dayListEditText={dayListEditText}
+        setDayListEditText={setDayListEditText}
+        applyDayListEdit={applyDayListEdit}
+        dayListReadItems={dayListReadItems}
+        memoFontPx={memoFontPx}
+      />
 
-      {deleteConfirm && (
-        <div
-          onClick={() => setDeleteConfirm(null)}
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(15, 23, 42, 0.35)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            padding: 16,
-            zIndex: 210
-          }}
-        >
-          <div
-            onClick={(e) => e.stopPropagation()}
-            style={{
-              width: "min(360px, 92vw)",
-              background: ui.surface,
-              color: ui.text,
-              borderRadius: 12,
-              border: `1px solid ${ui.border}`,
-              boxShadow: ui.shadow,
-              padding: 16,
-              display: "flex",
-              flexDirection: "column",
-              gap: 12
-            }}
-          >
-            <div style={{ fontWeight: 900, fontSize: 16 }}>탭을 삭제할까요?</div>
-            <div style={{ color: ui.text2, fontWeight: 600, fontSize: 13 }}>
-              [{deleteConfirm.title}] 탭을 삭제하면 복구할 수 없습니다.
-            </div>
-            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
-              <button
-                type="button"
-                onClick={() => setDeleteConfirm(null)}
-                style={{
-                  height: 32,
-                  padding: "0 16px",
-                  borderRadius: 10,
-                  border: `1px solid ${ui.border}`,
-                  background: ui.surface2,
-                  color: ui.text,
-                  cursor: "pointer",
-                  fontWeight: 800
-                }}
-              >
-                N
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  removeWindow(deleteConfirm.id)
-                  setDeleteConfirm(null)
-                }}
-                style={{
-                  height: 32,
-                  padding: "0 16px",
-                  borderRadius: 10,
-                  border: `1px solid ${ui.border}`,
-                  background: ui.accent,
-                  color: "#fff",
-                  cursor: "pointer",
-                  fontWeight: 800
-                }}
-              >
-                Y
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <DeleteConfirmModal
+        deleteConfirm={deleteConfirm}
+        ui={ui}
+        onCancel={() => setDeleteConfirm(null)}
+        onConfirm={(id) => {
+          removeWindow(id)
+          setDeleteConfirm(null)
+        }}
+      />
 
       <style>{`
         * { box-sizing: border-box; }
@@ -6306,3 +3524,4 @@ useEffect(() => {
 }
 
 export default App
+
