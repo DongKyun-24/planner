@@ -2111,12 +2111,22 @@ function stripEmptyGroupLines(bodyText) {
 
   async function saveRightMemoToSupabase(userId, year, windowId, content) {
     if (!supabase || !userId || !windowId) return
+    const nextText = String(content ?? "")
+    if (!nextText.trim()) {
+      await supabase
+        .from("right_memos")
+        .delete()
+        .eq("user_id", userId)
+        .eq("year", year)
+        .eq("window_id", windowId)
+      return
+    }
     await supabase.from("right_memos").upsert(
       {
         user_id: userId,
         year,
         window_id: windowId,
-        content: String(content ?? "")
+        content: nextText
       },
       { onConflict: "user_id,year,window_id" }
     )
