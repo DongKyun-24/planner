@@ -507,6 +507,7 @@ export default function CalendarPanel({
                           overflow: "hidden",
                           textOverflow: "ellipsis",
                           display: "flex",
+                          alignItems: "center",
                           gap: 4,
                           minWidth: 0
                         }}
@@ -520,7 +521,7 @@ export default function CalendarPanel({
                               borderRadius: 999,
                               background: it.color,
                               flexShrink: 0,
-                              marginTop: 4
+                              marginTop: 0
                             }}
                           />
                         )}

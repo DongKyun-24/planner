@@ -243,6 +243,7 @@ function App() {
   }
 
   function closeLoginModal() {
+    if (!session) return
     setLoginModalOpen(false)
     setAuthMessage("")
   }
@@ -487,11 +488,23 @@ function App() {
       normalized.push(w)
     }
 
+    const nextWindows = [DEFAULT_WINDOWS[0], ...normalized]
+    const currentActiveId = activeWindowId
+    const currentActiveTitle =
+      currentActiveId && currentActiveId !== "all"
+        ? normalizeWindowTitleValue(windows.find((w) => w.id === currentActiveId)?.title)
+        : null
+    const nextActiveById = nextWindows.some((w) => w.id === currentActiveId) ? currentActiveId : null
+    const nextActiveByTitle =
+      currentActiveTitle &&
+      nextWindows.find((w) => w.id !== "all" && w.title === currentActiveTitle)?.id
+    const nextActiveId = nextActiveById ?? nextActiveByTitle ?? "all"
+
     applyingRemoteWindowsRef.current = true
     setRemoteWindows(rows)
     setRemoteWindowsLoaded(true)
-    setWindows([DEFAULT_WINDOWS[0], ...normalized])
-    setActiveWindowId("all")
+    setWindows(nextWindows)
+    setActiveWindowId(nextActiveId)
     setTimeout(() => {
       applyingRemoteWindowsRef.current = false
     }, 0)
@@ -500,6 +513,11 @@ function App() {
   async function syncWindowsToSupabase(nextWindows) {
     if (!supabase || !session?.user?.id || !remoteWindowsLoaded) return
     const userId = session.user.id
+    const activeIdSnapshot = activeWindowId
+    const activeTitleSnapshot =
+      activeIdSnapshot && activeIdSnapshot !== "all"
+        ? normalizeWindowTitleValue((nextWindows ?? windows).find((w) => w.id === activeIdSnapshot)?.title)
+        : null
     const desired = (nextWindows ?? [])
       .filter((w) => w && w.id !== "all")
       .map((w, idx) => ({
@@ -572,6 +590,9 @@ function App() {
     }
 
     if (insertedRows.length > 0) {
+      const insertedIdByTitle = new Map(
+        insertedRows.map((row) => [normalizeWindowTitleValue(row.title), row.id])
+      )
       applyingRemoteWindowsRef.current = true
       setWindows((prev) => {
         let next = [...prev]
@@ -584,6 +605,12 @@ function App() {
         }
         return next
       })
+      if (activeTitleSnapshot && insertedIdByTitle.has(activeTitleSnapshot)) {
+        const nextActiveId = insertedIdByTitle.get(activeTitleSnapshot)
+        if (nextActiveId && activeIdSnapshot && !isUuid(activeIdSnapshot)) {
+          setActiveWindowId(nextActiveId)
+        }
+      }
       setTimeout(() => {
         applyingRemoteWindowsRef.current = false
       }, 0)
@@ -757,7 +784,12 @@ function App() {
   }, [])
 
   useEffect(() => {
-    if (session) setLoginModalOpen(false)
+    if (session) {
+      setLoginModalOpen(false)
+      return
+    }
+    setAuthMessage("")
+    setLoginModalOpen(true)
   }, [session])
 
   useEffect(() => {
@@ -1516,13 +1548,21 @@ function App() {
       error = result.error
     }
     if (error) setAuthMessage(error.message)
-    else setAuthMessage(authMode === "signIn" ? "로그인 완료." : "가입 완료. 로그인해 주세요.")
+    else {
+      if (authMode === "signIn") {
+        setAuthMessage("로그인 완료.")
+      } else {
+        setAuthMessage("가입 완료. 로그인해 주세요.")
+        setAuthMode("signIn")
+      }
+    }
     setAuthLoading(false)
   }
 
   async function handleSignOut() {
     if (!supabase) return
     await supabase.auth.signOut()
+    setAuthMessage("")
   }
 
   function updateEditorText(nextText) {
@@ -3296,14 +3336,16 @@ useEffect(() => {
   }
 
   const authInputStyle = {
-    height: 42,
-    padding: "0 12px",
+    height: 44,
+    padding: "0 14px",
     borderRadius: 12,
     border: `1px solid ${ui.border}`,
     background: ui.surface2,
     color: ui.text,
     fontFamily: "inherit",
-    fontWeight: 600
+    fontWeight: 600,
+    fontSize: 14,
+    letterSpacing: "0.01em"
   }
 
   // navArrowButton removed (reverted to original iconButton usage)
@@ -4324,7 +4366,7 @@ useEffect(() => {
                 justifyContent: "space-between"
               }}
             >
-              <div style={{ fontWeight: 900, fontSize: 18 }}>planner 로그인</div>
+              <div style={{ fontWeight: 900, fontSize: 18 }}>Planner</div>
               <button
                 type="button"
                 className="no-hover-outline login-modal-panel__close"
@@ -4339,10 +4381,11 @@ useEffect(() => {
               onChange={(e) => {
                 const next = e.target.value
                 setAuthEmail(next)
-                if (rememberCredentials) persistCredentials(next, authPassword)
+                if (rememberCredentials && authMode === "signIn") persistCredentials(next, authPassword)
               }}
               placeholder="이메일"
               style={authInputStyle}
+              className="login-modal-input"
               autoComplete="username"
             />
             <input
@@ -4351,56 +4394,72 @@ useEffect(() => {
               onChange={(e) => {
                 const next = e.target.value
                 setAuthPassword(next)
-                if (rememberCredentials) persistCredentials(authEmail, next)
+                if (rememberCredentials && authMode === "signIn") persistCredentials(authEmail, next)
               }}
               placeholder="비밀번호"
               style={authInputStyle}
+              className="login-modal-input"
               autoComplete="current-password"
             />
-            <label
+            {authMode === "signIn" && (
+              <label
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 6,
+                  fontSize: 13,
+                  color: ui.text2,
+                  cursor: "pointer"
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={rememberCredentials}
+                  onChange={(e) => {
+                    const next = e.target.checked
+                    setRememberCredentials(next)
+                    if (next) persistCredentials(authEmail, authPassword)
+                    else clearPersistedCredentials()
+                  }}
+                  style={{ width: 14, height: 14 }}
+                />
+                <span>아이디/비번 기억</span>
+              </label>
+            )}
+            <div
+              className="login-mode-tabs"
               style={{
-                display: "inline-flex",
+                display: "flex",
                 alignItems: "center",
-                gap: 6,
-                fontSize: 13,
-                color: ui.text2,
-                cursor: "pointer"
+                gap: 4,
+                padding: 1
               }}
             >
-              <input
-                type="checkbox"
-                checked={rememberCredentials}
-                onChange={(e) => {
-                  const next = e.target.checked
-                  setRememberCredentials(next)
-                  if (next) persistCredentials(authEmail, authPassword)
-                  else clearPersistedCredentials()
-                }}
-                style={{ width: 14, height: 14 }}
-              />
-              <span>아이디/비번 기억</span>
-            </label>
-            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
               <button
                 type="button"
                 onClick={() => setAuthMode("signUp")}
+                className="login-mode-tab"
                 style={{
                   border: "none",
                   background: "transparent",
                   color: authMode === "signUp" ? ui.text : ui.text2,
+                  opacity: authMode === "signUp" ? 1 : 0.45,
                   fontWeight: 800,
                   cursor: "pointer"
                 }}
               >
                 가입
               </button>
+              <div style={{ width: 1, height: 18, background: ui.border2, opacity: 0.7 }} />
               <button
                 type="button"
                 onClick={() => setAuthMode("signIn")}
+                className="login-mode-tab"
                 style={{
                   border: "none",
                   background: "transparent",
                   color: authMode === "signIn" ? ui.text : ui.text2,
+                  opacity: authMode === "signIn" ? 1 : 0.45,
                   fontWeight: 800,
                   cursor: "pointer"
                 }}
@@ -4412,8 +4471,9 @@ useEffect(() => {
               type="button"
               onClick={handleAuthSubmit}
               disabled={authLoading}
+              className="login-modal-submit"
               style={{
-                height: 42,
+                height: 44,
                 borderRadius: 12,
                 border: "none",
                 background: ui.accent,
@@ -4588,12 +4648,13 @@ useEffect(() => {
         .login-modal-overlay {
           position: fixed;
           inset: 0;
-          background: rgba(15, 23, 42, 0.45);
+          background: radial-gradient(circle at top, rgba(37, 99, 235, 0.18), rgba(15, 23, 42, 0.65));
           display: flex;
           align-items: center;
           justify-content: center;
           padding: 24px;
           z-index: 130;
+          backdrop-filter: blur(6px);
         }
         .login-modal-panel {
           width: min(420px, 100%);
@@ -4601,10 +4662,24 @@ useEffect(() => {
           background: ${ui.surface};
           border: 1px solid ${ui.border};
           box-shadow: ${ui.shadow};
-          padding: 24px;
+          padding: 22px;
           display: flex;
           flex-direction: column;
           gap: 12px;
+          position: relative;
+          overflow: hidden;
+        }
+        .login-modal-panel::before {
+          content: "";
+          position: absolute;
+          inset: 0;
+          background: linear-gradient(180deg, ${ui.surface2}, transparent 60%);
+          opacity: 0.6;
+          pointer-events: none;
+        }
+        .login-modal-panel > * {
+          position: relative;
+          z-index: 1;
         }
         .login-modal-panel__close {
           width: 28px;
@@ -4619,6 +4694,30 @@ useEffect(() => {
         .login-modal-panel__close:hover:not(:disabled) {
           background: ${ui.surface};
           color: ${ui.text};
+        }
+        .login-modal-input {
+          transition: border-color 120ms ease, box-shadow 120ms ease, background 120ms ease;
+        }
+        .login-modal-input:focus {
+          background: ${ui.surface};
+        }
+        .login-mode-tabs {
+          background: transparent;
+          border: none;
+          border-radius: 0;
+          padding: 0;
+        }
+        .login-mode-tab {
+          padding: 4px 10px;
+          border-radius: 999px;
+        }
+        .login-modal-submit {
+          box-shadow: 0 10px 24px rgba(37, 99, 235, 0.25);
+        }
+        .login-modal-submit:disabled {
+          opacity: 0.7;
+          cursor: default;
+          box-shadow: none;
         }
         * { scrollbar-width: none; -ms-overflow-style: none; }
         ::-webkit-scrollbar { width: 0px; height: 0px; }

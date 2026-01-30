@@ -785,7 +785,12 @@ export function ensureTabGroupLineAtDate(text, dateKey, title, year) {
 
   const body = source.slice(block.bodyStartPos, block.blockEndPos)
   if (body.trim().length > 0) {
-    return { newText: source, caretPos: block.bodyStartPos, headerPos: block.headerStartPos }
+    const ensured = ensureOneBlankLineAtBlockEnd(source, block)
+    return {
+      newText: ensured.newText ?? source,
+      caretPos: ensured.caretPos ?? Math.max(0, block.blockEndPos - 1),
+      headerPos: block.headerStartPos
+    }
   }
 
   const ensured = ensureBodyLineForBlock(source, block)
