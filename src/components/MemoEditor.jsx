@@ -121,7 +121,6 @@ export default function MemoEditor({
               style={{
                 height: 30,
                 padding: "0 10px",
-                border: "none",
                 background: tabMentionHoverId === w.id ? ui.surface2 : "transparent",
                 color: ui.text,
                 textAlign: "left",
