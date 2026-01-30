@@ -2109,6 +2109,22 @@ function stripEmptyGroupLines(bodyText) {
     return typeof data?.content === "string" ? data.content : ""
   }
 
+  async function loadAllRightMemosForYearFromSupabase(userId, year) {
+    if (!supabase || !userId) return {}
+    const { data, error } = await supabase
+      .from("right_memos")
+      .select("window_id, content")
+      .eq("user_id", userId)
+      .eq("year", year)
+    if (error) return {}
+    const map = {}
+    for (const row of data ?? []) {
+      if (!row?.window_id) continue
+      map[row.window_id] = typeof row?.content === "string" ? row.content : ""
+    }
+    return map
+  }
+
   async function saveRightMemoToSupabase(userId, year, windowId, content) {
     if (!supabase || !userId || !windowId) return
     const nextText = String(content ?? "")
@@ -2138,10 +2154,37 @@ function stripEmptyGroupLines(bodyText) {
     suppressRightSaveRef.current = true
 
     if (activeWindowId === "all") {
-      const combined = buildCombinedRightTextForYear(baseYear)
-      setRightMemoText(combined)
-      suppressRightSaveRef.current = false
-      return
+      const fallbackAll = () => {
+        const combined = buildCombinedRightTextForYear(baseYear)
+        setRightMemoText(combined)
+        suppressRightSaveRef.current = false
+      }
+
+      if (!supabase || !session?.user?.id) {
+        fallbackAll()
+        return
+      }
+
+      loadAllRightMemosForYearFromSupabase(session.user.id, baseYear)
+        .then((windowTexts) => {
+          if (cancelled) return
+          for (const w of editableWindows) {
+            const text = String(windowTexts?.[w.id] ?? "")
+            setRightWindowTextSync(baseYear, w.id, text)
+          }
+          const commonText = getRightWindowTextSync(baseYear, "all")
+          const combined = buildCombinedRightText(commonText, editableWindows, integratedFilters, windowTexts)
+          setRightMemoText(combined)
+          suppressRightSaveRef.current = false
+        })
+        .catch(() => {
+          if (cancelled) return
+          fallbackAll()
+        })
+
+      return () => {
+        cancelled = true
+      }
     }
 
     const fallback = () => {
@@ -2199,7 +2242,6 @@ function stripEmptyGroupLines(bodyText) {
       suppressRightSaveRef.current = false
       return
     }
-    if (activeWindowId === "all") return
     try {
       localStorage.setItem(rightMemoKey, rightMemoText)
     } catch (err) { void err }
@@ -2207,6 +2249,21 @@ function stripEmptyGroupLines(bodyText) {
     if (!supabase || !session?.user?.id) return
     if (rightMemoSyncTimerRef.current) clearTimeout(rightMemoSyncTimerRef.current)
     rightMemoSyncTimerRef.current = setTimeout(() => {
+      if (activeWindowId === "all") {
+        const { commonLines, windowLinesById } = splitCombinedRightText(rightMemoText, editableWindows)
+        setRightWindowTextSync(baseYear, "all", commonLines.join("\n").trimEnd())
+        const visibleWindows = (editableWindows ?? []).filter((w) => !integratedFilters || integratedFilters[w.id] !== false)
+        for (const w of visibleWindows) {
+          const next = (windowLinesById.get(w.id) ?? []).join("\n").trimEnd()
+          setRightWindowTextSync(baseYear, w.id, next)
+        }
+        Promise.all(
+          visibleWindows.map((w) =>
+            saveRightMemoToSupabase(session.user.id, baseYear, w.id, (windowLinesById.get(w.id) ?? []).join("\n"))
+          )
+        ).catch((err) => console.error("save all right memos", err))
+        return
+      }
       saveRightMemoToSupabase(session.user.id, baseYear, activeWindowId, rightMemoText)
     }, 800)
   }, [rightMemoKey, rightMemoText, activeWindowId, baseYear, session?.user?.id])
