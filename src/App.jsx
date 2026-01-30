@@ -357,6 +357,9 @@ function App() {
         if (ta !== tb) return ta - tb
         const ca = a.category.localeCompare(b.category, "ko")
         if (ca !== 0) return ca
+        const aNum = /^\d+$/.test(a.content) ? Number(a.content) : null
+        const bNum = /^\d+$/.test(b.content) ? Number(b.content) : null
+        if (aNum != null && bNum != null) return aNum - bNum
         return a.content.localeCompare(b.content, "ko")
       })
       const lines = items.map((item) => {
@@ -1448,6 +1451,7 @@ function App() {
     [memoKeyPrefix, baseYear, activeWindowId]
   )
   const suppressRightSaveRef = useRef(false)
+  const rightMemoSyncTimerRef = useRef(null)
   const editableWindows = useMemo(() => windows.filter((w) => w.id !== "all"), [windows])
   const windowTitlesOrder = useMemo(() => windows.filter((w) => w.id !== "all").map((w) => w.title), [windows])
   const windowTitleRank = useMemo(() => {
@@ -1561,6 +1565,33 @@ function App() {
 
   async function handleSignOut() {
     if (!supabase) return
+    const userId = session?.user?.id
+    if (userId) {
+      try {
+        if (syncTimerRef.current) clearTimeout(syncTimerRef.current)
+        const sourceText =
+          activeWindowId === "all" ? (textRef.current ?? text) : getWindowMemoTextSync(baseYear, "all") ?? ""
+        await syncYearToSupabase(sourceText, baseYear)
+      } catch (err) {
+        console.error("flush plans before sign out", err)
+      }
+
+      try {
+        if (windowsSyncTimerRef.current) clearTimeout(windowsSyncTimerRef.current)
+        if (remoteWindowsLoaded) await syncWindowsToSupabase(windows)
+      } catch (err) {
+        console.error("flush windows before sign out", err)
+      }
+
+      try {
+        if (rightMemoSyncTimerRef.current) clearTimeout(rightMemoSyncTimerRef.current)
+        if (activeWindowId !== "all") {
+          await saveRightMemoToSupabase(userId, baseYear, activeWindowId, rightMemoText)
+        }
+      } catch (err) {
+        console.error("flush right memo before sign out", err)
+      }
+    }
     await supabase.auth.signOut()
     setAuthMessage("")
   }
@@ -2065,21 +2096,83 @@ function stripEmptyGroupLines(bodyText) {
     setText("")
   }, [memoKey, legacyLeftKey, isOfflineMemo])
 
+  async function loadRightMemoFromSupabase(userId, year, windowId) {
+    if (!supabase || !userId || !windowId) return null
+    const { data, error } = await supabase
+      .from("right_memos")
+      .select("content")
+      .eq("user_id", userId)
+      .eq("year", year)
+      .eq("window_id", windowId)
+      .maybeSingle()
+    if (error) return null
+    return typeof data?.content === "string" ? data.content : ""
+  }
+
+  async function saveRightMemoToSupabase(userId, year, windowId, content) {
+    if (!supabase || !userId || !windowId) return
+    await supabase.from("right_memos").upsert(
+      {
+        user_id: userId,
+        year,
+        window_id: windowId,
+        content: String(content ?? "")
+      },
+      { onConflict: "user_id,year,window_id" }
+    )
+  }
+
   // ? 오른쪽 메모(연도별) 로드
-useEffect(() => {
-  suppressRightSaveRef.current = true
-  try {
+  useEffect(() => {
+    let cancelled = false
+    suppressRightSaveRef.current = true
+
     if (activeWindowId === "all") {
       const combined = buildCombinedRightTextForYear(baseYear)
       setRightMemoText(combined)
+      suppressRightSaveRef.current = false
       return
     }
-    const saved = localStorage.getItem(rightMemoKey)
-    setRightMemoText(saved ?? "")
-  } catch {
-    setRightMemoText("")
-  }
-}, [rightMemoKey, baseYear, activeWindowId, editableWindows, integratedFilters])
+
+    const fallback = () => {
+      try {
+        const saved = localStorage.getItem(rightMemoKey)
+        setRightMemoText(saved ?? "")
+        if (saved && supabase && session?.user?.id) {
+          saveRightMemoToSupabase(session.user.id, baseYear, activeWindowId, saved)
+        }
+      } catch {
+        setRightMemoText("")
+      }
+      suppressRightSaveRef.current = false
+    }
+
+    if (!supabase || !session?.user?.id) {
+      fallback()
+      return
+    }
+
+    loadRightMemoFromSupabase(session.user.id, baseYear, activeWindowId)
+      .then((remoteText) => {
+        if (cancelled) return
+        if (remoteText != null) {
+          setRightMemoText(remoteText)
+          try {
+            localStorage.setItem(rightMemoKey, remoteText)
+          } catch (err) { void err }
+        } else {
+          fallback()
+        }
+      })
+      .catch(() => {
+        if (cancelled) return
+        fallback()
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [rightMemoKey, baseYear, activeWindowId, editableWindows, integratedFilters, session?.user?.id])
 
 
   useEffect(() => {
@@ -2091,16 +2184,22 @@ useEffect(() => {
   }, [memoKey, text])
 
   // ? 오른쪽 메모(연도별) 저장
-useEffect(() => {
-  if (suppressRightSaveRef.current) {
-    suppressRightSaveRef.current = false
-    return
-  }
-  if (activeWindowId === "all") return
-  try {
-    localStorage.setItem(rightMemoKey, rightMemoText)
-  } catch (err) { void err }
-}, [rightMemoKey, rightMemoText, activeWindowId])
+  useEffect(() => {
+    if (suppressRightSaveRef.current) {
+      suppressRightSaveRef.current = false
+      return
+    }
+    if (activeWindowId === "all") return
+    try {
+      localStorage.setItem(rightMemoKey, rightMemoText)
+    } catch (err) { void err }
+
+    if (!supabase || !session?.user?.id) return
+    if (rightMemoSyncTimerRef.current) clearTimeout(rightMemoSyncTimerRef.current)
+    rightMemoSyncTimerRef.current = setTimeout(() => {
+      saveRightMemoToSupabase(session.user.id, baseYear, activeWindowId, rightMemoText)
+    }, 800)
+  }, [rightMemoKey, rightMemoText, activeWindowId, baseYear, session?.user?.id])
 
   const leftOverlayLines = useMemo(() => {
     if (activeWindowId === "all") return buildMemoOverlayLines(text)
