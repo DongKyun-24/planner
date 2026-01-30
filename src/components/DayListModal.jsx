@@ -147,9 +147,9 @@ export default function DayListModal({
             {dayListReadItems ? (
               dayListReadItems.isAll ? (
                 <>
-                  {dayListReadItems.general.map((line, idx) => (
-                    <div key={`daylist-general-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
-                      {line}
+                  {dayListReadItems.timedItems.map((item, idx) => (
+                    <div key={`daylist-timed-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
+                      {item.time} {item.title ? `[${item.title}] ` : ""}{item.text}
                     </div>
                   ))}
                   {dayListReadItems.noTimeGroupItems.map((item, idx) => (
@@ -157,9 +157,9 @@ export default function DayListModal({
                       [{item.title}] {item.text}
                     </div>
                   ))}
-                  {dayListReadItems.timedItems.map((item, idx) => (
-                    <div key={`daylist-timed-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
-                      {item.time} {item.title ? `[${item.title}] ` : ""}{item.text}
+                  {dayListReadItems.general.map((line, idx) => (
+                    <div key={`daylist-general-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
+                      {line}
                     </div>
                   ))}
                   {dayListReadItems.general.length === 0 &&
@@ -168,14 +168,14 @@ export default function DayListModal({
                 </>
               ) : (
                 <>
-                  {dayListReadItems.noTimeItems.map((line, idx) => (
-                    <div key={`daylist-notime-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
-                      {line}
-                    </div>
-                  ))}
                   {dayListReadItems.timedItems.map((item, idx) => (
                     <div key={`daylist-timed-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
                       {item.time} {item.text}
+                    </div>
+                  ))}
+                  {dayListReadItems.noTimeItems.map((line, idx) => (
+                    <div key={`daylist-notime-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
+                      {line}
                     </div>
                   ))}
                   {dayListReadItems.noTimeItems.length === 0 && dayListReadItems.timedItems.length === 0 && (

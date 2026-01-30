@@ -197,9 +197,9 @@ export default function MemoReadView({
               <div style={{ marginTop: 4, display: "flex", flexDirection: "column", gap: 2 }}>
                 {isAll ? (
                   <>
-                    {block.general.map((line, idx) => (
-                      <div key={`${block.dateKey}-general-${idx}`} style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}>
-                        {line}
+                    {timedItems.map((item, idx) => (
+                      <div key={`${block.dateKey}-timed-${idx}`} style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}>
+                        {item.time} {item.title ? `[${item.title}] ` : ""}{item.text}
                       </div>
                     ))}
                     {noTimeGroupItems.map((item, idx) => (
@@ -207,28 +207,28 @@ export default function MemoReadView({
                         [{item.title}] {item.text}
                       </div>
                     ))}
-                    {timedItems.map((item, idx) => (
-                      <div key={`${block.dateKey}-timed-${idx}`} style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}>
-                        {item.time} {item.title ? `[${item.title}] ` : ""}{item.text}
+                    {block.general.map((line, idx) => (
+                      <div key={`${block.dateKey}-general-${idx}`} style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}>
+                        {line}
                       </div>
                     ))}
                   </>
                 ) : (
                   <>
-                    {tabNoTimeItems.map((item, ii) => (
-                      <div
-                        key={`${block.dateKey}-${activeWindowId ?? "tab"}-notime-${ii}`}
-                        style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}
-                      >
-                        {item.text}
-                      </div>
-                    ))}
                     {tabTimedItems.map((item, ii) => (
                       <div
                         key={`${block.dateKey}-${activeWindowId ?? "tab"}-time-${ii}`}
                         style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}
                       >
                         {item.time} {item.text}
+                      </div>
+                    ))}
+                    {tabNoTimeItems.map((item, ii) => (
+                      <div
+                        key={`${block.dateKey}-${activeWindowId ?? "tab"}-notime-${ii}`}
+                        style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}
+                      >
+                        {item.text}
                       </div>
                     ))}
                   </>
