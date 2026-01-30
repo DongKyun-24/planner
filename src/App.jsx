@@ -8,6 +8,7 @@ import MemoReadView from "./components/MemoReadView"
 import RightMemoEditor from "./components/RightMemoEditor"
 import SettingsPanel from "./components/SettingsPanel"
 import WindowTabs from "./components/WindowTabs"
+import { isSupabaseConfigured, supabase } from "./lib/supabase"
 import { themes } from "./styles/themes"
 import { daysInMonth, dayOfWeek, keyToYMD, keyToTime, clamp } from "./utils/dateUtils"
 import {
@@ -52,6 +53,41 @@ import {
   removeAllEmptyBlocks
 } from "./utils/plannerText"
 
+const CATEGORY_ID_MAP = {}
+const GENERAL_CATEGORY_ID = "__general__"
+
+function normalizeCategoryId(value) {
+  const key = String(value ?? "").trim()
+  return CATEGORY_ID_MAP[key] || key
+}
+
+function isGeneralCategoryId(value) {
+  const normalized = normalizeCategoryId(value)
+  return !normalized || normalized === GENERAL_CATEGORY_ID
+}
+
+function normalizeWindowTitleValue(value) {
+  return normalizeCategoryId(normalizeWindowTitle(value))
+}
+
+const CLIENT_ID_KEY = "planner-client-id"
+const REMEMBER_CREDENTIALS_KEY = "planner-remember-credentials"
+
+function getClientId() {
+  if (typeof window === "undefined") return "server"
+  try {
+    const existing = localStorage.getItem(CLIENT_ID_KEY)
+    if (existing) return existing
+    const next =
+      (crypto?.randomUUID && `web-${crypto.randomUUID()}`) ||
+      `web-${Date.now()}-${Math.random().toString(16).slice(2)}`
+    localStorage.setItem(CLIENT_ID_KEY, next)
+    return next
+  } catch {
+    return `web-${Date.now()}-${Math.random().toString(16).slice(2)}`
+  }
+}
+
 function App() {
   const textareaRef = useRef(null)
   const rightTextareaRef = useRef(null)
@@ -60,10 +96,17 @@ function App() {
   const leftOverlayInnerRef = useRef(null)
   const rightOverlayInnerRef = useRef(null)
   const readBlockRefs = useRef(new Map())
+  const clientIdRef = useRef(getClientId())
+  const pendingDeleteIdsRef = useRef(new Set())
 
   // ===== 창(캘린더) 탭 =====
   const WINDOWS_KEY = "planner-windows-v1"
+  const OFFLINE_WINDOWS_KEY = "planner-windows-offline-v1"
+  const WINDOWS_KEY_PREFIX = "planner-windows-user-v1"
   const LEGACY_KEY = "planner-text"
+  const OFFLINE_MEMO_PREFIX = "planner-offline"
+  const USER_MEMO_PREFIX = "planner-user"
+  const OFFLINE_MEMO_MIGRATION_KEY = "planner-offline-memo-migrated-v1"
 
   const DEFAULT_WINDOWS = [{ id: "all", title: "통합", color: "#2563eb", fixed: true }]
 
@@ -74,9 +117,41 @@ function App() {
   return `w-${Date.now()}-${Math.random().toString(16).slice(2)}`
   }
 
-  function loadWindows() {
+  function getMemoStoragePrefix(userId) {
+    return userId ? `${USER_MEMO_PREFIX}-${userId}` : OFFLINE_MEMO_PREFIX
+  }
+
+  function getMemoKey(prefix, year, windowId) {
+    return `${prefix}-text-${year}-${windowId}`
+  }
+
+  function getLeftMemoKey(prefix, year) {
+    return `${prefix}-left-text-${year}`
+  }
+
+  function getRightMemoKey(prefix, year, windowId) {
+    return `${prefix}-right-text-${year}-${windowId}`
+  }
+
+  function escapeRegExp(value) {
+    return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  }
+
+  function getWindowsStorageKey(userId) {
+    return userId ? `${WINDOWS_KEY_PREFIX}-${userId}` : OFFLINE_WINDOWS_KEY
+  }
+
+  function hasStoredWindows(key) {
+    try {
+      return localStorage.getItem(key) != null
+    } catch {
+      return false
+    }
+  }
+
+  function loadWindows(storageKey) {
   try {
-    const raw = localStorage.getItem(WINDOWS_KEY)
+    const raw = localStorage.getItem(storageKey ?? WINDOWS_KEY)
     if (!raw) return DEFAULT_WINDOWS
     const parsed = JSON.parse(raw)
     if (!Array.isArray(parsed)) return DEFAULT_WINDOWS
@@ -85,22 +160,36 @@ function App() {
       .filter((w) => w && typeof w.id === "string")
       .map((w) => ({
         id: w.id,
-        title: typeof w.title === "string" && w.title.trim() ? w.title : "제목없음",
+        title: normalizeWindowTitleValue(w.title),
         color: typeof w.color === "string" ? w.color : "#2563eb",
         fixed: Boolean(w.fixed) || w.id === "all"
       }))
 
-    const hasAll = normalized.some((w) => w.id === "all")
-    if (!hasAll) normalized.unshift(DEFAULT_WINDOWS[0])
-    return normalized
+    const seen = new Set()
+    let hasAll = false
+    const deduped = []
+    for (const w of normalized) {
+      if (w.id === "all") {
+        if (hasAll) continue
+        hasAll = true
+        deduped.push({ ...w, title: "통합", fixed: true })
+        continue
+      }
+      if (!w.title) continue
+      if (seen.has(w.title)) continue
+      seen.add(w.title)
+      deduped.push({ ...w, fixed: Boolean(w.fixed) })
+    }
+    if (!hasAll) deduped.unshift(DEFAULT_WINDOWS[0])
+    return deduped
   } catch {
     return DEFAULT_WINDOWS
   }
   }
 
-  function saveWindows(ws) {
+  function saveWindows(ws, storageKey) {
   try {
-    localStorage.setItem(WINDOWS_KEY, JSON.stringify(ws))
+    localStorage.setItem(storageKey ?? WINDOWS_KEY, JSON.stringify(ws))
   } catch (err) { void err }
   }
 
@@ -124,6 +213,66 @@ function App() {
     "#e1c2ff", // 657 lavender
     "#ffd1e7" // 656 light pink
   ]
+
+  // ===== Supabase (웹-앱 데이터 연동) =====
+  const [session, setSession] = useState(null)
+  const [authMode, setAuthMode] = useState("signIn") // "signIn" | "signUp"
+  const [authEmail, setAuthEmail] = useState("")
+  const [authPassword, setAuthPassword] = useState("")
+  const [authLoading, setAuthLoading] = useState(false)
+  const [authMessage, setAuthMessage] = useState("")
+  const [loginModalOpen, setLoginModalOpen] = useState(false)
+  const [rememberCredentials, setRememberCredentials] = useState(false)
+
+  function persistCredentials(email, password) {
+    if (typeof window === "undefined") return
+    try {
+      localStorage.setItem(REMEMBER_CREDENTIALS_KEY, JSON.stringify({ email, password }))
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function clearPersistedCredentials() {
+    if (typeof window === "undefined") return
+    try {
+      localStorage.removeItem(REMEMBER_CREDENTIALS_KEY)
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function closeLoginModal() {
+    setLoginModalOpen(false)
+    setAuthMessage("")
+  }
+
+  useEffect(() => {
+    if (typeof window === "undefined") return
+    try {
+      const raw = localStorage.getItem(REMEMBER_CREDENTIALS_KEY)
+      if (!raw) return
+      const parsed = JSON.parse(raw)
+      const email = typeof parsed?.email === "string" ? parsed.email : ""
+      const password = typeof parsed?.password === "string" ? parsed.password : ""
+      if (email) setAuthEmail(email)
+      if (password) setAuthPassword(password)
+      if (email || password) setRememberCredentials(true)
+    } catch {
+      /* ignore */
+    }
+  }, [])
+  const [remotePlans, setRemotePlans] = useState([])
+  const [remoteLoaded, setRemoteLoaded] = useState(false)
+  const applyingRemoteRef = useRef(false)
+  const syncTimerRef = useRef(null)
+  const lastCloudSyncRef = useRef({ year: null, text: "" })
+  const forceRemoteApplyRef = useRef(false)
+  const lastSessionIdRef = useRef(null)
+  const [remoteWindows, setRemoteWindows] = useState([])
+  const [remoteWindowsLoaded, setRemoteWindowsLoaded] = useState(false)
+  const applyingRemoteWindowsRef = useRef(false)
+  const windowsSyncTimerRef = useRef(null)
 
   const [text, setText] = useState("")
   const [today, setToday] = useState(() => new Date())
@@ -156,6 +305,517 @@ function App() {
     }
   }, [])
 
+  function pickNextWindowColor(ws) {
+    const used = new Set(ws.map((w) => w.color))
+    const available = WINDOW_COLORS.find((c) => !used.has(c))
+    return available ?? WINDOW_COLORS[ws.length % WINDOW_COLORS.length]
+  }
+
+  function ensureWindowsForCategories(titles) {
+    if (!titles || titles.size === 0) return
+    setWindows((prev) => {
+      const existingTitles = new Set(prev.map((w) => normalizeWindowTitleValue(w.title)))
+      let changed = false
+      let next = [...prev]
+      for (const title of titles) {
+        const trimmed = normalizeCategoryId(String(title ?? "").trim())
+        if (!trimmed || trimmed === GENERAL_CATEGORY_ID || existingTitles.has(trimmed)) continue
+        const color = pickNextWindowColor(next)
+        next = [...next, { id: genWindowId(), title: trimmed, color, fixed: false }]
+        existingTitles.add(trimmed)
+        changed = true
+      }
+      return changed ? next : prev
+    })
+  }
+
+  function buildTextFromPlans(plans, year) {
+    const yearPrefix = `${year}-`
+    const byDate = new Map()
+    for (const row of plans ?? []) {
+      const dateKey = String(row?.date ?? "")
+      if (!dateKey.startsWith(yearPrefix)) continue
+      const content = String(row?.content ?? "").trim()
+      if (!content) continue
+      const category = normalizeCategoryId(String(row?.category_id ?? "").trim())
+      const isGeneral = isGeneralCategoryId(category)
+      const time = String(row?.time ?? "").trim()
+      const bucket = byDate.get(dateKey) ?? []
+      bucket.push({ time, category: isGeneral ? "" : category, content, isGeneral })
+      byDate.set(dateKey, bucket)
+    }
+
+    const sortedDates = [...byDate.keys()].sort((a, b) => keyToTime(a) - keyToTime(b))
+    const blocks = sortedDates.map((dateKey) => {
+      const { m, d } = keyToYMD(dateKey)
+      const header = buildHeaderLine(year, m, d)
+      const items = byDate.get(dateKey) ?? []
+      items.sort((a, b) => {
+        const ta = timeToMinutes(a.time)
+        const tb = timeToMinutes(b.time)
+        if (ta !== tb) return ta - tb
+        const ca = a.category.localeCompare(b.category, "ko")
+        if (ca !== 0) return ca
+        return a.content.localeCompare(b.content, "ko")
+      })
+      const lines = items.map((item) => {
+        if (item.isGeneral) return item.time ? `${item.time};${item.content}` : item.content
+        return item.time ? `${item.time};@${item.category};${item.content}` : `@${item.category};${item.content}`
+      })
+      return lines.length > 0 ? `${header}\n${lines.join("\n")}` : header
+    })
+    return blocks.join("\n\n").trimEnd()
+  }
+
+  function extractPlansFromText(sourceText, year) {
+    const out = []
+    const parsed = parseBlocksAndItems(sourceText ?? "", year)
+    for (const block of parsed.blocks) {
+      const body = (sourceText ?? "").slice(block.bodyStartPos, block.blockEndPos)
+      const parsedBlock = parseDashboardBlockContent(body)
+      for (const line of parsedBlock.general ?? []) {
+        const text = String(line ?? "").trim()
+        if (!text) continue
+        out.push({
+          date: block.dateKey,
+          time: null,
+          category_id: GENERAL_CATEGORY_ID,
+          content: text
+        })
+      }
+      for (const item of parsedBlock.timed ?? []) {
+        const text = String(item.text ?? "").trim()
+        if (!text) continue
+        out.push({
+          date: block.dateKey,
+          time: item.time ? String(item.time).trim() : null,
+          category_id: GENERAL_CATEGORY_ID,
+          content: text
+        })
+      }
+      for (const group of parsedBlock.groups ?? []) {
+        const title = normalizeCategoryId(String(group.title ?? "").trim())
+        if (!title) continue
+        for (const item of group.items ?? []) {
+          const text = String(item.text ?? "").trim()
+          if (!text) continue
+          out.push({
+            date: block.dateKey,
+            time: item.time ? String(item.time).trim() : null,
+            category_id: title,
+            content: text
+          })
+        }
+      }
+    }
+    return out
+  }
+
+  function buildPlanKey(row) {
+    const date = String(row?.date ?? "").trim()
+    const time = String(row?.time ?? "").trim()
+    let category = normalizeCategoryId(String(row?.category_id ?? row?.categoryId ?? "").trim())
+    if (!category) category = GENERAL_CATEGORY_ID
+    const content = String(row?.content ?? row?.text ?? "").trim()
+    return `${date}|${time}|${category}|${content}`
+  }
+
+  function isUuid(value) {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      String(value ?? "")
+    )
+  }
+
+  async function loadRemotePlans(userId) {
+    if (!supabase) return
+    const { data, error } = await supabase
+      .from("plans")
+      .select("*")
+      .eq("user_id", userId)
+      .is("deleted_at", null)
+    if (error) {
+      console.error("load plans", error)
+      return
+    }
+    const updates = []
+    const rows = (data ?? []).map((row) => {
+      let normalized = normalizeCategoryId(row?.category_id)
+      if (!normalized) normalized = GENERAL_CATEGORY_ID
+      if (normalized && normalized !== row?.category_id) {
+        updates.push({ id: row.id, category_id: normalized })
+      }
+      return { ...row, category_id: normalized }
+    })
+    if (updates.length > 0) {
+      await Promise.all(
+        updates.map((item) =>
+          supabase.from("plans").update({ category_id: item.category_id }).eq("id", item.id).eq("user_id", userId)
+        )
+      )
+    }
+    setRemotePlans(rows)
+    setRemoteLoaded(true)
+    const titles = new Set(rows.map((row) => String(row.category_id ?? "").trim()).filter(Boolean))
+    ensureWindowsForCategories(titles)
+  }
+
+  async function loadRemoteWindows(userId) {
+    if (!supabase) return
+    const { data, error } = await supabase
+      .from("windows")
+      .select("*")
+      .eq("user_id", userId)
+      .order("sort_order", { ascending: true })
+    if (error) {
+      console.error("load windows", error)
+      return
+    }
+
+    const rows = (data ?? []).filter((row) => row && row.title).map((row) => ({
+      id: row.id,
+      title: normalizeWindowTitleValue(row.title),
+      color: typeof row.color === "string" ? row.color : "#2563eb",
+      fixed: Boolean(row.is_fixed)
+    }))
+
+    const seen = new Set()
+    const normalized = []
+    for (const w of rows) {
+      if (!w.title) continue
+      if (seen.has(w.title)) continue
+      seen.add(w.title)
+      normalized.push(w)
+    }
+
+    applyingRemoteWindowsRef.current = true
+    setRemoteWindows(rows)
+    setRemoteWindowsLoaded(true)
+    setWindows([DEFAULT_WINDOWS[0], ...normalized])
+    setActiveWindowId("all")
+    setTimeout(() => {
+      applyingRemoteWindowsRef.current = false
+    }, 0)
+  }
+
+  async function syncWindowsToSupabase(nextWindows) {
+    if (!supabase || !session?.user?.id || !remoteWindowsLoaded) return
+    const userId = session.user.id
+    const desired = (nextWindows ?? [])
+      .filter((w) => w && w.id !== "all")
+      .map((w, idx) => ({
+        id: isUuid(w.id) ? w.id : null,
+        title: normalizeWindowTitleValue(w.title),
+        color: typeof w.color === "string" ? w.color : "#2563eb",
+        sort_order: idx,
+        is_fixed: Boolean(w.fixed)
+      }))
+      .filter((w) => w.title)
+
+    const remoteById = new Map((remoteWindows ?? []).map((row) => [row.id, row]))
+    const desiredIds = new Set(desired.map((w) => w.id).filter(Boolean))
+
+    const toInsert = desired
+      .filter((w) => !w.id || !remoteById.has(w.id))
+      .map((w) => ({
+        user_id: userId,
+        title: w.title,
+        color: w.color,
+        sort_order: w.sort_order,
+        is_fixed: w.is_fixed
+      }))
+
+    const toUpdate = desired
+      .filter((w) => w.id && remoteById.has(w.id))
+      .map((w) => ({
+        id: w.id,
+        user_id: userId,
+        title: w.title,
+        color: w.color,
+        sort_order: w.sort_order,
+        is_fixed: w.is_fixed
+      }))
+
+    const toDelete = (remoteWindows ?? []).filter((row) => !desiredIds.has(row.id))
+
+    let insertedRows = []
+    if (toInsert.length > 0) {
+      const { data: inserted, error: insertError } = await supabase
+        .from("windows")
+        .insert(toInsert)
+        .select()
+      if (insertError) {
+        console.error("insert windows", insertError)
+        return
+      }
+      insertedRows = inserted ?? []
+    }
+
+    if (toUpdate.length > 0) {
+      const { error: updateError } = await supabase.from("windows").upsert(toUpdate)
+      if (updateError) {
+        console.error("update windows", updateError)
+        return
+      }
+    }
+
+    if (toDelete.length > 0) {
+      const ids = toDelete.map((row) => row.id)
+      const { error: deleteError } = await supabase
+        .from("windows")
+        .delete()
+        .in("id", ids)
+        .eq("user_id", userId)
+      if (deleteError) {
+        console.error("delete windows", deleteError)
+        return
+      }
+    }
+
+    if (insertedRows.length > 0) {
+      applyingRemoteWindowsRef.current = true
+      setWindows((prev) => {
+        let next = [...prev]
+        for (const row of insertedRows) {
+          const title = normalizeWindowTitleValue(row.title)
+          const idx = next.findIndex((w) => w.id !== "all" && w.title === title && !isUuid(w.id))
+          if (idx >= 0) {
+            next[idx] = { ...next[idx], id: row.id }
+          }
+        }
+        return next
+      })
+      setTimeout(() => {
+        applyingRemoteWindowsRef.current = false
+      }, 0)
+    }
+
+    const mergedRemote = (() => {
+      const removed = new Set(toDelete.map((row) => row.id))
+      const base = (remoteWindows ?? []).filter((row) => !removed.has(row.id))
+      const updated = new Map(toUpdate.map((row) => [row.id, row]))
+      const next = base.map((row) => (updated.has(row.id) ? { ...row, ...updated.get(row.id) } : row))
+      for (const row of insertedRows) next.push(row)
+      return next
+    })()
+    setRemoteWindows(mergedRemote)
+  }
+
+  function scheduleWindowsSync(nextWindows) {
+    if (!supabase || !session?.user?.id || !remoteWindowsLoaded) return
+    if (applyingRemoteWindowsRef.current) return
+    if (windowsSyncTimerRef.current) clearTimeout(windowsSyncTimerRef.current)
+    windowsSyncTimerRef.current = setTimeout(() => {
+      syncWindowsToSupabase(nextWindows)
+    }, 500)
+  }
+
+  async function syncYearToSupabase(sourceText, year) {
+    if (!supabase || !session?.user?.id) return
+    const userId = session.user.id
+    const desired = extractPlansFromText(sourceText ?? "", year)
+    const desiredMap = new Map()
+    for (const row of desired) {
+      const key = buildPlanKey(row)
+      if (!key || desiredMap.has(key)) continue
+      desiredMap.set(key, row)
+    }
+
+    const yearPrefix = `${year}-`
+    const current = (remotePlans ?? []).filter(
+      (row) =>
+        row &&
+        row.user_id === userId &&
+        !row.deleted_at &&
+        String(row?.date ?? "").startsWith(yearPrefix)
+    )
+    const currentMap = new Map()
+    for (const row of current) {
+      const key = buildPlanKey(row)
+      if (!key || currentMap.has(key)) continue
+      currentMap.set(key, row)
+    }
+
+    const toInsert = []
+    for (const [key, row] of desiredMap.entries()) {
+      if (currentMap.has(key)) continue
+      toInsert.push({
+        ...row,
+        user_id: userId,
+        client_id: clientIdRef.current,
+        updated_at: new Date().toISOString()
+      })
+    }
+
+    const toDelete = []
+    for (const [key, row] of currentMap.entries()) {
+      if (desiredMap.has(key)) continue
+      if (row?.id) toDelete.push(row)
+    }
+
+    if (toDelete.length > 0) {
+      const ids = toDelete.map((row) => row.id)
+      ids.forEach((id) => pendingDeleteIdsRef.current.add(id))
+      const { error: deleteError } = await supabase.from("plans").delete().in("id", ids).eq("user_id", userId)
+      if (deleteError) {
+        console.error("delete plans", deleteError)
+        ids.forEach((id) => pendingDeleteIdsRef.current.delete(id))
+        return
+      }
+    }
+
+    let insertedRows = []
+    if (toInsert.length > 0) {
+      const { data, error: insertError } = await supabase.from("plans").insert(toInsert).select()
+      if (insertError) {
+        console.error("insert plans", insertError)
+        return
+      }
+      insertedRows = (data ?? []).map((row) => ({
+        ...row,
+        category_id: normalizeCategoryId(row?.category_id)
+      }))
+    }
+
+    lastCloudSyncRef.current = { year, text: sourceText ?? "" }
+    setRemotePlans((prev) => {
+      const removedIds = new Set(toDelete.map((row) => row.id))
+      const base = (prev ?? []).filter((row) => !removedIds.has(row?.id))
+      return insertedRows.length > 0 ? [...base, ...insertedRows] : base
+    })
+  }
+
+  function scheduleCloudSync(sourceText, year) {
+    if (!supabase || !session?.user?.id || !remoteLoaded) return
+    if (applyingRemoteRef.current) return
+    const last = lastCloudSyncRef.current
+    if (last.year === year && last.text === sourceText) return
+    if (syncTimerRef.current) clearTimeout(syncTimerRef.current)
+    syncTimerRef.current = setTimeout(() => {
+      syncYearToSupabase(sourceText, year)
+    }, 800)
+  }
+
+  async function migrateGroupTitleInSupabase(oldTitle, newTitle) {
+    if (!supabase || !session?.user?.id) return
+    const userId = session.user.id
+    const { error } = await supabase
+      .from("plans")
+      .update({ category_id: newTitle, updated_at: new Date().toISOString(), client_id: clientIdRef.current })
+      .eq("user_id", userId)
+      .eq("category_id", oldTitle)
+    if (error) {
+      console.error("rename category", error)
+      return
+    }
+    setRemotePlans((prev) =>
+      (prev ?? []).map((row) =>
+        row.category_id === oldTitle ? { ...row, category_id: newTitle } : row
+      )
+    )
+  }
+
+  async function removeCategoryInSupabase(title) {
+    if (!supabase || !session?.user?.id) return
+    const userId = session.user.id
+    const ids = (remotePlans ?? [])
+      .filter((row) => row?.category_id === title && row?.user_id === userId)
+      .map((row) => row.id)
+      .filter(Boolean)
+    ids.forEach((id) => pendingDeleteIdsRef.current.add(id))
+    const { error } = await supabase.from("plans").delete().eq("user_id", userId).eq("category_id", title)
+    if (error) {
+      console.error("remove category", error)
+      ids.forEach((id) => pendingDeleteIdsRef.current.delete(id))
+      return
+    }
+    setRemotePlans((prev) => (prev ?? []).filter((row) => row.category_id !== title))
+  }
+
+  useEffect(() => {
+    if (!isSupabaseConfigured || !supabase) return
+    let mounted = true
+    supabase.auth.getSession().then(({ data }) => {
+      if (!mounted) return
+      setSession(data.session)
+      if (data.session?.user?.id) loadRemotePlans(data.session.user.id)
+    })
+    const {
+      data: { subscription }
+    } = supabase.auth.onAuthStateChange((_, nextSession) => {
+      setSession(nextSession)
+      if (nextSession?.user?.id) {
+        loadRemotePlans(nextSession.user.id)
+      } else {
+        setRemotePlans([])
+        setRemoteLoaded(false)
+      }
+    })
+    return () => {
+      mounted = false
+      subscription.unsubscribe()
+    }
+  }, [])
+
+  useEffect(() => {
+    if (session) setLoginModalOpen(false)
+  }, [session])
+
+  useEffect(() => {
+    const nextId = session?.user?.id ?? null
+    if (nextId && nextId !== lastSessionIdRef.current) {
+      forceRemoteApplyRef.current = true
+    }
+    lastSessionIdRef.current = nextId
+  }, [session?.user?.id])
+
+  useEffect(() => {
+    if (!supabase || !session?.user?.id) return
+    const channel = supabase
+      .channel(`plans-changes-${session.user.id}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "plans", filter: `user_id=eq.${session.user.id}` },
+        (payload) => {
+          const { eventType } = payload
+          if (eventType === "DELETE") {
+            const id = payload.old?.id
+            if (!id) return
+            if (pendingDeleteIdsRef.current.has(id)) {
+              pendingDeleteIdsRef.current.delete(id)
+              return
+            }
+            setRemotePlans((prev) => (prev ?? []).filter((row) => row?.id !== id))
+            return
+          }
+
+          const incoming = payload.new
+          if (!incoming) return
+          if (incoming.client_id && incoming.client_id === clientIdRef.current) return
+
+          const normalized = {
+            ...incoming,
+            category_id: normalizeCategoryId(incoming?.category_id)
+          }
+          setRemotePlans((prev) => {
+            const list = prev ?? []
+            const idx = list.findIndex((row) => row?.id === normalized.id)
+            if (idx >= 0) {
+              const next = [...list]
+              next[idx] = { ...list[idx], ...normalized }
+              return next
+            }
+            return [...list, normalized]
+          })
+          setRemoteLoaded(true)
+        }
+      )
+      .subscribe()
+
+    return () => {
+      supabase.removeChannel(channel)
+    }
+  }, [session?.user?.id])
+
   // ===== 연도(메모 기준) =====
   const [baseYear, setBaseYear] = useState(today.getFullYear())
   const baseYearRef = useRef(baseYear)
@@ -167,6 +827,12 @@ function App() {
   useEffect(() => {
     textRef.current = text
   }, [text])
+
+  useEffect(() => {
+    if (!session?.user?.id || !remoteLoaded) return
+    const titles = new Set(remotePlans.map((row) => String(row?.category_id ?? "").trim()).filter(Boolean))
+    ensureWindowsForCategories(titles)
+  }, [remotePlans, session?.user?.id, remoteLoaded])
 
 
   // ===== 달력 뷰 =====
@@ -282,13 +948,70 @@ function App() {
   const tabMentionRef = useRef(null)
   const tabMentionMouseDownRef = useRef(false)
   // ? 창 목록/활성 탭
-  const [windows, setWindows] = useState(() => loadWindows())
+  const windowsKeyRef = useRef(getWindowsStorageKey(null))
+  const [windows, setWindows] = useState(() => loadWindows(windowsKeyRef.current))
   const [activeWindowId, setActiveWindowId] = useState("all")
+
+  useEffect(() => {
+    const userId = session?.user?.id ?? null
+    const nextKey = getWindowsStorageKey(userId)
+    if (windowsKeyRef.current === nextKey) return
+    windowsKeyRef.current = nextKey
+    if (!userId) {
+      const stored = hasStoredWindows(nextKey)
+      let next = loadWindows(nextKey)
+      if (!stored) {
+        next = DEFAULT_WINDOWS
+      }
+      setWindows(next)
+      setActiveWindowId("all")
+      setRemoteWindows([])
+      setRemoteWindowsLoaded(false)
+      return
+    }
+    loadRemoteWindows(userId)
+  }, [session?.user?.id])
+
+  useEffect(() => {
+    if (!session?.user?.id || !remoteLoaded) return
+    const forceApply = forceRemoteApplyRef.current
+    if (!forceApply && isEditingLeftMemo) return
+    const last = lastCloudSyncRef.current
+    if (!forceApply && last.year === baseYear && last.text !== textRef.current) return
+    const nextText = buildTextFromPlans(remotePlans, baseYear)
+    if (nextText === textRef.current) {
+      if (forceApply) {
+        lastCloudSyncRef.current = { year: baseYear, text: nextText }
+        forceRemoteApplyRef.current = false
+      }
+      return
+    }
+    applyingRemoteRef.current = true
+    updateEditorText(nextText)
+    setWindowMemoTextSync(baseYear, "all", nextText)
+    setDashboardSourceTick((x) => x + 1)
+    lastCloudSyncRef.current = { year: baseYear, text: nextText }
+    forceRemoteApplyRef.current = false
+    setTimeout(() => {
+      applyingRemoteRef.current = false
+    }, 0)
+  }, [remotePlans, baseYear, session?.user?.id, remoteLoaded, isEditingLeftMemo])
   const [editingWindowId, setEditingWindowId] = useState(null)
   const [deleteConfirm, setDeleteConfirm] = useState(null)
   const titleInputRef = useRef(null)
   const draggingWindowIdRef = useRef(null)
+  useEffect(() => {
+    if (!session?.user?.id || !remoteLoaded) return
+    const sourceText =
+      activeWindowId === "all" ? text : getWindowMemoTextSync(baseYear, "all") ?? ""
+    scheduleCloudSync(sourceText, baseYear)
+  }, [text, tabEditText, dashboardSourceTick, baseYear, session?.user?.id, remoteLoaded, activeWindowId])
   const FILTER_KEY = "planner-integrated-filters-v1"
+  const FILTER_KEY_PREFIX = "planner-integrated-filters-user-v1"
+  const filterKeyRef = useRef(FILTER_KEY)
+  function getFilterStorageKey(userId) {
+    return userId ? `${FILTER_KEY_PREFIX}-${userId}` : FILTER_KEY
+  }
   const [integratedFilters, setIntegratedFilters] = useState({})
   const [filterOpen, setFilterOpen] = useState(false)
   const filterBtnRef = useRef(null)
@@ -308,8 +1031,24 @@ function App() {
 
   
   useEffect(() => {
+    const userId = session?.user?.id ?? null
+    const nextKey = getFilterStorageKey(userId)
+    if (filterKeyRef.current === nextKey) return
+    filterKeyRef.current = nextKey
     try {
-      const raw = localStorage.getItem(FILTER_KEY)
+      const raw = localStorage.getItem(nextKey)
+      if (raw) {
+        const parsed = JSON.parse(raw)
+        if (parsed && typeof parsed === "object") setIntegratedFilters(parsed)
+      } else {
+        setIntegratedFilters({})
+      }
+    } catch (err) { void err }
+  }, [session?.user?.id])
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(filterKeyRef.current)
       if (raw) {
         const parsed = JSON.parse(raw)
         if (parsed && typeof parsed === "object") setIntegratedFilters(parsed)
@@ -319,7 +1058,7 @@ function App() {
 
   useEffect(() => {
     try {
-      localStorage.setItem(FILTER_KEY, JSON.stringify(integratedFilters))
+      localStorage.setItem(filterKeyRef.current, JSON.stringify(integratedFilters))
     } catch (err) { void err }
   }, [integratedFilters])
 
@@ -343,8 +1082,9 @@ function App() {
     const el = tabsScrollRef.current
     if (!el) return
     const max = Math.max(0, el.scrollWidth - el.clientWidth)
-    const left = el.scrollLeft > 2
-    const right = el.scrollLeft < max - 2
+    const canScroll = max > 8
+    const left = canScroll && el.scrollLeft > 2
+    const right = canScroll && el.scrollLeft < max - 2
     setTabScrollState((prev) => (prev.left === left && prev.right === right ? prev : { left, right }))
   }, [])
 
@@ -437,13 +1177,18 @@ function App() {
  
   
   useEffect(() => {
-    saveWindows(windows)
+    saveWindows(windows, windowsKeyRef.current)
   }, [windows])
+
+  useEffect(() => {
+    if (!session?.user?.id || !remoteWindowsLoaded) return
+    scheduleWindowsSync(windows)
+  }, [windows, session?.user?.id, remoteWindowsLoaded])
 
   function commitWindowTitleChange(windowId, rawTitle) {
     const target = windows.find((w) => w.id === windowId)
     if (!target) return
-    const normalized = normalizeWindowTitle(rawTitle)
+    const normalized = normalizeCategoryId(normalizeWindowTitle(rawTitle))
     const nextTitle = makeUniqueWindowTitle(normalized, windows, windowId)
     if (nextTitle === target.title) {
       setEditingWindowId(null)
@@ -451,6 +1196,7 @@ function App() {
     }
     setWindows((prev) => prev.map((w) => (w.id === windowId ? { ...w, title: nextTitle } : w)))
     migrateGroupTitleAcrossAllYears(target.title, nextTitle)
+    migrateGroupTitleInSupabase(target.title, nextTitle)
     setEditingWindowId(null)
   }
 
@@ -475,6 +1221,7 @@ function App() {
   function removeWindow(id) {
     const idx = windows.findIndex((w) => w.id === id)
     if (idx < 0) return
+    const removed = windows[idx]
     const allowedTitles = new Set(windows.filter((w) => w.id !== "all" && w.id !== id).map((w) => w.title))
 
     setWindows((prev) => prev.filter((w) => w.id !== id))
@@ -485,6 +1232,7 @@ function App() {
     }
 
     removeWindowDataFromAllYears(id, allowedTitles)
+    if (removed?.title) removeCategoryInSupabase(removed.title)
   }
 
   function reorderWindows(dragId, overId) {
@@ -650,14 +1398,22 @@ function App() {
   const viewMonth = view.month
 
   // ===== 저장(연도별) =====
-  const memoKey = useMemo(() => `planner-text-${baseYear}-${activeWindowId}`, [baseYear, activeWindowId])
+  const memoKeyPrefix = useMemo(
+    () => getMemoStoragePrefix(session?.user?.id ?? null),
+    [session?.user?.id]
+  )
+  const isOfflineMemo = !session?.user?.id
+  const memoKey = useMemo(
+    () => getMemoKey(memoKeyPrefix, baseYear, activeWindowId),
+    [memoKeyPrefix, baseYear, activeWindowId]
+  )
   const legacyLeftKey = useMemo(() => `planner-left-text-${baseYear}`, [baseYear])
   const suppressSaveRef = useRef(false)
 
   // ? 오른쪽 메모(연도별)
   const rightMemoKey = useMemo(
-    () => `planner-right-text-${baseYear}-${activeWindowId}`,
-    [baseYear, activeWindowId]
+    () => getRightMemoKey(memoKeyPrefix, baseYear, activeWindowId),
+    [memoKeyPrefix, baseYear, activeWindowId]
   )
   const suppressRightSaveRef = useRef(false)
   const editableWindows = useMemo(() => windows.filter((w) => w.id !== "all"), [windows])
@@ -668,7 +1424,7 @@ function App() {
 
   function getLeftMemoTextSync(year) {
     try {
-      const key = `planner-left-text-${year}`
+      const key = getLeftMemoKey(memoKeyPrefix, year)
       return localStorage.getItem(key) ?? ""
     } catch {
       return ""
@@ -677,14 +1433,14 @@ function App() {
 
   function setLeftMemoTextSync(year, value) {
     try {
-      const key = `planner-left-text-${year}`
+      const key = getLeftMemoKey(memoKeyPrefix, year)
       localStorage.setItem(key, value)
     } catch (err) { void err }
   }
 
   function getWindowMemoTextSync(year, windowId) {
     try {
-      const key = `planner-text-${year}-${windowId}`
+      const key = getMemoKey(memoKeyPrefix, year, windowId)
       return localStorage.getItem(key) ?? ""
     } catch {
       return ""
@@ -693,14 +1449,14 @@ function App() {
 
   function setWindowMemoTextSync(year, windowId, value) {
     try {
-      const key = `planner-text-${year}-${windowId}`
+      const key = getMemoKey(memoKeyPrefix, year, windowId)
       localStorage.setItem(key, value ?? "")
     } catch (err) { void err }
   }
 
   function getRightWindowTextSync(year, windowId) {
     try {
-      const key = `planner-right-text-${year}-${windowId}`
+      const key = getRightMemoKey(memoKeyPrefix, year, windowId)
       return localStorage.getItem(key) ?? ""
     } catch {
       return ""
@@ -709,7 +1465,7 @@ function App() {
 
   function setRightWindowTextSync(year, windowId, value) {
     try {
-      const key = `planner-right-text-${year}-${windowId}`
+      const key = getRightMemoKey(memoKeyPrefix, year, windowId)
       localStorage.setItem(key, value)
     } catch (err) { void err }
   }
@@ -741,6 +1497,32 @@ function App() {
       windowTexts[w.id] = (windowLinesById.get(w.id) ?? []).join("\n").trimEnd()
     }
     return buildCombinedRightText(normalizedCommon, editableWindows, integratedFilters, windowTexts)
+  }
+
+  async function handleAuthSubmit() {
+    if (!supabase) return
+    if (!authEmail || !authPassword) {
+      setAuthMessage("이메일과 비밀번호를 모두 입력하세요.")
+      return
+    }
+    setAuthLoading(true)
+    setAuthMessage("")
+    let error = null
+    if (authMode === "signIn") {
+      const result = await supabase.auth.signInWithPassword({ email: authEmail, password: authPassword })
+      error = result.error
+    } else {
+      const result = await supabase.auth.signUp({ email: authEmail, password: authPassword })
+      error = result.error
+    }
+    if (error) setAuthMessage(error.message)
+    else setAuthMessage(authMode === "signIn" ? "로그인 완료." : "가입 완료. 로그인해 주세요.")
+    setAuthLoading(false)
+  }
+
+  async function handleSignOut() {
+    if (!supabase) return
+    await supabase.auth.signOut()
   }
 
   function updateEditorText(nextText) {
@@ -946,19 +1728,64 @@ function stripEmptyGroupLines(bodyText) {
   return nextLines.join("\n").trimEnd()
 }
 
-  function collectStoredYears() {
+  function collectStoredYears(prefix = memoKeyPrefix) {
     const years = new Set()
+    const safePrefix = escapeRegExp(prefix)
+    const textRe = new RegExp(`^${safePrefix}-text-(\\d{4})-`)
+    const leftRe = new RegExp(`^${safePrefix}-left-text-(\\d{4})$`)
+    const rightRe = new RegExp(`^${safePrefix}-right-text-(\\d{4})-`)
     try {
       for (let i = 0; i < localStorage.length; i++) {
         const key = localStorage.key(i)
         if (!key) continue
-        let match = key.match(/^planner-text-(\d{4})-/)
-        if (!match) match = key.match(/^planner-left-text-(\d{4})$/)
-        if (!match) match = key.match(/^planner-right-text-(\d{4})-/)
+        let match = key.match(textRe)
+        if (!match) match = key.match(leftRe)
+        if (!match) match = key.match(rightRe)
         if (match) years.add(Number(match[1]))
       }
     } catch (err) { void err }
     return years
+  }
+
+  function migrateOfflineLegacyMemoKeys() {
+    if (!isOfflineMemo) return
+    try {
+      if (localStorage.getItem(OFFLINE_MEMO_MIGRATION_KEY)) return
+    } catch {
+      return
+    }
+
+    const prefix = OFFLINE_MEMO_PREFIX
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i)
+        if (!key) continue
+        let match = key.match(/^planner-text-(\d{4})-(.+)$/)
+        if (match) {
+          const nextKey = getMemoKey(prefix, match[1], match[2])
+          if (localStorage.getItem(nextKey) == null) {
+            localStorage.setItem(nextKey, localStorage.getItem(key) ?? "")
+          }
+          continue
+        }
+        match = key.match(/^planner-right-text-(\d{4})-(.+)$/)
+        if (match) {
+          const nextKey = getRightMemoKey(prefix, match[1], match[2])
+          if (localStorage.getItem(nextKey) == null) {
+            localStorage.setItem(nextKey, localStorage.getItem(key) ?? "")
+          }
+          continue
+        }
+        match = key.match(/^planner-left-text-(\d{4})$/)
+        if (match) {
+          const nextKey = getLeftMemoKey(prefix, match[1])
+          if (localStorage.getItem(nextKey) == null) {
+            localStorage.setItem(nextKey, localStorage.getItem(key) ?? "")
+          }
+        }
+      }
+      localStorage.setItem(OFFLINE_MEMO_MIGRATION_KEY, "1")
+    } catch (err) { void err }
   }
 
   function migrateGroupTitleAcrossAllYears(oldTitle, newTitle) {
@@ -968,7 +1795,7 @@ function stripEmptyGroupLines(bodyText) {
     const years = collectStoredYears()
 
     for (const year of years) {
-      const allKey = `planner-text-${year}-all`
+      const allKey = getMemoKey(memoKeyPrefix, year, "all")
       const isActiveAllYear = activeWindowId === "all" && baseYearRef.current === year
       const storedAll = (() => {
         try {
@@ -990,29 +1817,33 @@ function stripEmptyGroupLines(bodyText) {
         }
       }
 
-      const legacyLeftKey = `planner-left-text-${year}`
+      if (isOfflineMemo) {
+        const legacyLeftKey = `planner-left-text-${year}`
+        try {
+          const legacyLeft = localStorage.getItem(legacyLeftKey)
+          if (legacyLeft != null) {
+            const nextLeft = replaceGroupTitleInText(legacyLeft, oldTitle, newTitle)
+            if (nextLeft !== legacyLeft) {
+              localStorage.setItem(legacyLeftKey, nextLeft)
+              changed = true
+            }
+          }
+        } catch (err) { void err }
+      }
+    }
+
+    if (isOfflineMemo) {
       try {
-        const legacyLeft = localStorage.getItem(legacyLeftKey)
-        if (legacyLeft != null) {
-          const nextLeft = replaceGroupTitleInText(legacyLeft, oldTitle, newTitle)
-          if (nextLeft !== legacyLeft) {
-            localStorage.setItem(legacyLeftKey, nextLeft)
+        const legacy = localStorage.getItem(LEGACY_KEY)
+        if (legacy != null) {
+          const nextLegacy = replaceGroupTitleInText(legacy, oldTitle, newTitle)
+          if (nextLegacy !== legacy) {
+            localStorage.setItem(LEGACY_KEY, nextLegacy)
             changed = true
           }
         }
       } catch (err) { void err }
     }
-
-    try {
-      const legacy = localStorage.getItem(LEGACY_KEY)
-      if (legacy != null) {
-        const nextLegacy = replaceGroupTitleInText(legacy, oldTitle, newTitle)
-        if (nextLegacy !== legacy) {
-          localStorage.setItem(LEGACY_KEY, nextLegacy)
-          changed = true
-        }
-      }
-    } catch (err) { void err }
 
     if (changed) setDashboardSourceTick((x) => x + 1)
   }
@@ -1059,12 +1890,51 @@ function stripEmptyGroupLines(bodyText) {
     const years = collectStoredYears()
     for (const year of years) {
       try {
-        localStorage.removeItem(`planner-text-${year}-${windowId}`)
-        localStorage.removeItem(`planner-right-text-${year}-${windowId}`)
+        localStorage.removeItem(getMemoKey(memoKeyPrefix, year, windowId))
+        localStorage.removeItem(getRightMemoKey(memoKeyPrefix, year, windowId))
       } catch (err) { void err }
     }
     pruneUnknownGroupsFromAllYears(allowedTitles)
   }
+
+  useEffect(() => {
+    if (!windows || windows.length === 0) return
+    let changed = false
+    let next = windows.map((w) => ({ ...w }))
+    const idsToRemove = new Set()
+    const titleToId = new Map(next.map((w) => [String(w.title ?? "").trim(), w.id]))
+
+    for (const w of next) {
+      if (w.id === "all") continue
+      const oldTitle = String(w.title ?? "").trim()
+      const mapped = CATEGORY_ID_MAP[oldTitle]
+      if (!mapped || mapped === oldTitle) continue
+
+      migrateGroupTitleAcrossAllYears(oldTitle, mapped)
+      migrateGroupTitleInSupabase(oldTitle, mapped)
+
+      if (titleToId.has(mapped)) {
+        idsToRemove.add(w.id)
+        changed = true
+        continue
+      }
+
+      titleToId.delete(oldTitle)
+      titleToId.set(mapped, w.id)
+      w.title = mapped
+      changed = true
+    }
+
+    if (!changed) return
+    if (idsToRemove.size > 0) {
+      next = next.filter((w) => !idsToRemove.has(w.id))
+      const allowedTitles = new Set(next.filter((w) => w.id !== "all").map((w) => w.title))
+      for (const id of idsToRemove) {
+        removeWindowDataFromAllYears(id, allowedTitles)
+      }
+    }
+    setWindows(next)
+  }, [windows, session?.user?.id])
 
   function applyTabEditToAllFromText(nextTabText) {
     if (activeWindowId === "all") return
@@ -1092,6 +1962,7 @@ function stripEmptyGroupLines(bodyText) {
     setWindowMemoTextSync(baseYear, "all", nextAll)
     if (activeWindowId === "all") updateEditorText(nextAll)
     setDashboardSourceTick((x) => x + 1)
+    scheduleCloudSync(nextAll, baseYear)
   }
 
   function applyTabEditToAll() {
@@ -1120,7 +1991,12 @@ function stripEmptyGroupLines(bodyText) {
     setWindowMemoTextSync(baseYear, "all", nextAll)
     if (activeWindowId === "all") updateEditorText(nextAll)
     setDashboardSourceTick((x) => x + 1)
+    scheduleCloudSync(nextAll, baseYear)
   }
+
+  useEffect(() => {
+    if (isOfflineMemo) migrateOfflineLegacyMemoKeys()
+  }, [isOfflineMemo])
 
   useEffect(() => {
     suppressSaveRef.current = true
@@ -1130,7 +2006,7 @@ function stripEmptyGroupLines(bodyText) {
       return
     }
 
-    if (activeWindowId === "all") {
+    if (isOfflineMemo && activeWindowId === "all") {
       const legacyLeft = localStorage.getItem(legacyLeftKey)
       if (legacyLeft != null) {
         localStorage.setItem(memoKey, legacyLeft)
@@ -1147,7 +2023,7 @@ function stripEmptyGroupLines(bodyText) {
     }
 
     setText("")
-  }, [memoKey, legacyLeftKey])
+  }, [memoKey, legacyLeftKey, isOfflineMemo])
 
   // ? 오른쪽 메모(연도별) 로드
 useEffect(() => {
@@ -2037,6 +2913,7 @@ useEffect(() => {
     if (normalized !== current) {
       updateEditorText(normalized)
     }
+    scheduleCloudSync(normalized, baseYear)
     if (!calendarInteractingRef.current) {
       setSelectedDateKey(null)
       lastActiveDateKeyRef.current = null
@@ -2418,6 +3295,17 @@ useEffect(() => {
     transition: "opacity 140ms ease, background 140ms ease, border-color 140ms ease, color 140ms ease"
   }
 
+  const authInputStyle = {
+    height: 42,
+    padding: "0 12px",
+    borderRadius: 12,
+    border: `1px solid ${ui.border}`,
+    background: ui.surface2,
+    color: ui.text,
+    fontFamily: "inherit",
+    fontWeight: 600
+  }
+
   // navArrowButton removed (reverted to original iconButton usage)
 
   const memoTopRightButton = {
@@ -2482,8 +3370,8 @@ useEffect(() => {
   const memoOverlay = {
     position: "absolute",
     inset: 0,
-    padding: "12px 12px",
-    paddingBottom: "80vh",
+    padding: "8px 12px",
+    paddingBottom: "50vh",
     boxSizing: "border-box",
     pointerEvents: "none",
     whiteSpace: "pre-wrap",
@@ -2526,7 +3414,7 @@ useEffect(() => {
     resize: "none",
     border: "none",
     borderRadius: 0,
-    padding: "12px 12px",
+    padding: "8px 12px",
     boxSizing: "border-box",
     background: "transparent",
     color: "transparent",
@@ -2539,7 +3427,7 @@ useEffect(() => {
     whiteSpace: "pre-wrap",
     overflowWrap: "break-word",
     wordBreak: "break-word",
-    paddingBottom: "80vh",
+    paddingBottom: "50vh",
     position: "relative",
     zIndex: 1
   }
@@ -2724,9 +3612,9 @@ useEffect(() => {
         <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
           {activeWindowId === "all" && (
             <div style={{ position: "relative" }}>
-            <button
-              ref={filterBtnRef}
-              onClick={() => setFilterOpen((v) => !v)}
+              <button
+                ref={filterBtnRef}
+                onClick={() => setFilterOpen((v) => !v)}
               style={{
                 ...memoTopRightButton,
                 padding: 0,
@@ -2752,9 +3640,9 @@ useEffect(() => {
               )}
             </div>
           )}
-            <button
-              ref={settingsBtnRef}
-              onClick={() => setSettingsOpen((v) => !v)}
+          <button
+            ref={settingsBtnRef}
+            onClick={() => setSettingsOpen((v) => !v)}
             title="설정"
             aria-label="설정"
             style={{
@@ -2778,7 +3666,32 @@ useEffect(() => {
                 clipRule="evenodd"
               />
             </svg>
+          </button>
+          {session ? (
+            <button
+              onClick={handleSignOut}
+              title="로그아웃"
+              aria-label="로그아웃"
+              style={{ ...memoTopRightButton, fontSize: 12, fontWeight: 900, minWidth: 74 }}
+            >
+              로그아웃
+            </button>
+          ) : (
+            <>
+              <button
+                onClick={() => {
+                  setAuthMessage("")
+                  setLoginModalOpen(true)
+                }}
+                title="로그인"
+                aria-label="로그인"
+                style={{ ...memoTopRightButton, fontSize: 12, fontWeight: 900, minWidth: 74 }}
+              >
+                로그인
               </button>
+              <span style={{ fontSize: 11, color: ui.text2 }}>오프라인 모드</span>
+            </>
+          )}
           {layoutPreset === "memo-left" && (
             <button
               onClick={() => setLayoutPreset((p) => (p === "memo-left" ? "calendar-left" : "memo-left"))}
@@ -2969,7 +3882,7 @@ useEffect(() => {
                     borderRadius: 12,
                     background: ui.surface,
                     padding: "12px 12px",
-                    paddingBottom: 400,
+                    paddingBottom: "max(400px, 70vh)",
                     overflow: "auto",
                     fontSize: memoFontPx,
                     lineHeight: 1.25
@@ -3121,6 +4034,41 @@ useEffect(() => {
       calendarInteractingRef={calendarInteractingRef}
     />
   )
+
+  if (!isSupabaseConfigured) {
+    return (
+      <div
+        style={{
+          minHeight: "100vh",
+          background: ui.bg,
+          color: ui.text,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          padding: 24,
+          fontFamily: panelFontFamily
+        }}
+      >
+        <div
+          style={{
+            maxWidth: 520,
+            width: "100%",
+            borderRadius: 16,
+            background: ui.surface,
+            border: `1px solid ${ui.border}`,
+            padding: "18px 20px",
+            boxShadow: ui.shadow
+          }}
+        >
+          <div style={{ fontWeight: 900, fontSize: 18, marginBottom: 8 }}>Supabase 연결 필요</div>
+          <div style={{ color: ui.text2, lineHeight: 1.5 }}>
+            Vite 환경변수에 Supabase URL/Key가 설정되어 있지 않습니다. 루트에 `.env` 파일을 만들고
+            `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`를 넣어주세요.
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   const dividerLeft =
     outerCollapsed === "left"
@@ -3361,6 +4309,128 @@ useEffect(() => {
         }}
       />
 
+      {!session && loginModalOpen && (
+        <div className="login-modal-overlay" onClick={closeLoginModal}>
+          <div
+            className="login-modal-panel"
+            role="dialog"
+            aria-modal="true"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between"
+              }}
+            >
+              <div style={{ fontWeight: 900, fontSize: 18 }}>planner 로그인</div>
+              <button
+                type="button"
+                className="no-hover-outline login-modal-panel__close"
+                onClick={closeLoginModal}
+                aria-label="로그인 창 닫기"
+              >
+                ×
+              </button>
+            </div>
+            <input
+              value={authEmail}
+              onChange={(e) => {
+                const next = e.target.value
+                setAuthEmail(next)
+                if (rememberCredentials) persistCredentials(next, authPassword)
+              }}
+              placeholder="이메일"
+              style={authInputStyle}
+              autoComplete="username"
+            />
+            <input
+              type="password"
+              value={authPassword}
+              onChange={(e) => {
+                const next = e.target.value
+                setAuthPassword(next)
+                if (rememberCredentials) persistCredentials(authEmail, next)
+              }}
+              placeholder="비밀번호"
+              style={authInputStyle}
+              autoComplete="current-password"
+            />
+            <label
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 6,
+                fontSize: 13,
+                color: ui.text2,
+                cursor: "pointer"
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={rememberCredentials}
+                onChange={(e) => {
+                  const next = e.target.checked
+                  setRememberCredentials(next)
+                  if (next) persistCredentials(authEmail, authPassword)
+                  else clearPersistedCredentials()
+                }}
+                style={{ width: 14, height: 14 }}
+              />
+              <span>아이디/비번 기억</span>
+            </label>
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <button
+                type="button"
+                onClick={() => setAuthMode("signUp")}
+                style={{
+                  border: "none",
+                  background: "transparent",
+                  color: authMode === "signUp" ? ui.text : ui.text2,
+                  fontWeight: 800,
+                  cursor: "pointer"
+                }}
+              >
+                가입
+              </button>
+              <button
+                type="button"
+                onClick={() => setAuthMode("signIn")}
+                style={{
+                  border: "none",
+                  background: "transparent",
+                  color: authMode === "signIn" ? ui.text : ui.text2,
+                  fontWeight: 800,
+                  cursor: "pointer"
+                }}
+              >
+                로그인
+              </button>
+            </div>
+            <button
+              type="button"
+              onClick={handleAuthSubmit}
+              disabled={authLoading}
+              style={{
+                height: 42,
+                borderRadius: 12,
+                border: "none",
+                background: ui.accent,
+                color: "#0b0f16",
+                fontWeight: 900,
+                cursor: "pointer"
+              }}
+            >
+              {authLoading ? "..." : authMode === "signIn" ? "로그인" : "가입"}
+            </button>
+            {authMessage ? (
+              <div style={{ color: ui.text2, fontSize: 13 }}>{authMessage}</div>
+            ) : null}
+          </div>
+        </div>
+      )}
+
       <style>{`
         * { box-sizing: border-box; }
         textarea:focus, input:focus, select:focus {
@@ -3514,6 +4584,41 @@ useEffect(() => {
         .outer-divider:hover .outer-divider__buttons {
           opacity: 1;
           pointer-events: auto;
+        }
+        .login-modal-overlay {
+          position: fixed;
+          inset: 0;
+          background: rgba(15, 23, 42, 0.45);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          padding: 24px;
+          z-index: 130;
+        }
+        .login-modal-panel {
+          width: min(420px, 100%);
+          border-radius: 16px;
+          background: ${ui.surface};
+          border: 1px solid ${ui.border};
+          box-shadow: ${ui.shadow};
+          padding: 24px;
+          display: flex;
+          flex-direction: column;
+          gap: 12px;
+        }
+        .login-modal-panel__close {
+          width: 28px;
+          height: 28px;
+          border-radius: 999px;
+          border: none;
+          background: ${ui.surface2};
+          color: ${ui.text2};
+          font-size: 18px;
+          line-height: 1;
+        }
+        .login-modal-panel__close:hover:not(:disabled) {
+          background: ${ui.surface};
+          color: ${ui.text};
         }
         * { scrollbar-width: none; -ms-overflow-style: none; }
         ::-webkit-scrollbar { width: 0px; height: 0px; }

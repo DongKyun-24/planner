@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
+﻿import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 
 export default function WindowTabs({
   windows,
@@ -23,6 +23,7 @@ export default function WindowTabs({
   WINDOW_COLORS,
   setWindows
 }) {
+  const showTabArrows = canScrollTabsLeft || canScrollTabsRight
   const [colorPickerId, setColorPickerId] = useState(null)
   const [colorPickerPos, setColorPickerPos] = useState(null)
   const colorPickerPanelRef = useRef(null)
@@ -78,6 +79,7 @@ export default function WindowTabs({
 
   return (
     <div
+      className="window-tabs"
       style={{
         padding: "10px 12px 8px",
         borderBottom: `1px solid ${ui.border}`,
@@ -88,16 +90,18 @@ export default function WindowTabs({
         minWidth: 0
       }}
     >
-      <button
-        onClick={() => scrollTabs(-1)}
-        className={`arrow-button${canScrollTabsLeft ? " is-active" : ""}`}
-        style={{ ...arrowButton, flexShrink: 0, cursor: canScrollTabsLeft ? "pointer" : "default" }}
-        disabled={!canScrollTabsLeft}
-        title="왼쪽으로 이동"
-        aria-label="왼쪽으로 이동"
-      >
-        ◀
-      </button>
+      {showTabArrows && (
+        <button
+          onClick={() => scrollTabs(-1)}
+          className={`arrow-button${canScrollTabsLeft ? " is-active" : ""}`}
+          style={{ ...arrowButton, flexShrink: 0, cursor: canScrollTabsLeft ? "pointer" : "default" }}
+          disabled={!canScrollTabsLeft}
+          title="왼쪽으로 이동"
+          aria-label="왼쪽으로 이동"
+        >
+          ◀
+        </button>
+      )}
       <div
         className="tabs-scroll"
         ref={tabsScrollRef}
@@ -260,16 +264,18 @@ export default function WindowTabs({
         })}
       </div>
 
-      <button
-        onClick={() => scrollTabs(1)}
-        className={`arrow-button${canScrollTabsRight ? " is-active" : ""}`}
-        style={{ ...arrowButton, flexShrink: 0, cursor: canScrollTabsRight ? "pointer" : "default" }}
-        disabled={!canScrollTabsRight}
-        title="오른쪽으로 이동"
-        aria-label="오른쪽으로 이동"
-      >
-        ▶
-      </button>
+      {showTabArrows && (
+        <button
+          onClick={() => scrollTabs(1)}
+          className={`arrow-button${canScrollTabsRight ? " is-active" : ""}`}
+          style={{ ...arrowButton, flexShrink: 0, cursor: canScrollTabsRight ? "pointer" : "default" }}
+          disabled={!canScrollTabsRight}
+          title="오른쪽으로 이동"
+          aria-label="오른쪽으로 이동"
+        >
+          ▶
+        </button>
+      )}
       <button onClick={addWindow} style={{ ...iconButton, flexShrink: 0 }} title="새 창 추가" aria-label="새 창 추가">
         +
       </button>

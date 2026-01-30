@@ -1,9 +1,9 @@
 import { buildHeaderLine } from "./holiday"
 import { buildLineStartPositions, keyToTime, keyToYMD } from "./dateUtils"
 
-export const groupLineRegex = /^\s*@([^(]+)\(([^)]*)\)\s*$/
-export const groupLineStartRegex = /^\s*@([^(]+)\s*\(\s*$/
-export const groupLineTitleOnlyRegex = /^\s*@([^()]+)\s*$/
+export const groupLineRegex = /^\s*@(.+)\(([^)]*)\)\s*$/
+export const groupLineStartRegex = /^\s*@(.+)\s*\(\s*$/
+export const groupLineTitleOnlyRegex = /^\s*@(.+)\s*$/
 export const groupLineCloseRegex = /^\s*\)\s*$/
 
 export const timeTokenRegex = /^(\d{1,2}):(\d{2})$/
@@ -99,14 +99,71 @@ export function addGroupItem(groupIndex, groups, title, item) {
 
 export function normalizeGroupLineNewlines(text) {
   const s = (text ?? "").replace(/\r\n/g, "\n")
-  const tightened = s.replace(/@([^(]+)\s*\(\s*/g, (full, title) => `@${String(title).trim()}(`)
-  return tightened.replace(/@([^(]+)\(([\s\S]*?)\)/g, (full, title, inner) => {
-    const normalizedInner = inner
+  const lines = s.split("\n")
+  const out = []
+  let pending = null
+
+  const pushNormalizedGroup = (indent, title, inner) => {
+    const normalizedInner = String(inner ?? "")
       .replace(/\r?\n+/g, ";")
       .replace(/\s+/g, " ")
       .trim()
-    return `@${String(title).trim()}(${normalizedInner})`
-  })
+    out.push(`${indent}@${String(title).trim()}(${normalizedInner})`)
+  }
+
+  for (const line of lines) {
+    const indent = line.match(/^\s*/)?.[0] ?? ""
+    const trimmed = line.trim()
+
+    if (pending) {
+      if (groupLineCloseRegex.test(trimmed)) {
+        pushNormalizedGroup(pending.indent, pending.title, pending.items.join(";"))
+        pending = null
+        continue
+      }
+      if (trimmed) pending.items.push(trimmed)
+      continue
+    }
+
+    if (!trimmed) {
+      out.push(line)
+      continue
+    }
+
+    if (trimmed.startsWith("@")) {
+      const inlineMatch = trimmed.match(groupLineRegex)
+      if (inlineMatch) {
+        pushNormalizedGroup(indent, inlineMatch[1], inlineMatch[2])
+        continue
+      }
+
+      const startMatch = trimmed.match(groupLineStartRegex)
+      if (startMatch) {
+        const title = String(startMatch[1] ?? "").trim()
+        if (title) {
+          pending = { title, indent, items: [] }
+          continue
+        }
+      }
+
+      const titleOnly = trimmed.match(groupLineTitleOnlyRegex)
+      if (titleOnly) {
+        const title = String(titleOnly[1] ?? "").trim()
+        if (title) {
+          out.push(`${indent}@${title}`)
+          continue
+        }
+      }
+    }
+
+    out.push(line)
+  }
+
+  if (pending) {
+    pushNormalizedGroup(pending.indent, pending.title, pending.items.join(";"))
+  }
+
+  return out.join("\n")
 }
 
 export function normalizeWindowTitle(value) {
