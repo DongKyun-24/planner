@@ -73,6 +73,7 @@ export default function WindowTabs({
     if (rect.top < pad) nextTop = pad
 
     if (nextLeft !== colorPickerPos.left || nextTop !== colorPickerPos.top) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setColorPickerPos({ left: nextLeft, top: nextTop })
     }
   }, [colorPickerId, colorPickerPos])

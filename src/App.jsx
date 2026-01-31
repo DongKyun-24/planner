@@ -2246,27 +2246,44 @@ function stripEmptyGroupLines(bodyText) {
       localStorage.setItem(rightMemoKey, rightMemoText)
     } catch (err) { void err }
 
-    if (!supabase || !session?.user?.id) return
+    const userId = session?.user?.id
+    if (!supabase || !userId) return
+
     if (rightMemoSyncTimerRef.current) clearTimeout(rightMemoSyncTimerRef.current)
-    rightMemoSyncTimerRef.current = setTimeout(() => {
-      if (activeWindowId === "all") {
-        const { commonLines, windowLinesById } = splitCombinedRightText(rightMemoText, editableWindows)
-        setRightWindowTextSync(baseYear, "all", commonLines.join("\n").trimEnd())
-        const visibleWindows = (editableWindows ?? []).filter((w) => !integratedFilters || integratedFilters[w.id] !== false)
+
+    const savedYear = baseYear
+    const savedWindowId = activeWindowId
+    const savedText = rightMemoText
+    const savedWindows = editableWindows
+    const savedFilters = integratedFilters
+
+    const flush = () => {
+      if (savedWindowId === "all") {
+        const { commonLines, windowLinesById } = splitCombinedRightText(savedText, savedWindows)
+        setRightWindowTextSync(savedYear, "all", commonLines.join("\n").trimEnd())
+        const visibleWindows = (savedWindows ?? []).filter((w) => !savedFilters || savedFilters[w.id] !== false)
         for (const w of visibleWindows) {
           const next = (windowLinesById.get(w.id) ?? []).join("\n").trimEnd()
-          setRightWindowTextSync(baseYear, w.id, next)
+          setRightWindowTextSync(savedYear, w.id, next)
         }
         Promise.all(
-          visibleWindows.map((w) =>
-            saveRightMemoToSupabase(session.user.id, baseYear, w.id, (windowLinesById.get(w.id) ?? []).join("\n"))
-          )
+          visibleWindows.map((w) => saveRightMemoToSupabase(userId, savedYear, w.id, (windowLinesById.get(w.id) ?? []).join("\n")))
         ).catch((err) => console.error("save all right memos", err))
         return
       }
-      saveRightMemoToSupabase(session.user.id, baseYear, activeWindowId, rightMemoText)
-    }, 800)
-  }, [rightMemoKey, rightMemoText, activeWindowId, baseYear, session?.user?.id])
+      saveRightMemoToSupabase(userId, savedYear, savedWindowId, savedText)
+    }
+
+    const t = setTimeout(flush, 800)
+    rightMemoSyncTimerRef.current = t
+
+    return () => {
+      if (rightMemoSyncTimerRef.current !== t) return
+      clearTimeout(t)
+      rightMemoSyncTimerRef.current = null
+      flush()
+    }
+  }, [rightMemoKey, rightMemoText, activeWindowId, baseYear, session?.user?.id, editableWindows, integratedFilters])
 
   const leftOverlayLines = useMemo(() => {
     if (activeWindowId === "all") return buildMemoOverlayLines(text)
