@@ -4919,6 +4919,7 @@ function stripEmptyGroupLines(bodyText) {
         applyDayListEdit={applyDayListEdit}
         dayListReadItems={dayListReadItems}
         memoFontPx={memoFontPx}
+        editableWindows={editableWindows}
       />
 
       <DeleteConfirmModal
