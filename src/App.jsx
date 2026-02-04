@@ -2924,7 +2924,10 @@ function stripEmptyGroupLines(bodyText) {
 
   function handleReadBlockClick(dateKey) {
     if (isMainMemoReadOnly) {
-      if (dateKey) setActiveDateKey(dateKey)
+      if (dateKey) {
+        setActiveDateKey(dateKey)
+        openDayList(dateKey, itemsByDate[dateKey] ?? [])
+      }
       return
     }
     if (!dateKey) return
