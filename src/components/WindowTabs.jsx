@@ -23,10 +23,33 @@ export default function WindowTabs({
   WINDOW_COLORS,
   setWindows
 }) {
-  const showTabArrows = canScrollTabsLeft || canScrollTabsRight
   const [colorPickerId, setColorPickerId] = useState(null)
   const [colorPickerPos, setColorPickerPos] = useState(null)
   const colorPickerPanelRef = useRef(null)
+
+  const ArrowIcon = ({ direction }) => (
+    <svg width="14" height="14" viewBox="0 0 20 20" aria-hidden="true">
+      {direction === "left" ? (
+        <path
+          d="M12.5 4.5L7 10l5.5 5.5"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2.3"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      ) : (
+        <path
+          d="M7.5 4.5L13 10l-5.5 5.5"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2.3"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      )}
+    </svg>
+  )
 
   const colorPickerWindow = useMemo(
     () => windows.find((w) => w.id === colorPickerId) ?? null,
@@ -91,16 +114,15 @@ export default function WindowTabs({
         minWidth: 0
       }}
     >
-      {showTabArrows && (
+      {canScrollTabsLeft && (
         <button
           onClick={() => scrollTabs(-1)}
-          className={`arrow-button${canScrollTabsLeft ? " is-active" : ""}`}
-          style={{ ...arrowButton, flexShrink: 0, cursor: canScrollTabsLeft ? "pointer" : "default" }}
-          disabled={!canScrollTabsLeft}
+          className="arrow-button is-active"
+          style={{ ...arrowButton, flexShrink: 0, cursor: "pointer" }}
           title="왼쪽으로 이동"
           aria-label="왼쪽으로 이동"
         >
-          ◀
+          <ArrowIcon direction="left" />
         </button>
       )}
       <div
@@ -265,16 +287,15 @@ export default function WindowTabs({
         })}
       </div>
 
-      {showTabArrows && (
+      {canScrollTabsRight && (
         <button
           onClick={() => scrollTabs(1)}
-          className={`arrow-button${canScrollTabsRight ? " is-active" : ""}`}
-          style={{ ...arrowButton, flexShrink: 0, cursor: canScrollTabsRight ? "pointer" : "default" }}
-          disabled={!canScrollTabsRight}
+          className="arrow-button is-active"
+          style={{ ...arrowButton, flexShrink: 0, cursor: "pointer" }}
           title="오른쪽으로 이동"
           aria-label="오른쪽으로 이동"
         >
-          ▶
+          <ArrowIcon direction="right" />
         </button>
       )}
       <button onClick={addWindow} style={{ ...iconButton, flexShrink: 0 }} title="새 창 추가" aria-label="새 창 추가">
