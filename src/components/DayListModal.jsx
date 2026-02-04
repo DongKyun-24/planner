@@ -1,6 +1,7 @@
 export default function DayListModal({
   open,
   onClose,
+  readOnly = false,
   ui,
   dayListTitle,
   dayListMode,
@@ -12,6 +13,7 @@ export default function DayListModal({
   memoFontPx
 }) {
   if (!open) return null
+  const effectiveMode = readOnly ? "read" : dayListMode
 
   return (
     <div
@@ -54,30 +56,32 @@ export default function DayListModal({
                 padding: "0 10px",
                 borderRadius: 8,
                 border: `1px solid ${ui.border}`,
-                background: dayListMode === "read" ? ui.accent : ui.surface,
-                color: dayListMode === "read" ? "#fff" : ui.text,
+                background: effectiveMode === "read" ? ui.accent : ui.surface,
+                color: effectiveMode === "read" ? "#fff" : ui.text,
                 cursor: "pointer",
                 fontWeight: 800
               }}
             >
-              읽기모드
+              Read
             </button>
-            <button
-              type="button"
-              onClick={() => setDayListMode("edit")}
-              style={{
-                height: 28,
-                padding: "0 10px",
-                borderRadius: 8,
-                border: `1px solid ${ui.border}`,
-                background: dayListMode === "edit" ? ui.accent : ui.surface,
-                color: dayListMode === "edit" ? "#fff" : ui.text,
-                cursor: "pointer",
-                fontWeight: 800
-              }}
-            >
-              편집모드
-            </button>
+            {!readOnly && (
+              <button
+                type="button"
+                onClick={() => setDayListMode("edit")}
+                style={{
+                  height: 28,
+                  padding: "0 10px",
+                  borderRadius: 8,
+                  border: `1px solid ${ui.border}`,
+                  background: effectiveMode === "edit" ? ui.accent : ui.surface,
+                  color: effectiveMode === "edit" ? "#fff" : ui.text,
+                  cursor: "pointer",
+                  fontWeight: 800
+                }}
+              >
+                Edit
+              </button>
+            )}
             <button
               type="button"
               onClick={onClose}
@@ -92,11 +96,12 @@ export default function DayListModal({
                 fontWeight: 800
               }}
             >
-              닫기
+              Close
             </button>
           </div>
         </div>
-        {dayListMode === "edit" ? (
+
+        {effectiveMode === "edit" ? (
           <textarea
             value={dayListEditText}
             onChange={(e) => {
@@ -104,7 +109,7 @@ export default function DayListModal({
               setDayListEditText(next)
               applyDayListEdit(next)
             }}
-            placeholder="할 일을 입력하세요"
+            placeholder="Type your schedule notes"
             style={{
               marginTop: 10,
               width: "100%",
@@ -149,7 +154,8 @@ export default function DayListModal({
                 <>
                   {dayListReadItems.timedItems.map((item, idx) => (
                     <div key={`daylist-timed-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
-                      {item.time} {item.title ? `[${item.title}] ` : ""}{item.text}
+                      {item.time} {item.title ? `[${item.title}] ` : ""}
+                      {item.text}
                     </div>
                   ))}
                   {dayListReadItems.noTimeGroupItems.map((item, idx) => (
@@ -164,7 +170,7 @@ export default function DayListModal({
                   ))}
                   {dayListReadItems.general.length === 0 &&
                     dayListReadItems.noTimeGroupItems.length === 0 &&
-                    dayListReadItems.timedItems.length === 0 && <div style={{ color: ui.text2 }}>내용이 없습니다.</div>}
+                    dayListReadItems.timedItems.length === 0 && <div style={{ color: ui.text2 }}>No content.</div>}
                 </>
               ) : (
                 <>
@@ -179,12 +185,12 @@ export default function DayListModal({
                     </div>
                   ))}
                   {dayListReadItems.noTimeItems.length === 0 && dayListReadItems.timedItems.length === 0 && (
-                    <div style={{ color: ui.text2 }}>내용이 없습니다.</div>
+                    <div style={{ color: ui.text2 }}>No content.</div>
                   )}
                 </>
               )
             ) : (
-              <span style={{ color: ui.text2 }}>내용이 없습니다.</span>
+              <span style={{ color: ui.text2 }}>No content.</span>
             )}
           </div>
         )}

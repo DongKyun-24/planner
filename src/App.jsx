@@ -97,7 +97,6 @@ function App() {
   const rightOverlayInnerRef = useRef(null)
   const readBlockRefs = useRef(new Map())
   const clientIdRef = useRef(getClientId())
-  const pendingDeleteIdsRef = useRef(new Set())
 
   // ===== 창(캘린더) 탭 =====
   const WINDOWS_KEY = "planner-windows-v1"
@@ -107,6 +106,12 @@ function App() {
   const OFFLINE_MEMO_PREFIX = "planner-offline"
   const USER_MEMO_PREFIX = "planner-user"
   const OFFLINE_MEMO_MIGRATION_KEY = "planner-offline-memo-migrated-v1"
+  const SYNC_BACKUP_KEY_PREFIX = "planner-sync-backup-v1"
+  // Temporary safety mode: web reads plans from Supabase, but does not write plans from memo text.
+  // Mobile remains the source of truth for schedule CRUD until web is migrated to row-based edits.
+  const ENABLE_WEB_TEXT_PLAN_SYNC = false
+  const ENABLE_WEB_ROW_PLAN_EDIT = true
+  const ENABLE_AUTOMATIC_DIFF_DELETE = false
 
   const DEFAULT_WINDOWS = [{ id: "all", title: "통합", color: "#2563eb", fixed: true }]
 
@@ -139,6 +144,24 @@ function App() {
 
   function getWindowsStorageKey(userId) {
     return userId ? `${WINDOWS_KEY_PREFIX}-${userId}` : OFFLINE_WINDOWS_KEY
+  }
+
+  function getSyncBackupKey(userId, year) {
+    return `${SYNC_BACKUP_KEY_PREFIX}-${userId ?? "offline"}-${year}`
+  }
+
+  function pushSyncBackup(userId, year, text, reason = "sync") {
+    try {
+      const key = getSyncBackupKey(userId, year)
+      const raw = localStorage.getItem(key)
+      const parsed = JSON.parse(raw ?? "[]")
+      const list = Array.isArray(parsed) ? parsed : []
+      const nextText = String(text ?? "")
+      const last = list[list.length - 1]
+      if (last?.text === nextText) return
+      const next = [...list, { at: new Date().toISOString(), reason, text: nextText }]
+      localStorage.setItem(key, JSON.stringify(next.slice(-20)))
+    } catch (err) { void err }
   }
 
   function hasStoredWindows(key) {
@@ -274,6 +297,13 @@ function App() {
   const [remoteWindowsLoaded, setRemoteWindowsLoaded] = useState(false)
   const applyingRemoteWindowsRef = useRef(false)
   const windowsSyncTimerRef = useRef(null)
+  const hasCloudSession = Boolean(session?.user?.id && supabase)
+  const canUseWebRowPlanEdit = Boolean(hasCloudSession && !ENABLE_WEB_TEXT_PLAN_SYNC && ENABLE_WEB_ROW_PLAN_EDIT)
+  const isMainMemoReadOnly = Boolean(hasCloudSession && !ENABLE_WEB_TEXT_PLAN_SYNC)
+  const isScheduleReadOnly = Boolean(isMainMemoReadOnly && !canUseWebRowPlanEdit)
+  const dayListSyncTimerRef = useRef(null)
+  const dayListPendingSyncRef = useRef(null)
+  const dayListSyncQueueRef = useRef(Promise.resolve())
 
   const [text, setText] = useState("")
   const [today, setToday] = useState(() => new Date())
@@ -334,6 +364,7 @@ function App() {
     const yearPrefix = `${year}-`
     const byDate = new Map()
     for (const row of plans ?? []) {
+      if (row?.deleted_at) continue
       const dateKey = String(row?.date ?? "")
       if (!dateKey.startsWith(yearPrefix)) continue
       const content = String(row?.content ?? "").trim()
@@ -640,8 +671,10 @@ function App() {
   }
 
   async function syncYearToSupabase(sourceText, year) {
+    if (!ENABLE_WEB_TEXT_PLAN_SYNC) return
     if (!supabase || !session?.user?.id) return
     const userId = session.user.id
+    pushSyncBackup(userId, year, sourceText ?? "", "pre-sync")
     const desired = extractPlansFromText(sourceText ?? "", year)
     const desiredMap = new Map()
     for (const row of desired) {
@@ -659,9 +692,14 @@ function App() {
         String(row?.date ?? "").startsWith(yearPrefix)
     )
     const currentMap = new Map()
+    const duplicateRows = []
     for (const row of current) {
       const key = buildPlanKey(row)
-      if (!key || currentMap.has(key)) continue
+      if (!key) continue
+      if (currentMap.has(key)) {
+        if (row?.id) duplicateRows.push(row)
+        continue
+      }
       currentMap.set(key, row)
     }
 
@@ -676,19 +714,54 @@ function App() {
       })
     }
 
-    const toDelete = []
+    const removedRows = []
     for (const [key, row] of currentMap.entries()) {
       if (desiredMap.has(key)) continue
-      if (row?.id) toDelete.push(row)
+      if (row?.id) removedRows.push(row)
+    }
+    const duplicateDeleteRows = duplicateRows.filter((row) => row?.id)
+
+    let toDelete = [...duplicateDeleteRows]
+    if (ENABLE_AUTOMATIC_DIFF_DELETE) {
+      toDelete = [...removedRows, ...duplicateDeleteRows]
+
+      // Safety net: never wipe an entire year from an empty/invalid parse result.
+      if (currentMap.size > 0 && desiredMap.size === 0 && toInsert.length === 0 && toDelete.length >= currentMap.size) {
+        console.warn("sync skipped: refusing to delete all yearly plans from empty parsed text", {
+          year,
+          currentCount: currentMap.size,
+          sourceLength: String(sourceText ?? "").length
+        })
+        return
+      }
+
+      const MAX_AUTO_DELETE_PER_SYNC = 40
+      if (removedRows.length > MAX_AUTO_DELETE_PER_SYNC) {
+        console.warn("sync delete capped: refusing a large automatic delete batch", {
+          year,
+          removedCount: removedRows.length,
+          duplicateCount: duplicateDeleteRows.length
+        })
+        // Keep duplicate cleanup, skip mass diff-based deletes.
+        toDelete = [...duplicateDeleteRows]
+      }
+    } else if (removedRows.length > 0) {
+      console.warn("auto diff delete disabled: skip removed rows", {
+        year,
+        removedCount: removedRows.length
+      })
     }
 
     if (toDelete.length > 0) {
       const ids = toDelete.map((row) => row.id)
-      ids.forEach((id) => pendingDeleteIdsRef.current.add(id))
-      const { error: deleteError } = await supabase.from("plans").delete().in("id", ids).eq("user_id", userId)
+      const deletedAt = new Date().toISOString()
+      const { error: deleteError } = await supabase
+        .from("plans")
+        .update({ deleted_at: deletedAt, updated_at: deletedAt, client_id: clientIdRef.current })
+        .in("id", ids)
+        .eq("user_id", userId)
       if (deleteError) {
         console.error("delete plans", deleteError)
-        ids.forEach((id) => pendingDeleteIdsRef.current.delete(id))
         return
       }
     }
@@ -714,7 +787,205 @@ function App() {
     })
   }
 
+  function extractPlansFromDayBody(bodyText, dateKey, scopedWindowTitle = null) {
+    const out = []
+    const parsedBlock = parseDashboardBlockContent(bodyText ?? "")
+    const scopedTitle = scopedWindowTitle ? normalizeCategoryId(scopedWindowTitle) : null
+
+    if (scopedTitle) {
+      for (const line of parsedBlock.general ?? []) {
+        const text = String(line ?? "").trim()
+        if (!text) continue
+        out.push({ date: dateKey, time: null, category_id: scopedTitle, content: text })
+      }
+      for (const item of parsedBlock.timed ?? []) {
+        const text = String(item?.text ?? "").trim()
+        if (!text) continue
+        out.push({
+          date: dateKey,
+          time: item?.time ? String(item.time).trim() : null,
+          category_id: scopedTitle,
+          content: text
+        })
+      }
+      for (const group of parsedBlock.groups ?? []) {
+        const groupTitle = normalizeCategoryId(String(group?.title ?? "").trim())
+        if (!groupTitle || groupTitle !== scopedTitle) continue
+        for (const item of group.items ?? []) {
+          const text = String(item?.text ?? "").trim()
+          if (!text) continue
+          out.push({
+            date: dateKey,
+            time: item?.time ? String(item.time).trim() : null,
+            category_id: scopedTitle,
+            content: text
+          })
+        }
+      }
+      return out
+    }
+
+    for (const line of parsedBlock.general ?? []) {
+      const text = String(line ?? "").trim()
+      if (!text) continue
+      out.push({ date: dateKey, time: null, category_id: GENERAL_CATEGORY_ID, content: text })
+    }
+    for (const item of parsedBlock.timed ?? []) {
+      const text = String(item?.text ?? "").trim()
+      if (!text) continue
+      out.push({
+        date: dateKey,
+        time: item?.time ? String(item.time).trim() : null,
+        category_id: GENERAL_CATEGORY_ID,
+        content: text
+      })
+    }
+    for (const group of parsedBlock.groups ?? []) {
+      const title = normalizeCategoryId(String(group?.title ?? "").trim())
+      if (!title) continue
+      for (const item of group.items ?? []) {
+        const text = String(item?.text ?? "").trim()
+        if (!text) continue
+        out.push({
+          date: dateKey,
+          time: item?.time ? String(item.time).trim() : null,
+          category_id: title,
+          content: text
+        })
+      }
+    }
+    return out
+  }
+
+  async function syncDayBodyToSupabase(dateKey, bodyText, windowId) {
+    if (!canUseWebRowPlanEdit) return
+    if (!supabase || !session?.user?.id) return
+    const userId = session.user.id
+    const scopedWindow =
+      windowId && windowId !== "all" ? windows.find((w) => String(w?.id) === String(windowId)) : null
+    if (windowId && windowId !== "all" && !scopedWindow) return
+    const scopedTitle = scopedWindow ? normalizeCategoryId(scopedWindow.title) : null
+
+    const desired = extractPlansFromDayBody(bodyText ?? "", dateKey, scopedTitle)
+    const desiredMap = new Map()
+    for (const row of desired) {
+      const key = buildPlanKey(row)
+      if (!key || desiredMap.has(key)) continue
+      desiredMap.set(key, row)
+    }
+
+    let query = supabase
+      .from("plans")
+      .select("*")
+      .eq("user_id", userId)
+      .eq("date", dateKey)
+      .is("deleted_at", null)
+    if (scopedTitle) query = query.eq("category_id", scopedTitle)
+    const { data: currentRows, error: loadError } = await query
+    if (loadError) {
+      console.error("load day plans", loadError)
+      return
+    }
+
+    const currentMap = new Map()
+    const duplicateRows = []
+    for (const row of currentRows ?? []) {
+      const key = buildPlanKey(row)
+      if (!key) continue
+      if (currentMap.has(key)) {
+        if (row?.id) duplicateRows.push(row)
+        continue
+      }
+      currentMap.set(key, row)
+    }
+
+    const toInsert = []
+    for (const [key, row] of desiredMap.entries()) {
+      if (currentMap.has(key)) continue
+      toInsert.push({
+        ...row,
+        user_id: userId,
+        client_id: clientIdRef.current,
+        updated_at: new Date().toISOString()
+      })
+    }
+
+    const toDelete = []
+    for (const [key, row] of currentMap.entries()) {
+      if (desiredMap.has(key)) continue
+      if (row?.id) toDelete.push(row)
+    }
+    for (const row of duplicateRows) {
+      if (row?.id) toDelete.push(row)
+    }
+
+    if (toDelete.length > 0) {
+      const ids = [...new Set(toDelete.map((row) => row.id).filter(Boolean))]
+      const deletedAt = new Date().toISOString()
+      const { error: deleteError } = await supabase
+        .from("plans")
+        .update({ deleted_at: deletedAt, updated_at: deletedAt, client_id: clientIdRef.current })
+        .in("id", ids)
+        .eq("user_id", userId)
+      if (deleteError) {
+        console.error("delete day plans", deleteError)
+        return
+      }
+    }
+
+    if (toInsert.length > 0) {
+      const { error: insertError } = await supabase.from("plans").insert(toInsert)
+      if (insertError) {
+        console.error("insert day plans", insertError)
+        return
+      }
+    }
+
+    const categoryTitles = new Set(
+      desired
+        .map((row) => normalizeCategoryId(String(row?.category_id ?? "").trim()))
+        .filter((title) => title && !isGeneralCategoryId(title))
+    )
+    ensureWindowsForCategories(categoryTitles)
+    await loadRemotePlans(userId)
+  }
+
+  function runPendingDayListSyncNow() {
+    const payload = dayListPendingSyncRef.current
+    dayListPendingSyncRef.current = null
+    if (!payload || !payload.dateKey) return
+    dayListSyncQueueRef.current = dayListSyncQueueRef.current
+      .catch((err) => {
+        console.error("day sync queue", err)
+      })
+      .then(() => syncDayBodyToSupabase(payload.dateKey, payload.bodyText, payload.windowId))
+  }
+
+  function enqueueDayListSync(dateKey, bodyText, windowId) {
+    if (!canUseWebRowPlanEdit) return
+    dayListPendingSyncRef.current = {
+      dateKey,
+      bodyText: String(bodyText ?? ""),
+      windowId: windowId ?? "all"
+    }
+    if (dayListSyncTimerRef.current) clearTimeout(dayListSyncTimerRef.current)
+    dayListSyncTimerRef.current = setTimeout(() => {
+      dayListSyncTimerRef.current = null
+      runPendingDayListSyncNow()
+    }, 450)
+  }
+
+  function flushPendingDayListSync() {
+    if (!canUseWebRowPlanEdit) return
+    if (dayListSyncTimerRef.current) {
+      clearTimeout(dayListSyncTimerRef.current)
+      dayListSyncTimerRef.current = null
+    }
+    runPendingDayListSyncNow()
+  }
+
   function scheduleCloudSync(sourceText, year) {
+    if (!ENABLE_WEB_TEXT_PLAN_SYNC) return
     if (!supabase || !session?.user?.id || !remoteLoaded) return
     if (applyingRemoteRef.current) return
     const last = lastCloudSyncRef.current
@@ -747,18 +1018,20 @@ function App() {
   async function removeCategoryInSupabase(title) {
     if (!supabase || !session?.user?.id) return
     const userId = session.user.id
-    const ids = (remotePlans ?? [])
-      .filter((row) => row?.category_id === title && row?.user_id === userId)
-      .map((row) => row.id)
-      .filter(Boolean)
-    ids.forEach((id) => pendingDeleteIdsRef.current.add(id))
-    const { error } = await supabase.from("plans").delete().eq("user_id", userId).eq("category_id", title)
+    const deletedAt = new Date().toISOString()
+    const { error } = await supabase
+      .from("plans")
+      .update({ deleted_at: deletedAt, updated_at: deletedAt, client_id: clientIdRef.current })
+      .eq("user_id", userId)
+      .eq("category_id", title)
+      .is("deleted_at", null)
     if (error) {
       console.error("remove category", error)
-      ids.forEach((id) => pendingDeleteIdsRef.current.delete(id))
       return
     }
-    setRemotePlans((prev) => (prev ?? []).filter((row) => row.category_id !== title))
+    setRemotePlans((prev) =>
+      (prev ?? []).filter((row) => !(row?.category_id === title && row?.user_id === userId))
+    )
   }
 
   useEffect(() => {
@@ -815,10 +1088,6 @@ function App() {
           if (eventType === "DELETE") {
             const id = payload.old?.id
             if (!id) return
-            if (pendingDeleteIdsRef.current.has(id)) {
-              pendingDeleteIdsRef.current.delete(id)
-              return
-            }
             setRemotePlans((prev) => (prev ?? []).filter((row) => row?.id !== id))
             return
           }
@@ -830,6 +1099,11 @@ function App() {
           const normalized = {
             ...incoming,
             category_id: normalizeCategoryId(incoming?.category_id)
+          }
+          if (normalized?.deleted_at) {
+            setRemotePlans((prev) => (prev ?? []).filter((row) => row?.id !== normalized.id))
+            setRemoteLoaded(true)
+            return
           }
           setRemotePlans((prev) => {
             const list = prev ?? []
@@ -865,7 +1139,12 @@ function App() {
 
   useEffect(() => {
     if (!session?.user?.id || !remoteLoaded) return
-    const titles = new Set(remotePlans.map((row) => String(row?.category_id ?? "").trim()).filter(Boolean))
+    const titles = new Set(
+      remotePlans
+        .filter((row) => !row?.deleted_at)
+        .map((row) => String(row?.category_id ?? "").trim())
+        .filter(Boolean)
+    )
     ensureWindowsForCategories(titles)
   }, [remotePlans, session?.user?.id, remoteLoaded])
 
@@ -1012,7 +1291,7 @@ function App() {
     const forceApply = forceRemoteApplyRef.current
     if (!forceApply && isEditingLeftMemo) return
     const last = lastCloudSyncRef.current
-    if (!forceApply && last.year === baseYear && last.text !== textRef.current) return
+    if (ENABLE_WEB_TEXT_PLAN_SYNC && !forceApply && last.year === baseYear && last.text !== textRef.current) return
     const nextText = buildTextFromPlans(remotePlans, baseYear)
     if (nextText === textRef.current) {
       if (forceApply) {
@@ -1037,10 +1316,11 @@ function App() {
   const draggingWindowIdRef = useRef(null)
   useEffect(() => {
     if (!session?.user?.id || !remoteLoaded) return
-    const sourceText =
-      activeWindowId === "all" ? text : getWindowMemoTextSync(baseYear, "all") ?? ""
-    scheduleCloudSync(sourceText, baseYear)
-  }, [text, tabEditText, dashboardSourceTick, baseYear, session?.user?.id, remoteLoaded, activeWindowId])
+    // Tab edits already call scheduleCloudSync() after they are merged into the "all" text.
+    // Avoid syncing from stale all-text snapshots while typing in a tab.
+    if (activeWindowId !== "all") return
+    scheduleCloudSync(text, baseYear)
+  }, [text, baseYear, session?.user?.id, remoteLoaded, activeWindowId])
   const FILTER_KEY = "planner-integrated-filters-v1"
   const FILTER_KEY_PREFIX = "planner-integrated-filters-user-v1"
   const filterKeyRef = useRef(FILTER_KEY)
@@ -1452,11 +1732,42 @@ function App() {
   )
   const suppressRightSaveRef = useRef(false)
   const rightMemoSyncTimerRef = useRef(null)
+  const rightSaveSuppressResetRef = useRef(null)
   const editableWindows = useMemo(() => windows.filter((w) => w.id !== "all"), [windows])
   const windowTitlesOrder = useMemo(() => windows.filter((w) => w.id !== "all").map((w) => w.title), [windows])
   const windowTitleRank = useMemo(() => {
     return new Map(windowTitlesOrder.map((title, index) => [title, index]))
   }, [windowTitlesOrder])
+
+  function scheduleRightSaveUnsuppress() {
+    if (typeof window === "undefined") {
+      suppressRightSaveRef.current = false
+      return
+    }
+    if (rightSaveSuppressResetRef.current != null) {
+      cancelAnimationFrame(rightSaveSuppressResetRef.current)
+    }
+    rightSaveSuppressResetRef.current = requestAnimationFrame(() => {
+      suppressRightSaveRef.current = false
+      rightSaveSuppressResetRef.current = null
+    })
+  }
+
+  function sanitizeRightMemoBody(rawText, windowsForTitles) {
+    const titleSet = new Set(
+      (windowsForTitles ?? [])
+        .map((w) => String(w?.title ?? "").trim())
+        .filter(Boolean)
+    )
+    const lines = String(rawText ?? "").split("\n")
+    const out = []
+    for (const line of lines) {
+      const match = line.match(/^\s*\[(.+)\]\s*$/)
+      if (match && titleSet.has(String(match[1] ?? "").trim())) continue
+      out.push(line)
+    }
+    return out.join("\n").trimEnd()
+  }
 
   function getLeftMemoTextSync(year) {
     try {
@@ -1509,9 +1820,9 @@ function App() {
   function buildCombinedRightTextForYear(year) {
     const windowTexts = {}
     for (const w of editableWindows) {
-      windowTexts[w.id] = getRightWindowTextSync(year, w.id)
+      windowTexts[w.id] = sanitizeRightMemoBody(getRightWindowTextSync(year, w.id), editableWindows)
     }
-    const commonText = getRightWindowTextSync(year, "all")
+    const commonText = sanitizeRightMemoBody(getRightWindowTextSync(year, "all"), editableWindows)
     return buildCombinedRightText(commonText, editableWindows, integratedFilters, windowTexts)
   }
 
@@ -1567,6 +1878,7 @@ function App() {
     if (!supabase) return
     const userId = session?.user?.id
     if (userId) {
+      flushPendingDayListSync()
       try {
         if (syncTimerRef.current) clearTimeout(syncTimerRef.current)
         const sourceText =
@@ -2157,7 +2469,7 @@ function stripEmptyGroupLines(bodyText) {
       const fallbackAll = () => {
         const combined = buildCombinedRightTextForYear(baseYear)
         setRightMemoText(combined)
-        suppressRightSaveRef.current = false
+        scheduleRightSaveUnsuppress()
       }
 
       if (!supabase || !session?.user?.id) {
@@ -2168,14 +2480,17 @@ function stripEmptyGroupLines(bodyText) {
       loadAllRightMemosForYearFromSupabase(session.user.id, baseYear)
         .then((windowTexts) => {
           if (cancelled) return
+          const normalizedWindowTexts = {}
           for (const w of editableWindows) {
-            const text = String(windowTexts?.[w.id] ?? "")
+            const text = sanitizeRightMemoBody(String(windowTexts?.[w.id] ?? ""), editableWindows)
+            normalizedWindowTexts[w.id] = text
             setRightWindowTextSync(baseYear, w.id, text)
           }
-          const commonText = getRightWindowTextSync(baseYear, "all")
-          const combined = buildCombinedRightText(commonText, editableWindows, integratedFilters, windowTexts)
+          const commonText = sanitizeRightMemoBody(getRightWindowTextSync(baseYear, "all"), editableWindows)
+          setRightWindowTextSync(baseYear, "all", commonText)
+          const combined = buildCombinedRightText(commonText, editableWindows, integratedFilters, normalizedWindowTexts)
           setRightMemoText(combined)
-          suppressRightSaveRef.current = false
+          scheduleRightSaveUnsuppress()
         })
         .catch(() => {
           if (cancelled) return
@@ -2190,14 +2505,15 @@ function stripEmptyGroupLines(bodyText) {
     const fallback = () => {
       try {
         const saved = localStorage.getItem(rightMemoKey)
-        setRightMemoText(saved ?? "")
-        if (saved && supabase && session?.user?.id) {
-          saveRightMemoToSupabase(session.user.id, baseYear, activeWindowId, saved)
+        const normalized = sanitizeRightMemoBody(saved ?? "", editableWindows)
+        setRightMemoText(normalized)
+        if (normalized && supabase && session?.user?.id) {
+          saveRightMemoToSupabase(session.user.id, baseYear, activeWindowId, normalized)
         }
       } catch {
         setRightMemoText("")
       }
-      suppressRightSaveRef.current = false
+      scheduleRightSaveUnsuppress()
     }
 
     if (!supabase || !session?.user?.id) {
@@ -2209,10 +2525,12 @@ function stripEmptyGroupLines(bodyText) {
       .then((remoteText) => {
         if (cancelled) return
         if (remoteText != null) {
-          setRightMemoText(remoteText)
+          const normalized = sanitizeRightMemoBody(remoteText, editableWindows)
+          setRightMemoText(normalized)
           try {
-            localStorage.setItem(rightMemoKey, remoteText)
+            localStorage.setItem(rightMemoKey, normalized)
           } catch (err) { void err }
+          scheduleRightSaveUnsuppress()
         } else {
           fallback()
         }
@@ -2235,6 +2553,25 @@ function stripEmptyGroupLines(bodyText) {
     }
     localStorage.setItem(memoKey, text)
   }, [memoKey, text])
+
+  useEffect(() => {
+    return () => {
+      if (rightSaveSuppressResetRef.current != null && typeof window !== "undefined") {
+        cancelAnimationFrame(rightSaveSuppressResetRef.current)
+        rightSaveSuppressResetRef.current = null
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (dayListSyncTimerRef.current) {
+        clearTimeout(dayListSyncTimerRef.current)
+        dayListSyncTimerRef.current = null
+      }
+      dayListPendingSyncRef.current = null
+    }
+  }, [])
 
   // ? 오른쪽 메모(연도별) 저장
   useEffect(() => {
@@ -2260,18 +2597,22 @@ function stripEmptyGroupLines(bodyText) {
     const flush = () => {
       if (savedWindowId === "all") {
         const { commonLines, windowLinesById } = splitCombinedRightText(savedText, savedWindows)
-        setRightWindowTextSync(savedYear, "all", commonLines.join("\n").trimEnd())
+        const normalizedCommon = sanitizeRightMemoBody(commonLines.join("\n").trimEnd(), savedWindows)
+        setRightWindowTextSync(savedYear, "all", normalizedCommon)
         const visibleWindows = (savedWindows ?? []).filter((w) => !savedFilters || savedFilters[w.id] !== false)
         for (const w of visibleWindows) {
-          const next = (windowLinesById.get(w.id) ?? []).join("\n").trimEnd()
+          const next = sanitizeRightMemoBody((windowLinesById.get(w.id) ?? []).join("\n").trimEnd(), savedWindows)
           setRightWindowTextSync(savedYear, w.id, next)
         }
         Promise.all(
-          visibleWindows.map((w) => saveRightMemoToSupabase(userId, savedYear, w.id, (windowLinesById.get(w.id) ?? []).join("\n")))
+          visibleWindows.map((w) => {
+            const next = sanitizeRightMemoBody((windowLinesById.get(w.id) ?? []).join("\n").trimEnd(), savedWindows)
+            return saveRightMemoToSupabase(userId, savedYear, w.id, next)
+          })
         ).catch((err) => console.error("save all right memos", err))
         return
       }
-      saveRightMemoToSupabase(userId, savedYear, savedWindowId, savedText)
+      saveRightMemoToSupabase(userId, savedYear, savedWindowId, sanitizeRightMemoBody(savedText, savedWindows))
     }
 
     const t = setTimeout(flush, 800)
@@ -2567,6 +2908,7 @@ function stripEmptyGroupLines(bodyText) {
   }
 
   function enterEditMode() {
+    if (isMainMemoReadOnly) return
     const targetKey = selectedDateKey ?? lastEditedDateKey ?? lastActiveDateKeyRef.current
     if (targetKey) {
       handleReadBlockClick(targetKey)
@@ -2581,6 +2923,10 @@ function stripEmptyGroupLines(bodyText) {
   }
 
   function handleReadBlockClick(dateKey) {
+    if (isMainMemoReadOnly) {
+      if (dateKey) setActiveDateKey(dateKey)
+      return
+    }
     if (!dateKey) return
     beginEditSession(dateKey)
     setActiveDateKey(dateKey)
@@ -2728,6 +3074,12 @@ function stripEmptyGroupLines(bodyText) {
     setDayListMode("read")
   }, [dayListModal ? dayListModal.key : null, baseYear, activeWindowId])
 
+  useEffect(() => {
+    if (!isMainMemoReadOnly) return
+    if (!isEditingLeftMemo) return
+    setIsEditingLeftMemo(false)
+  }, [isMainMemoReadOnly, isEditingLeftMemo])
+
   function setActiveDateKey(key) {
     if (!key) return
     lastActiveDateKeyRef.current = key
@@ -2744,6 +3096,11 @@ function stripEmptyGroupLines(bodyText) {
 
   function applyDayListEdit(nextBody) {
     if (!dayListModal) return
+    if (canUseWebRowPlanEdit) {
+      enqueueDayListSync(dayListModal.key, nextBody, activeWindowId)
+      return
+    }
+    if (isScheduleReadOnly) return
     const isAll = activeWindowId === "all"
     const current = isAll ? textRef.current ?? text : tabEditText ?? ""
     const nextText = updateDateBlockBody(current, baseYear, dayListModal.key, nextBody)
@@ -3148,6 +3505,11 @@ function stripEmptyGroupLines(bodyText) {
   function handleDayClick(day) {
     const { year, month } = viewRef.current
     const key = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`
+    if (isMainMemoReadOnly) {
+      setActiveDateKey(key)
+      openDayList(key, itemsByDate[key] ?? [])
+      return
+    }
     if (!isEditingLeftMemo) {
       beginEditSession(key)
       setIsEditingLeftMemo(true)
@@ -3227,6 +3589,13 @@ function stripEmptyGroupLines(bodyText) {
     const m = today.getMonth() + 1
     const d = today.getDate()
     const key = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`
+    if (isMainMemoReadOnly) {
+      setView({ year: y, month: m })
+      viewRef.current = { year: y, month: m }
+      setBaseYear(y)
+      setActiveDateKey(key)
+      return
+    }
 
     if (!isEditingLeftMemo) beginEditSession(key)
     setIsEditingLeftMemo(true)
@@ -3614,6 +3983,11 @@ function stripEmptyGroupLines(bodyText) {
   function openDayList(key, items) {
     setDayListModal({ key, items })
     setDayListMode("read")
+  }
+
+  function closeDayListModal() {
+    flushPendingDayListSync()
+    setDayListModal(null)
   }
 
   function toggleLeftMemo() {
@@ -4110,9 +4484,28 @@ function stripEmptyGroupLines(bodyText) {
                     paddingBottom: "max(400px, 70vh)",
                     overflow: "auto",
                     fontSize: memoFontPx,
-                    lineHeight: 1.25
+                    lineHeight: 1.25,
+                    cursor: isMainMemoReadOnly ? "default" : "text"
                   }}
                 >
+                  {isMainMemoReadOnly && (
+                    <div
+                      style={{
+                        marginBottom: 10,
+                        padding: "8px 10px",
+                        borderRadius: 8,
+                        border: `1px solid ${ui.border}`,
+                        background: ui.surface2,
+                        color: ui.text2,
+                        fontSize: Math.max(11, memoFontPx - 2),
+                        fontWeight: 700
+                      }}
+                    >
+                      {canUseWebRowPlanEdit
+                        ? "웹 일정 편집은 달력 날짜(+/개수) 팝업에서 가능합니다."
+                        : "웹 일정은 현재 읽기 전용입니다. 일정 추가/수정/삭제는 앱에서 진행해 주세요."}
+                    </div>
+                  )}
                   <MemoReadView
                     blocks={activeWindowId === "all" ? dashboardBlocks : tabReadBlocks}
                     isAll={activeWindowId === "all"}
@@ -4512,7 +4905,8 @@ function stripEmptyGroupLines(bodyText) {
 
       <DayListModal
         open={Boolean(dayListModal)}
-        onClose={() => setDayListModal(null)}
+        onClose={closeDayListModal}
+        readOnly={isScheduleReadOnly}
         ui={ui}
         dayListTitle={dayListTitle}
         dayListMode={dayListMode}
