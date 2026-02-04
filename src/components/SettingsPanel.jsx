@@ -19,6 +19,8 @@ export default function SettingsPanel({
   setMemoFontInput,
   memoFontPx,
   setMemoFontPx,
+  showLogout = false,
+  onSignOut,
   onClose
 }) {
   return (
@@ -115,7 +117,28 @@ export default function SettingsPanel({
         </div>
       </div>
 
+      {showLogout ? (
+        <button
+          type="button"
+          onClick={onSignOut}
+          style={{
+            width: "100%",
+            height: 30,
+            borderRadius: 10,
+            border: `1px solid ${ui.border}`,
+            background: ui.surface2,
+            color: "#ef4444",
+            cursor: "pointer",
+            fontWeight: 700,
+            fontFamily: panelFontFamily
+          }}
+        >
+          로그아웃
+        </button>
+      ) : null}
+
       <button
+        type="button"
         onClick={onClose}
         style={{
           width: "100%",

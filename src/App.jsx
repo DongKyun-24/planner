@@ -2983,6 +2983,7 @@ function stripEmptyGroupLines(bodyText) {
   const lastCaretDateKeyRef = useRef(null)
   const editSessionRef = useRef({ id: 0, entryKey: null, lastChangeKey: null })
   const calendarInteractingRef = useRef(false)
+  const readDateCreateInputRef = useRef(null)
   const [dayListModal, setDayListModal] = useState(null)
   const [dayListEditText, setDayListEditText] = useState("")
   const [dayListMode, setDayListMode] = useState("read")
@@ -3115,6 +3116,41 @@ function stripEmptyGroupLines(bodyText) {
     setTabEditText(nextText)
     setWindowMemoTextSync(baseYear, activeWindowId, nextText)
     applyTabEditToAllFromText(nextText)
+  }
+
+  function openReadDateCreatePicker() {
+    const input = readDateCreateInputRef.current
+    if (!input) return
+
+    const fallbackKey = selectedDateKey ?? todayKey
+    if (/^\d{4}-\d{2}-\d{2}$/.test(fallbackKey)) input.value = fallbackKey
+
+    try {
+      if (typeof input.showPicker === "function") {
+        input.showPicker()
+        return
+      }
+    } catch (err) {
+      void err
+    }
+    input.focus()
+    input.click()
+  }
+
+  function handleReadDateCreateChange(e) {
+    const key = String(e.target.value ?? "").trim()
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(key)) return
+    const { y, m } = keyToYMD(key)
+    if (!Number.isFinite(y) || !Number.isFinite(m)) return
+
+    setView({ year: y, month: m })
+    viewRef.current = { year: y, month: m }
+    if (baseYearRef.current !== y) {
+      baseYearRef.current = y
+      setBaseYear(y)
+    }
+    setActiveDateKey(key)
+    openDayList(key, [])
   }
 
   // ===== 점프 스케줄 =====
@@ -4144,25 +4180,17 @@ function stripEmptyGroupLines(bodyText) {
             >
               ▶
             </button>
-          <button
-            onClick={goToday}
-            style={{ ...pillButton, padding: "0 10px 2px", borderRadius: 12, lineHeight: 1 }}
-            title="오늘로 이동"
-            aria-label="오늘로 이동"
-          >
-            Today
-          </button>
-          <div
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              height: 32,
-              borderRadius: 10,
-              border: `1px solid ${ui.border}`,
-              background: ui.surface,
-              overflow: "hidden"
-            }}
-          >
+            <div
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                height: 32,
+                borderRadius: 10,
+                border: `1px solid ${ui.border}`,
+                background: ui.surface,
+                overflow: "hidden"
+              }}
+            >
               <button
                 onClick={toggleLeftMemo}
                 className="no-hover-outline memo-toggle-button is-left"
@@ -4208,8 +4236,37 @@ function stripEmptyGroupLines(bodyText) {
               >
                 R
               </button>
+            </div>
+            {!isLeftCollapsed ? (
+              <>
+                <button
+                  onClick={openReadDateCreatePicker}
+                  style={{ ...pillButton, padding: "0 10px 2px", borderRadius: 12, lineHeight: 1 }}
+                  title="일정 생성"
+                  aria-label="일정 생성"
+                >
+                  일정 생성
+                </button>
+                <input
+                  ref={readDateCreateInputRef}
+                  type="date"
+                  onChange={handleReadDateCreateChange}
+                  aria-label="일정 날짜 생성"
+                  style={{
+                    position: "absolute",
+                    width: 1,
+                    height: 1,
+                    border: 0,
+                    padding: 0,
+                    margin: -1,
+                    overflow: "hidden",
+                    clip: "rect(0 0 0 0)",
+                    whiteSpace: "nowrap"
+                  }}
+                />
+              </>
+            ) : null}
           </div>
-        </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
           {activeWindowId === "all" && (
@@ -4269,16 +4326,7 @@ function stripEmptyGroupLines(bodyText) {
               />
             </svg>
           </button>
-          {session ? (
-            <button
-              onClick={handleSignOut}
-              title="로그아웃"
-              aria-label="로그아웃"
-              style={{ ...memoTopRightButton, fontSize: 12, fontWeight: 900, minWidth: 74 }}
-            >
-              로그아웃
-            </button>
-          ) : (
+          {!session && (
             <>
               <button
                 onClick={() => {
@@ -4336,6 +4384,11 @@ function stripEmptyGroupLines(bodyText) {
             setMemoFontInput={setMemoFontInput}
             memoFontPx={memoFontPx}
             setMemoFontPx={setMemoFontPx}
+            showLogout={Boolean(session)}
+            onSignOut={() => {
+              setSettingsOpen(false)
+              void handleSignOut()
+            }}
             onClose={() => setSettingsOpen(false)}
           />
         )}
@@ -4491,24 +4544,6 @@ function stripEmptyGroupLines(bodyText) {
                     cursor: isMainMemoReadOnly ? "default" : "text"
                   }}
                 >
-                  {isMainMemoReadOnly && (
-                    <div
-                      style={{
-                        marginBottom: 10,
-                        padding: "8px 10px",
-                        borderRadius: 8,
-                        border: `1px solid ${ui.border}`,
-                        background: ui.surface2,
-                        color: ui.text2,
-                        fontSize: Math.max(11, memoFontPx - 2),
-                        fontWeight: 700
-                      }}
-                    >
-                      {canUseWebRowPlanEdit
-                        ? "웹 일정 편집은 달력 날짜(+/개수) 팝업에서 가능합니다."
-                        : "웹 일정은 현재 읽기 전용입니다. 일정 추가/수정/삭제는 앱에서 진행해 주세요."}
-                    </div>
-                  )}
                   <MemoReadView
                     blocks={activeWindowId === "all" ? dashboardBlocks : tabReadBlocks}
                     isAll={activeWindowId === "all"}
@@ -4653,6 +4688,7 @@ function stripEmptyGroupLines(bodyText) {
       openDayList={openDayList}
       handleDayClick={handleDayClick}
       calendarInteractingRef={calendarInteractingRef}
+      goToday={goToday}
     />
   )
 

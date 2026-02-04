@@ -31,7 +31,8 @@ export default function CalendarPanel({
   viewMonth,
   openDayList,
   handleDayClick,
-  calendarInteractingRef
+  calendarInteractingRef,
+  goToday
 }) {
   return (
     <div
@@ -197,6 +198,15 @@ export default function CalendarPanel({
                 </svg>
               </span>
             </div>
+
+            <button
+              onClick={goToday}
+              style={{ ...pillButton, padding: "0 10px 2px", borderRadius: 12, lineHeight: 1 }}
+              title="오늘로 이동"
+              aria-label="오늘로 이동"
+            >
+              Today
+            </button>
 
             <button onClick={goPrevMonth} className="arrow-button" style={arrowButton} title="이전 달" aria-label="이전 달">
               ◀
