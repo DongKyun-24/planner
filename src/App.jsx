@@ -2983,6 +2983,7 @@ function stripEmptyGroupLines(bodyText) {
   const lastCaretDateKeyRef = useRef(null)
   const editSessionRef = useRef({ id: 0, entryKey: null, lastChangeKey: null })
   const calendarInteractingRef = useRef(false)
+  const readDateCreateButtonRef = useRef(null)
   const readDateCreateInputRef = useRef(null)
   const [dayListModal, setDayListModal] = useState(null)
   const [dayListEditText, setDayListEditText] = useState("")
@@ -3121,9 +3122,20 @@ function stripEmptyGroupLines(bodyText) {
   function openReadDateCreatePicker() {
     const input = readDateCreateInputRef.current
     if (!input) return
-
-    const fallbackKey = selectedDateKey ?? todayKey
-    if (/^\d{4}-\d{2}-\d{2}$/.test(fallbackKey)) input.value = fallbackKey
+    const button = readDateCreateButtonRef.current
+    if (button) {
+      const rect = button.getBoundingClientRect()
+      const pickerWidth = 296
+      const gapY = 4
+      const viewportPadding = 8
+      let left = rect.right - pickerWidth + 90
+      if (typeof window !== "undefined") {
+        left = Math.max(viewportPadding, Math.min(left, window.innerWidth - pickerWidth - viewportPadding))
+      }
+      input.style.left = `${Math.round(left)}px`
+      input.style.top = `${Math.round(rect.bottom + gapY)}px`
+    }
+    input.value = ""
 
     try {
       if (typeof input.showPicker === "function") {
@@ -4240,28 +4252,41 @@ function stripEmptyGroupLines(bodyText) {
             {!isLeftCollapsed ? (
               <>
                 <button
+                  ref={readDateCreateButtonRef}
                   onClick={openReadDateCreatePicker}
-                  style={{ ...pillButton, padding: "0 10px 2px", borderRadius: 12, lineHeight: 1 }}
+                  style={{
+                    ...pillButton,
+                    height: 32,
+                    padding: "0 12px",
+                    borderRadius: 10,
+                    lineHeight: "normal",
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center"
+                  }}
                   title="일정 생성"
                   aria-label="일정 생성"
                 >
-                  일정 생성
+                  🗓 Add
                 </button>
                 <input
                   ref={readDateCreateInputRef}
                   type="date"
+                  required
                   onChange={handleReadDateCreateChange}
                   aria-label="일정 날짜 생성"
                   style={{
-                    position: "absolute",
+                    position: "fixed",
+                    left: -9999,
+                    top: -9999,
                     width: 1,
                     height: 1,
                     border: 0,
                     padding: 0,
-                    margin: -1,
+                    margin: 0,
                     overflow: "hidden",
-                    clip: "rect(0 0 0 0)",
-                    whiteSpace: "nowrap"
+                    opacity: 0,
+                    pointerEvents: "none"
                   }}
                 />
               </>
