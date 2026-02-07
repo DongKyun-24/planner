@@ -32,10 +32,12 @@ import {
   makeUniqueWindowTitle,
   replaceGroupTitleInText,
   parseDashboardBlockContent,
+  buildOrderedEntriesFromBody,
   parseBlocksAndItems,
   buildMemoOverlayLines,
   syncOverlayScroll,
   normalizePrettyAndMerge,
+  normalizeBlockOrderByTime,
   getDateKeyFromLine,
   buildCombinedRightText,
   splitCombinedRightText,
@@ -97,6 +99,7 @@ function App() {
   const rightOverlayInnerRef = useRef(null)
   const readBlockRefs = useRef(new Map())
   const clientIdRef = useRef(getClientId())
+  const endTimeSupportedRef = useRef(true)
 
   // ===== 창(캘린더) 탭 =====
   const WINDOWS_KEY = "planner-windows-v1"
@@ -304,6 +307,8 @@ function App() {
   const dayListSyncTimerRef = useRef(null)
   const dayListPendingSyncRef = useRef(null)
   const dayListSyncQueueRef = useRef(Promise.resolve())
+  const sortOrderSupportedRef = useRef(true)
+  const sortOrderSyncTimerRef = useRef(null)
 
   const [text, setText] = useState("")
   const [today, setToday] = useState(() => new Date())
@@ -360,9 +365,190 @@ function App() {
     })
   }
 
-  function buildTextFromPlans(plans, year) {
+  function parsePlanTimestampMs(value) {
+    if (value == null) return null
+    if (value instanceof Date) {
+      const ms = value.getTime()
+      return Number.isNaN(ms) ? null : ms
+    }
+    if (typeof value === "number" && Number.isFinite(value)) return value
+    const ms = Date.parse(String(value))
+    return Number.isNaN(ms) ? null : ms
+  }
+
+  function parsePlanOrderValue(value) {
+    const n = Number(value)
+    return Number.isFinite(n) ? n : null
+  }
+
+  function normalizeClockTime(value) {
+    const match = String(value ?? "")
+      .trim()
+      .match(/^(\d{1,2}):(\d{2})$/)
+    if (!match) return ""
+    const hour = Number(match[1])
+    const minute = Number(match[2])
+    if (!Number.isInteger(hour) || !Number.isInteger(minute)) return ""
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return ""
+    return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`
+  }
+
+  function parseTimeSpanToken(value) {
+    const raw = String(value ?? "").trim()
+    if (!raw) return { startTime: "", endTime: "", hasInput: false, isValid: true }
+    const single = normalizeClockTime(raw)
+    if (single) return { startTime: single, endTime: "", hasInput: true, isValid: true }
+    const match = raw.match(/^(\d{1,2}):(\d{2})\s*[~-]\s*(\d{1,2}):(\d{2})$/)
+    if (!match) return { startTime: "", endTime: "", hasInput: true, isValid: false }
+    const startTime = normalizeClockTime(`${match[1]}:${match[2]}`)
+    const endTime = normalizeClockTime(`${match[3]}:${match[4]}`)
+    if (!startTime) return { startTime: "", endTime: "", hasInput: true, isValid: false }
+    if (!endTime || endTime === startTime) return { startTime, endTime: "", hasInput: true, isValid: false }
+    return { startTime, endTime, hasInput: true, isValid: true }
+  }
+
+  function normalizePlanTimeFields(row) {
+    const parsedFromTime = parseTimeSpanToken(row?.time)
+    const explicitEnd = normalizeClockTime(row?.end_time ?? row?.endTime)
+    const startTime = parsedFromTime.startTime
+    if (!startTime) return { time: null, end_time: null }
+    if (!endTimeSupportedRef.current) return { time: startTime, end_time: null }
+    let endTime = explicitEnd || parsedFromTime.endTime
+    if (endTime && endTime === startTime) endTime = ""
+    return { time: startTime, end_time: endTime || null }
+  }
+
+  function buildTimeSpanLabel(time, endTime) {
+    const start = normalizeClockTime(time)
+    if (!start) return ""
+    const end = normalizeClockTime(endTime)
+    if (end && end !== start) return `${start}-${end}`
+    return start
+  }
+
+  function isSortOrderColumnError(error) {
+    const msg = String(error?.message ?? "").toLowerCase()
+    return msg.includes("sort_order") || (msg.includes("column") && msg.includes("sort") && msg.includes("order"))
+  }
+
+  function isEndTimeColumnError(error) {
+    const msg = String(error?.message ?? "").toLowerCase()
+    return msg.includes("end_time") || (msg.includes("column") && msg.includes("end") && msg.includes("time"))
+  }
+
+  function stripEndTimeFromRows(rows) {
+    const list = Array.isArray(rows) ? rows : []
+    return list.map((row) => {
+      const next = { ...(row ?? {}) }
+      delete next.end_time
+      return next
+    })
+  }
+
+  function stripSortOrderFromRows(rows) {
+    const list = Array.isArray(rows) ? rows : []
+    return list.map((row) => {
+      const next = { ...(row ?? {}) }
+      delete next.sort_order
+      return next
+    })
+  }
+
+  function buildPlanOrderMapFromText(sourceText, year) {
+    const map = new Map()
+    const src = String(sourceText ?? "")
+    if (!src.trim()) return map
+
+    const parsed = parseBlocksAndItems(src, year, { allowAnyYear: true })
+    for (const block of parsed.blocks) {
+      const body = src.slice(block.bodyStartPos, block.blockEndPos)
+      const normalizedBody = normalizeGroupLineNewlines(body)
+      const lines = normalizedBody.split("\n")
+      let order = 0
+
+      for (const rawLine of lines) {
+        const trimmed = rawLine.trim()
+        if (!trimmed) continue
+
+        const semicolon = parseDashboardSemicolonLine(trimmed)
+        if (semicolon) {
+          const categoryId = semicolon.group ? normalizeCategoryId(semicolon.group) : GENERAL_CATEGORY_ID
+          const timeFields = normalizePlanTimeFields({ time: semicolon.time || "" })
+          const key = buildPlanKey({
+            date: block.dateKey,
+            time: timeFields.time,
+            end_time: timeFields.end_time,
+            category_id: categoryId,
+            content: semicolon.text
+          })
+          if (!map.has(key)) map.set(key, order)
+          order++
+          continue
+        }
+
+        const emptySemicolon = parseDashboardSemicolonLine(trimmed, { allowEmptyText: true })
+        if (emptySemicolon && !emptySemicolon.text) continue
+
+        const match = trimmed.match(groupLineRegex)
+        if (match) {
+          const title = normalizeCategoryId(match[1].trim())
+          if (!title) continue
+          const items = String(match[2] ?? "")
+            .split(";")
+            .map((x) => x.trim())
+            .filter((x) => x !== "")
+          for (const item of items) {
+            const parsedItem = parseTimePrefix(item)
+            const text = parsedItem ? parsedItem.text : item
+            if (!text) continue
+            const timeFields = normalizePlanTimeFields({ time: parsedItem ? parsedItem.time : "" })
+            const key = buildPlanKey({
+              date: block.dateKey,
+              time: timeFields.time,
+              end_time: timeFields.end_time,
+              category_id: title,
+              content: text
+            })
+            if (!map.has(key)) map.set(key, order)
+            order++
+          }
+          continue
+        }
+
+        const timeLine = parseTimePrefix(trimmed)
+        if (timeLine) {
+          const timeFields = normalizePlanTimeFields({ time: timeLine.time || "" })
+          const key = buildPlanKey({
+            date: block.dateKey,
+            time: timeFields.time,
+            end_time: timeFields.end_time,
+            category_id: GENERAL_CATEGORY_ID,
+            content: timeLine.text
+          })
+          if (!map.has(key)) map.set(key, order)
+          order++
+          continue
+        }
+
+        const key = buildPlanKey({
+          date: block.dateKey,
+          time: "",
+          category_id: GENERAL_CATEGORY_ID,
+          content: trimmed
+        })
+        if (!map.has(key)) map.set(key, order)
+        order++
+      }
+    }
+
+    return map
+  }
+
+  function buildTextFromPlans(plans, year, previousText = "") {
     const yearPrefix = `${year}-`
+    const orderMap = buildPlanOrderMapFromText(previousText, year)
     const byDate = new Map()
+    let rowIndex = 0
     for (const row of plans ?? []) {
       if (row?.deleted_at) continue
       const dateKey = String(row?.date ?? "")
@@ -371,9 +557,32 @@ function App() {
       if (!content) continue
       const category = normalizeCategoryId(String(row?.category_id ?? "").trim())
       const isGeneral = isGeneralCategoryId(category)
-      const time = String(row?.time ?? "").trim()
+      const normalizedTime = normalizePlanTimeFields(row)
+      const time = normalizedTime.time ?? ""
+      const endTime = normalizedTime.end_time ?? ""
+      const timeLabel = buildTimeSpanLabel(time, endTime)
+      const categoryId = isGeneral ? GENERAL_CATEGORY_ID : category
+      const sortOrder = parsePlanOrderValue(row?.sort_order ?? row?.sortOrder ?? row?.order)
+      const createdAtMs = parsePlanTimestampMs(row?.created_at ?? row?.createdAt)
+      const updatedAtMs = parsePlanTimestampMs(row?.updated_at ?? row?.updatedAt)
+      const key = buildPlanKey({ date: dateKey, time, end_time: endTime, category_id: categoryId, content })
+      const preservedOrder = orderMap.has(key) ? orderMap.get(key) : null
       const bucket = byDate.get(dateKey) ?? []
-      bucket.push({ time, category: isGeneral ? "" : category, content, isGeneral })
+      bucket.push({
+        time,
+        endTime,
+        timeLabel,
+        category: isGeneral ? "" : category,
+        categoryId,
+        content,
+        isGeneral,
+        order: preservedOrder,
+        sortOrder,
+        createdAtMs,
+        updatedAtMs,
+        id: row?.id,
+        idx: rowIndex++
+      })
       byDate.set(dateKey, bucket)
     }
 
@@ -386,16 +595,37 @@ function App() {
         const ta = timeToMinutes(a.time)
         const tb = timeToMinutes(b.time)
         if (ta !== tb) return ta - tb
-        const ca = a.category.localeCompare(b.category, "ko")
-        if (ca !== 0) return ca
-        const aNum = /^\d+$/.test(a.content) ? Number(a.content) : null
-        const bNum = /^\d+$/.test(b.content) ? Number(b.content) : null
-        if (aNum != null && bNum != null) return aNum - bNum
-        return a.content.localeCompare(b.content, "ko")
+        const oa = a.sortOrder ?? a.order
+        const ob = b.sortOrder ?? b.order
+        if (oa != null || ob != null) {
+          if (oa == null) return 1
+          if (ob == null) return -1
+          if (oa !== ob) return oa - ob
+        }
+        const ca = a.createdAtMs
+        const cb = b.createdAtMs
+        if (ca != null || cb != null) {
+          if (ca == null) return 1
+          if (cb == null) return -1
+          if (ca !== cb) return ca - cb
+        }
+        const ua = a.updatedAtMs
+        const ub = b.updatedAtMs
+        if (ua != null || ub != null) {
+          if (ua == null) return 1
+          if (ub == null) return -1
+          if (ua !== ub) return ua - ub
+        }
+        const ia = a.id != null ? String(a.id) : ""
+        const ib = b.id != null ? String(b.id) : ""
+        if (ia && ib && ia !== ib) return ia.localeCompare(ib, "en")
+        if (ia && !ib) return -1
+        if (!ia && ib) return 1
+        return (a.idx ?? 0) - (b.idx ?? 0)
       })
       const lines = items.map((item) => {
-        if (item.isGeneral) return item.time ? `${item.time};${item.content}` : item.content
-        return item.time ? `${item.time};@${item.category};${item.content}` : `@${item.category};${item.content}`
+        if (item.isGeneral) return item.timeLabel ? `${item.timeLabel};${item.content}` : item.content
+        return item.timeLabel ? `${item.timeLabel};@${item.category};${item.content}` : `@${item.category};${item.content}`
       })
       return lines.length > 0 ? `${header}\n${lines.join("\n")}` : header
     })
@@ -407,40 +637,20 @@ function App() {
     const parsed = parseBlocksAndItems(sourceText ?? "", year)
     for (const block of parsed.blocks) {
       const body = (sourceText ?? "").slice(block.bodyStartPos, block.blockEndPos)
-      const parsedBlock = parseDashboardBlockContent(body)
-      for (const line of parsedBlock.general ?? []) {
-        const text = String(line ?? "").trim()
+      const entries = buildOrderedEntriesFromBody(body)
+      for (const entry of entries) {
+        const text = String(entry?.text ?? "").trim()
         if (!text) continue
+        const title = normalizeCategoryId(String(entry?.title ?? "").trim())
+        const timeFields = normalizePlanTimeFields({ time: entry?.time ? String(entry.time).trim() : "" })
         out.push({
           date: block.dateKey,
-          time: null,
-          category_id: GENERAL_CATEGORY_ID,
-          content: text
+          time: timeFields.time,
+          end_time: timeFields.end_time,
+          category_id: title || GENERAL_CATEGORY_ID,
+          content: text,
+          sort_order: entry?.order ?? 0
         })
-      }
-      for (const item of parsedBlock.timed ?? []) {
-        const text = String(item.text ?? "").trim()
-        if (!text) continue
-        out.push({
-          date: block.dateKey,
-          time: item.time ? String(item.time).trim() : null,
-          category_id: GENERAL_CATEGORY_ID,
-          content: text
-        })
-      }
-      for (const group of parsedBlock.groups ?? []) {
-        const title = normalizeCategoryId(String(group.title ?? "").trim())
-        if (!title) continue
-        for (const item of group.items ?? []) {
-          const text = String(item.text ?? "").trim()
-          if (!text) continue
-          out.push({
-            date: block.dateKey,
-            time: item.time ? String(item.time).trim() : null,
-            category_id: title,
-            content: text
-          })
-        }
       }
     }
     return out
@@ -448,11 +658,13 @@ function App() {
 
   function buildPlanKey(row) {
     const date = String(row?.date ?? "").trim()
-    const time = String(row?.time ?? "").trim()
+    const normalizedTime = normalizePlanTimeFields(row)
+    const time = String(normalizedTime.time ?? "").trim()
+    const endTime = String(normalizedTime.end_time ?? "").trim()
     let category = normalizeCategoryId(String(row?.category_id ?? row?.categoryId ?? "").trim())
     if (!category) category = GENERAL_CATEGORY_ID
     const content = String(row?.content ?? row?.text ?? "").trim()
-    return `${date}|${time}|${category}|${content}`
+    return `${date}|${time}|${endTime}|${category}|${content}`
   }
 
   function isUuid(value) {
@@ -476,10 +688,11 @@ function App() {
     const rows = (data ?? []).map((row) => {
       let normalized = normalizeCategoryId(row?.category_id)
       if (!normalized) normalized = GENERAL_CATEGORY_ID
+      const timeFields = normalizePlanTimeFields(row)
       if (normalized && normalized !== row?.category_id) {
         updates.push({ id: row.id, category_id: normalized })
       }
-      return { ...row, category_id: normalized }
+      return { ...row, category_id: normalized, time: timeFields.time, end_time: timeFields.end_time }
     })
     if (updates.length > 0) {
       await Promise.all(
@@ -676,6 +889,7 @@ function App() {
     const userId = session.user.id
     pushSyncBackup(userId, year, sourceText ?? "", "pre-sync")
     const desired = extractPlansFromText(sourceText ?? "", year)
+    const baseMs = Date.now()
     const desiredMap = new Map()
     for (const row of desired) {
       const key = buildPlanKey(row)
@@ -706,11 +920,31 @@ function App() {
     const toInsert = []
     for (const [key, row] of desiredMap.entries()) {
       if (currentMap.has(key)) continue
+      const desiredOrder = Number.isFinite(row?.sort_order) ? row.sort_order : 0
       toInsert.push({
         ...row,
         user_id: userId,
         client_id: clientIdRef.current,
-        updated_at: new Date().toISOString()
+        updated_at: new Date(baseMs + desiredOrder).toISOString()
+      })
+    }
+
+    const toUpdate = []
+    for (const [key, row] of desiredMap.entries()) {
+      const currentRow = currentMap.get(key)
+      if (!currentRow?.id) continue
+      const desiredOrder = Number(row?.sort_order)
+      if (!Number.isFinite(desiredOrder)) continue
+      const currentOrder = Number(
+        currentRow?.sort_order ?? currentRow?.sortOrder ?? currentRow?.order ?? Number.NaN
+      )
+      if (Number.isFinite(currentOrder) && desiredOrder === currentOrder) continue
+      toUpdate.push({
+        id: currentRow.id,
+        user_id: userId,
+        sort_order: desiredOrder,
+        updated_at: new Date(baseMs + desiredOrder).toISOString(),
+        client_id: clientIdRef.current
       })
     }
 
@@ -768,91 +1002,97 @@ function App() {
 
     let insertedRows = []
     if (toInsert.length > 0) {
-      const { data, error: insertError } = await supabase.from("plans").insert(toInsert).select()
+      const rowsForInsert = endTimeSupportedRef.current ? toInsert : stripEndTimeFromRows(toInsert)
+      const insertPayload = sortOrderSupportedRef.current ? rowsForInsert : stripSortOrderFromRows(rowsForInsert)
+      let { data, error: insertError } = await supabase.from("plans").insert(insertPayload).select()
+      if (insertError && isEndTimeColumnError(insertError)) {
+        endTimeSupportedRef.current = false
+        const retryRows = stripEndTimeFromRows(toInsert)
+        const retryPayload = sortOrderSupportedRef.current ? retryRows : stripSortOrderFromRows(retryRows)
+        const retry = await supabase.from("plans").insert(retryPayload).select()
+        data = retry.data
+        insertError = retry.error
+      }
+      if (insertError && isSortOrderColumnError(insertError)) {
+        sortOrderSupportedRef.current = false
+        const retryRows = endTimeSupportedRef.current ? toInsert : stripEndTimeFromRows(toInsert)
+        const retry = await supabase.from("plans").insert(stripSortOrderFromRows(retryRows)).select()
+        data = retry.data
+        insertError = retry.error
+      }
       if (insertError) {
         console.error("insert plans", insertError)
         return
       }
       insertedRows = (data ?? []).map((row) => ({
         ...row,
+        ...normalizePlanTimeFields(row),
         category_id: normalizeCategoryId(row?.category_id)
       }))
+    }
+
+    if (toUpdate.length > 0 && sortOrderSupportedRef.current) {
+      const chunkSize = 200
+      for (let i = 0; i < toUpdate.length; i += chunkSize) {
+        const chunk = toUpdate.slice(i, i + chunkSize)
+        const { error: updateError } = await supabase.from("plans").upsert(chunk, { onConflict: "id" })
+        if (updateError) {
+          if (isSortOrderColumnError(updateError)) {
+            sortOrderSupportedRef.current = false
+          } else {
+            console.error("update plan order", updateError)
+          }
+          break
+        }
+      }
     }
 
     lastCloudSyncRef.current = { year, text: sourceText ?? "" }
     setRemotePlans((prev) => {
       const removedIds = new Set(toDelete.map((row) => row.id))
-      const base = (prev ?? []).filter((row) => !removedIds.has(row?.id))
+      const updateMap = new Map(toUpdate.map((row) => [row.id, row]))
+      const base = (prev ?? [])
+        .filter((row) => !removedIds.has(row?.id))
+        .map((row) => {
+          const update = updateMap.get(row?.id)
+          if (!update) return row
+          return { ...row, sort_order: update.sort_order, updated_at: update.updated_at, client_id: update.client_id }
+        })
       return insertedRows.length > 0 ? [...base, ...insertedRows] : base
     })
   }
 
   function extractPlansFromDayBody(bodyText, dateKey, scopedWindowTitle = null) {
     const out = []
-    const parsedBlock = parseDashboardBlockContent(bodyText ?? "")
+    const entries = buildOrderedEntriesFromBody(bodyText ?? "")
     const scopedTitle = scopedWindowTitle ? normalizeCategoryId(scopedWindowTitle) : null
 
-    if (scopedTitle) {
-      for (const line of parsedBlock.general ?? []) {
-        const text = String(line ?? "").trim()
-        if (!text) continue
-        out.push({ date: dateKey, time: null, category_id: scopedTitle, content: text })
-      }
-      for (const item of parsedBlock.timed ?? []) {
-        const text = String(item?.text ?? "").trim()
-        if (!text) continue
+    for (const entry of entries) {
+      const text = String(entry?.text ?? "").trim()
+      if (!text) continue
+      const entryTitle = normalizeCategoryId(String(entry?.title ?? "").trim())
+      const timeFields = normalizePlanTimeFields({ time: entry?.time ? String(entry.time).trim() : "" })
+      if (scopedTitle) {
+        if (entryTitle && entryTitle !== scopedTitle) continue
         out.push({
           date: dateKey,
-          time: item?.time ? String(item.time).trim() : null,
+          time: timeFields.time,
+          end_time: timeFields.end_time,
           category_id: scopedTitle,
-          content: text
+          content: text,
+          sort_order: entry?.order ?? 0
         })
+        continue
       }
-      for (const group of parsedBlock.groups ?? []) {
-        const groupTitle = normalizeCategoryId(String(group?.title ?? "").trim())
-        if (!groupTitle || groupTitle !== scopedTitle) continue
-        for (const item of group.items ?? []) {
-          const text = String(item?.text ?? "").trim()
-          if (!text) continue
-          out.push({
-            date: dateKey,
-            time: item?.time ? String(item.time).trim() : null,
-            category_id: scopedTitle,
-            content: text
-          })
-        }
-      }
-      return out
-    }
 
-    for (const line of parsedBlock.general ?? []) {
-      const text = String(line ?? "").trim()
-      if (!text) continue
-      out.push({ date: dateKey, time: null, category_id: GENERAL_CATEGORY_ID, content: text })
-    }
-    for (const item of parsedBlock.timed ?? []) {
-      const text = String(item?.text ?? "").trim()
-      if (!text) continue
       out.push({
         date: dateKey,
-        time: item?.time ? String(item.time).trim() : null,
-        category_id: GENERAL_CATEGORY_ID,
-        content: text
+        time: timeFields.time,
+        end_time: timeFields.end_time,
+        category_id: entryTitle || GENERAL_CATEGORY_ID,
+        content: text,
+        sort_order: entry?.order ?? 0
       })
-    }
-    for (const group of parsedBlock.groups ?? []) {
-      const title = normalizeCategoryId(String(group?.title ?? "").trim())
-      if (!title) continue
-      for (const item of group.items ?? []) {
-        const text = String(item?.text ?? "").trim()
-        if (!text) continue
-        out.push({
-          date: dateKey,
-          time: item?.time ? String(item.time).trim() : null,
-          category_id: title,
-          content: text
-        })
-      }
     }
     return out
   }
@@ -867,6 +1107,7 @@ function App() {
     const scopedTitle = scopedWindow ? normalizeCategoryId(scopedWindow.title) : null
 
     const desired = extractPlansFromDayBody(bodyText ?? "", dateKey, scopedTitle)
+    const baseMs = Date.now()
     const desiredMap = new Map()
     for (const row of desired) {
       const key = buildPlanKey(row)
@@ -902,11 +1143,31 @@ function App() {
     const toInsert = []
     for (const [key, row] of desiredMap.entries()) {
       if (currentMap.has(key)) continue
+      const desiredOrder = Number.isFinite(row?.sort_order) ? row.sort_order : 0
       toInsert.push({
         ...row,
         user_id: userId,
         client_id: clientIdRef.current,
-        updated_at: new Date().toISOString()
+        updated_at: new Date(baseMs + desiredOrder).toISOString()
+      })
+    }
+
+    const toUpdate = []
+    for (const [key, row] of desiredMap.entries()) {
+      const currentRow = currentMap.get(key)
+      if (!currentRow?.id) continue
+      const desiredOrder = Number(row?.sort_order)
+      if (!Number.isFinite(desiredOrder)) continue
+      const currentOrder = Number(
+        currentRow?.sort_order ?? currentRow?.sortOrder ?? currentRow?.order ?? Number.NaN
+      )
+      if (Number.isFinite(currentOrder) && desiredOrder === currentOrder) continue
+      toUpdate.push({
+        id: currentRow.id,
+        user_id: userId,
+        sort_order: desiredOrder,
+        updated_at: new Date(baseMs + desiredOrder).toISOString(),
+        client_id: clientIdRef.current
       })
     }
 
@@ -934,10 +1195,41 @@ function App() {
     }
 
     if (toInsert.length > 0) {
-      const { error: insertError } = await supabase.from("plans").insert(toInsert)
+      const rowsForInsert = endTimeSupportedRef.current ? toInsert : stripEndTimeFromRows(toInsert)
+      const insertPayload = sortOrderSupportedRef.current ? rowsForInsert : stripSortOrderFromRows(rowsForInsert)
+      let { error: insertError } = await supabase.from("plans").insert(insertPayload)
+      if (insertError && isEndTimeColumnError(insertError)) {
+        endTimeSupportedRef.current = false
+        const retryRows = stripEndTimeFromRows(toInsert)
+        const retryPayload = sortOrderSupportedRef.current ? retryRows : stripSortOrderFromRows(retryRows)
+        const retry = await supabase.from("plans").insert(retryPayload)
+        insertError = retry.error
+      }
+      if (insertError && isSortOrderColumnError(insertError)) {
+        sortOrderSupportedRef.current = false
+        const retryRows = endTimeSupportedRef.current ? toInsert : stripEndTimeFromRows(toInsert)
+        const retry = await supabase.from("plans").insert(stripSortOrderFromRows(retryRows))
+        insertError = retry.error
+      }
       if (insertError) {
         console.error("insert day plans", insertError)
         return
+      }
+    }
+
+    if (toUpdate.length > 0 && sortOrderSupportedRef.current) {
+      const chunkSize = 200
+      for (let i = 0; i < toUpdate.length; i += chunkSize) {
+        const chunk = toUpdate.slice(i, i + chunkSize)
+        const { error: updateError } = await supabase.from("plans").upsert(chunk, { onConflict: "id" })
+        if (updateError) {
+          if (isSortOrderColumnError(updateError)) {
+            sortOrderSupportedRef.current = false
+          } else {
+            console.error("update day plan order", updateError)
+          }
+          break
+        }
       }
     }
 
@@ -982,6 +1274,71 @@ function App() {
       dayListSyncTimerRef.current = null
     }
     runPendingDayListSyncNow()
+  }
+
+  async function syncSortOrderFromText(sourceText, year) {
+    if (!supabase || !session?.user?.id) return
+    if (!sortOrderSupportedRef.current) return
+    const userId = session.user.id
+    const orderMap = buildPlanOrderMapFromText(sourceText ?? "", year)
+    if (orderMap.size === 0) return
+
+    const yearPrefix = `${year}-`
+    const current = (remotePlans ?? []).filter(
+      (row) =>
+        row &&
+        row.user_id === userId &&
+        !row.deleted_at &&
+        String(row?.date ?? "").startsWith(yearPrefix)
+    )
+    if (current.length === 0) return
+
+    const baseMs = Date.now()
+    const updates = []
+    for (const row of current) {
+      const key = buildPlanKey(row)
+      if (!orderMap.has(key)) continue
+      const desiredOrder = orderMap.get(key)
+      if (!Number.isFinite(desiredOrder)) continue
+      const currentOrder = Number(
+        row?.sort_order ?? row?.sortOrder ?? row?.order ?? Number.NaN
+      )
+      if (Number.isFinite(currentOrder) && desiredOrder === currentOrder) continue
+      updates.push({
+        id: row.id,
+        user_id: userId,
+        sort_order: desiredOrder,
+        updated_at: new Date(baseMs + desiredOrder).toISOString(),
+        client_id: clientIdRef.current
+      })
+    }
+    if (updates.length === 0) return
+
+    const chunkSize = 200
+    try {
+      for (let i = 0; i < updates.length; i += chunkSize) {
+        const chunk = updates.slice(i, i + chunkSize)
+        const { error } = await supabase.from("plans").upsert(chunk, { onConflict: "id" })
+        if (error) {
+          if (isSortOrderColumnError(error)) {
+            sortOrderSupportedRef.current = false
+          } else {
+            console.error("sync sort_order", error)
+          }
+          return
+        }
+      }
+      setRemotePlans((prev) => {
+        const updateMap = new Map(updates.map((row) => [row.id, row]))
+        return (prev ?? []).map((row) => {
+          const update = updateMap.get(row?.id)
+          if (!update) return row
+          return { ...row, sort_order: update.sort_order, updated_at: update.updated_at, client_id: update.client_id }
+        })
+      })
+    } catch (err) {
+      console.error("sync sort_order", err)
+    }
   }
 
   function scheduleCloudSync(sourceText, year) {
@@ -1292,7 +1649,11 @@ function App() {
     if (!forceApply && isEditingLeftMemo) return
     const last = lastCloudSyncRef.current
     if (ENABLE_WEB_TEXT_PLAN_SYNC && !forceApply && last.year === baseYear && last.text !== textRef.current) return
-    const nextText = buildTextFromPlans(remotePlans, baseYear)
+    const previousText = getWindowMemoTextSync(baseYear, "all") ?? textRef.current ?? ""
+    if (!forceApply && (remotePlans ?? []).length === 0 && previousText.trim()) {
+      return
+    }
+    const nextText = buildTextFromPlans(remotePlans, baseYear, previousText)
     if (nextText === textRef.current) {
       if (forceApply) {
         lastCloudSyncRef.current = { year: baseYear, text: nextText }
@@ -1310,6 +1671,7 @@ function App() {
       applyingRemoteRef.current = false
     }, 0)
   }, [remotePlans, baseYear, session?.user?.id, remoteLoaded, isEditingLeftMemo])
+
   const [editingWindowId, setEditingWindowId] = useState(null)
   const [deleteConfirm, setDeleteConfirm] = useState(null)
   const titleInputRef = useRef(null)
@@ -1738,6 +2100,16 @@ function App() {
   const windowTitleRank = useMemo(() => {
     return new Map(windowTitlesOrder.map((title, index) => [title, index]))
   }, [windowTitlesOrder])
+  const windowColorByTitle = useMemo(() => {
+    const map = new Map()
+    for (const w of windows ?? []) {
+      if (!w || w.id === "all") continue
+      const title = String(w.title ?? "").trim()
+      if (!title) continue
+      map.set(title, typeof w.color === "string" ? w.color : "#999")
+    }
+    return map
+  }, [windows])
 
   function scheduleRightSaveUnsuppress() {
     if (typeof window === "undefined") {
@@ -2342,6 +2714,7 @@ function stripEmptyGroupLines(bodyText) {
     }
 
     nextAll = normalizePrettyAndMerge(nextAll, baseYear)
+    nextAll = normalizeBlockOrderByTime(nextAll, baseYear, { allowAnyYear: true })
     setWindowMemoTextSync(baseYear, "all", nextAll)
     if (activeWindowId === "all") updateEditorText(nextAll)
     setDashboardSourceTick((x) => x + 1)
@@ -2371,6 +2744,7 @@ function stripEmptyGroupLines(bodyText) {
     }
 
     nextAll = normalizePrettyAndMerge(nextAll, baseYear)
+    nextAll = normalizeBlockOrderByTime(nextAll, baseYear, { allowAnyYear: true })
     setWindowMemoTextSync(baseYear, "all", nextAll)
     if (activeWindowId === "all") updateEditorText(nextAll)
     setDashboardSourceTick((x) => x + 1)
@@ -2673,11 +3047,20 @@ function stripEmptyGroupLines(bodyText) {
     for (const block of dashboardBlocksSource) {
       const body = dashboardSourceText.slice(block.bodyStartPos, block.blockEndPos)
       const parsedBlock = parseDashboardBlockContent(body)
+      const entries = buildOrderedEntriesFromBody(body)
       const filteredGroups = allowedDashboardGroupTitles
         ? parsedBlock.groups.filter((group) => allowedDashboardGroupTitles.has(group.title))
         : parsedBlock.groups
-      if (parsedBlock.general.length === 0 && filteredGroups.length === 0 && parsedBlock.timed.length === 0) continue
-      map[block.dateKey] = { general: parsedBlock.general, groups: filteredGroups, timed: parsedBlock.timed }
+      const filteredEntries = allowedDashboardGroupTitles
+        ? entries.filter((entry) => !entry.title || allowedDashboardGroupTitles.has(entry.title))
+        : entries
+      if (filteredEntries.length === 0) continue
+      map[block.dateKey] = {
+        general: parsedBlock.general,
+        groups: filteredGroups,
+        timed: parsedBlock.timed,
+        entries: filteredEntries
+      }
     }
     return map
   }, [dashboardBlocksSource, dashboardSourceText, allowedDashboardGroupTitles])
@@ -2701,7 +3084,8 @@ function stripEmptyGroupLines(bodyText) {
         dateKey: block.dateKey,
         general: parsedBlock.general,
         groups: orderedGroups,
-        timed: parsedBlock.timed
+        timed: parsedBlock.timed,
+        entries: parsedBlock.entries ?? null
       })
     }
     out.sort((a, b) => keyToTime(a.dateKey) - keyToTime(b.dateKey))
@@ -2787,57 +3171,38 @@ function stripEmptyGroupLines(bodyText) {
       for (const block of dashboardBlocksSource) {
         const parsedBlock = dashboardByDate[block.dateKey]
         if (!parsedBlock) continue
-        const bucket = []
-        // general lines first (colorless)
-        for (const line of parsedBlock.general) {
-          if (!line) continue
-          bucket.push({
-            id: `${block.dateKey}-general-${bucket.length}`,
-            time: "",
-            text: line,
-            color: "#999",
-            sourceTitle: ""
-          })
-        }
-        for (let idx = 0; idx < parsedBlock.timed.length; idx++) {
-          const item = parsedBlock.timed[idx]
-          const text = (item.text ?? "").trim()
+        const entries = parsedBlock.entries ?? []
+        const timedItems = []
+        const noTimeItems = []
+        for (const entry of entries) {
+          const text = String(entry?.text ?? "").trim()
           if (!text) continue
-          bucket.push({
-            id: `${block.dateKey}-timed-${idx}`,
-            time: item.time || "",
+          const title = String(entry?.title ?? "").trim()
+          if (allowedDashboardGroupTitles && title && !allowedDashboardGroupTitles.has(title)) continue
+          const color = title ? windowColorByTitle.get(title) || "#999" : "#999"
+          const order = Number.isFinite(entry?.order) ? entry.order : 0
+          const base = {
+            id: `${block.dateKey}-${title || "general"}-${order}`,
+            time: entry?.time ? String(entry.time).trim() : "",
             text,
-            color: "#999",
-            sourceTitle: ""
-          })
-        }
-        const orderedGroups = parsedBlock.groups
-          .map((group, idx) => ({ group, idx }))
-          .sort((a, b) => {
-            const idxA = windowTitleRank.get(a.group.title)
-            const idxB = windowTitleRank.get(b.group.title)
-            const rankA = idxA != null ? idxA : Number.MAX_SAFE_INTEGER
-            const rankB = idxB != null ? idxB : Number.MAX_SAFE_INTEGER
-            if (rankA !== rankB) return rankA - rankB
-            return a.idx - b.idx
-          })
-          .map((entry) => entry.group)
-        for (const group of orderedGroups) {
-          const window = windows.find((w) => w.title === group.title)
-          const color = window?.color ?? "#aaa"
-          for (let idx = 0; idx < group.items.length; idx++) {
-            const item = group.items[idx]
-            const text = (item.text ?? "").trim()
-            if (!text) continue
-            bucket.push({
-              id: `${block.dateKey}-${group.title}-${idx}`,
-              time: item.time || "",
-              text,
-              color,
-              sourceTitle: group.title
-            })
+            color,
+            sourceTitle: title
           }
+          if (base.time) timedItems.push({ ...base, order })
+          else noTimeItems.push({ ...base, order })
         }
+        timedItems.sort((a, b) => {
+          const ta = timeToMinutes(a.time)
+          const tb = timeToMinutes(b.time)
+          if (ta !== tb) return ta - tb
+          return (a.order ?? 0) - (b.order ?? 0)
+        })
+        noTimeItems.sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+        const bucket = [...timedItems, ...noTimeItems].map((item) => {
+          const next = { ...item }
+          delete next.order
+          return next
+        })
         if (bucket.length > 0) out[block.dateKey] = bucket
       }
       return out
@@ -2866,7 +3231,18 @@ function stripEmptyGroupLines(bodyText) {
       out[key] = (out[key] ?? []).concat(bucket)
     }
     return out
-  }, [activeWindowId, baseYear, dashboardBlocksSource, dashboardByDate, parsed.items, tabEditText, windowTitleRank, windows])
+  }, [
+    activeWindowId,
+    baseYear,
+    dashboardBlocksSource,
+    dashboardByDate,
+    parsed.items,
+    tabEditText,
+    windowTitleRank,
+    windowColorByTitle,
+    windows,
+    allowedDashboardGroupTitles
+  ])
 
   const collapsedForActive = dashboardCollapsedByWindow[activeWindowId] ?? {}
 
@@ -2988,6 +3364,7 @@ function stripEmptyGroupLines(bodyText) {
   const [dayListModal, setDayListModal] = useState(null)
   const [dayListEditText, setDayListEditText] = useState("")
   const [dayListMode, setDayListMode] = useState("read")
+  const dayListDirtyRef = useRef(false)
   const dayListView = useMemo(() => {
     if (!dayListModal) return null
     return parseDashboardBlockContent(dayListEditText)
@@ -2996,47 +3373,27 @@ function stripEmptyGroupLines(bodyText) {
     if (!dayListView) return null
     const isAll = activeWindowId === "all"
     if (isAll) {
-      const filteredGroups = allowedDashboardGroupTitles
-        ? dayListView.groups.filter((group) => allowedDashboardGroupTitles.has(group.title))
-        : dayListView.groups
-      const orderedGroups = filteredGroups
-        .map((group, idx) => ({ group, idx }))
-        .sort((a, b) => {
-          const idxA = windowTitleRank.get(a.group.title)
-          const idxB = windowTitleRank.get(b.group.title)
-          const rankA = idxA != null ? idxA : Number.MAX_SAFE_INTEGER
-          const rankB = idxB != null ? idxB : Number.MAX_SAFE_INTEGER
-          if (rankA !== rankB) return rankA - rankB
-          return a.idx - b.idx
-        })
-        .map((entry) => entry.group)
-      const general = dayListView.general.filter((line) => String(line ?? "").trim())
-      const noTimeGroupItems = []
+      const entries = buildOrderedEntriesFromBody(dayListEditText)
+      const filtered = allowedDashboardGroupTitles
+        ? entries.filter((entry) => !entry.title || allowedDashboardGroupTitles.has(entry.title))
+        : entries
       const timedItems = []
-      for (const group of orderedGroups) {
-        for (const item of group.items ?? []) {
-          const text = (item.text ?? "").trim()
-          if (!text) continue
-          const entry = { time: item.time || "", text, title: group.title }
-          if (entry.time) timedItems.push(entry)
-          else noTimeGroupItems.push(entry)
-        }
+      const noTimeItems = []
+      for (const entry of filtered) {
+        const text = String(entry.text ?? "").trim()
+        if (!text) continue
+        const item = { time: entry.time || "", text, title: entry.title || "", order: entry.order ?? 0 }
+        if (item.time) timedItems.push(item)
+        else noTimeItems.push(item)
       }
-      const timedNoGroup = (dayListView.timed ?? [])
-        .map((item) => ({
-          time: item.time || "",
-          text: (item.text ?? "").trim(),
-          title: ""
-        }))
-        .filter((item) => item.text)
-      timedItems.push(...timedNoGroup)
       timedItems.sort((a, b) => {
         const ta = timeToMinutes(a.time)
         const tb = timeToMinutes(b.time)
         if (ta !== tb) return ta - tb
-        return 0
+        return (a.order ?? 0) - (b.order ?? 0)
       })
-      return { isAll, general, noTimeGroupItems, timedItems }
+      noTimeItems.sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+      return { isAll, timedItems, noTimeItems }
     }
     const noTimeItems = dayListView.general.filter((line) => String(line ?? "").trim())
     const timedItems = (dayListView.timed ?? [])
@@ -3047,7 +3404,7 @@ function stripEmptyGroupLines(bodyText) {
       .filter((item) => item.text)
     timedItems.sort((a, b) => timeToMinutes(a.time) - timeToMinutes(b.time))
     return { isAll, noTimeItems, timedItems }
-  }, [dayListView, activeWindowId, windowTitleRank, allowedDashboardGroupTitles])
+  }, [dayListView, dayListEditText, activeWindowId, windowTitleRank, allowedDashboardGroupTitles])
 
   const setReadBlockRef = useCallback((dateKey) => {
     return (el) => {
@@ -3071,13 +3428,59 @@ function stripEmptyGroupLines(bodyText) {
   useEffect(() => {
     if (!dayListModal) {
       setDayListEditText("")
+      dayListDirtyRef.current = false
       return
     }
     const sourceText = activeWindowId === "all" ? textRef.current ?? text : tabEditText ?? ""
     const body = getDateBlockBodyText(sourceText, baseYear, dayListModal.key)
     setDayListEditText(body)
+    dayListDirtyRef.current = false
     setDayListMode("read")
   }, [dayListModal ? dayListModal.key : null, baseYear, activeWindowId])
+
+  useEffect(() => {
+    if (!dayListModal) return
+    if (dayListMode === "edit" && dayListDirtyRef.current) return
+    const sourceText = activeWindowId === "all" ? textRef.current ?? text : tabEditText ?? ""
+    const body = getDateBlockBodyText(sourceText, baseYear, dayListModal.key)
+    if (body === dayListEditText) return
+    dayListDirtyRef.current = false
+    setDayListEditText(body)
+  }, [text, tabEditText, baseYear, activeWindowId, dayListModal ? dayListModal.key : null, dayListMode])
+
+  const handleDayListEditTextChange = useCallback((next) => {
+    dayListDirtyRef.current = true
+    setDayListEditText(next)
+  }, [])
+
+  useEffect(() => {
+    if (!session?.user?.id || !remoteLoaded) return
+    if (isEditingLeftMemo) return
+    if (dayListModal && dayListMode === "edit" && dayListDirtyRef.current) return
+    if (sortOrderSyncTimerRef.current) clearTimeout(sortOrderSyncTimerRef.current)
+    const sourceText =
+      activeWindowId === "all"
+        ? textRef.current ?? text
+        : getWindowMemoTextSync(baseYear, "all") ?? textRef.current ?? text
+    sortOrderSyncTimerRef.current = setTimeout(() => {
+      syncSortOrderFromText(sourceText, baseYear)
+    }, 600)
+    return () => {
+      if (sortOrderSyncTimerRef.current) {
+        clearTimeout(sortOrderSyncTimerRef.current)
+        sortOrderSyncTimerRef.current = null
+      }
+    }
+  }, [
+    text,
+    baseYear,
+    session?.user?.id,
+    remoteLoaded,
+    isEditingLeftMemo,
+    dayListModal ? dayListModal.key : null,
+    dayListMode,
+    activeWindowId
+  ])
 
   useEffect(() => {
     if (!isMainMemoReadOnly) return
@@ -3103,7 +3506,6 @@ function stripEmptyGroupLines(bodyText) {
     if (!dayListModal) return
     if (canUseWebRowPlanEdit) {
       enqueueDayListSync(dayListModal.key, nextBody, activeWindowId)
-      return
     }
     if (isScheduleReadOnly) return
     const isAll = activeWindowId === "all"
@@ -3521,6 +3923,11 @@ function stripEmptyGroupLines(bodyText) {
         nextTabText = cleaned.newText
         changed = true
       }
+      const reordered = normalizeBlockOrderByTime(nextTabText, baseYear, { allowAnyYear: true })
+      if (reordered !== nextTabText) {
+        nextTabText = reordered
+        changed = true
+      }
       if (changed) {
         setTabEditText(nextTabText)
         setWindowMemoTextSync(baseYear, activeWindowId, nextTabText)
@@ -3540,6 +3947,7 @@ function stripEmptyGroupLines(bodyText) {
     const cleaned = removeAllEmptyBlocks(normalized, baseYear, { allowAnyYear: true })
     if (cleaned.changed) normalized = cleaned.newText
     normalized = normalizePrettyAndMerge(normalized, baseYear, { allowAnyYear: true })
+    normalized = normalizeBlockOrderByTime(normalized, baseYear, { allowAnyYear: true })
 
     if (normalized !== current) {
       updateEditorText(normalized)
@@ -4039,6 +4447,7 @@ function stripEmptyGroupLines(bodyText) {
   function closeDayListModal() {
     flushPendingDayListSync()
     setDayListModal(null)
+    dayListDirtyRef.current = false
   }
 
   function toggleLeftMemo() {
@@ -4976,7 +5385,7 @@ function stripEmptyGroupLines(bodyText) {
         dayListMode={dayListMode}
         setDayListMode={setDayListMode}
         dayListEditText={dayListEditText}
-        setDayListEditText={setDayListEditText}
+        setDayListEditText={handleDayListEditTextChange}
         applyDayListEdit={applyDayListEdit}
         dayListReadItems={dayListReadItems}
         memoFontPx={memoFontPx}
