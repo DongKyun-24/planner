@@ -28,6 +28,7 @@ export default function MemoReadView({
   return (
     <>
       {blocks.map((block) => {
+        if (!block?.dateKey) return null
         const { y, m, d } = keyToYMD(block.dateKey)
         const header = buildHeaderLine(y, m, d)
         const isCollapsed = Boolean(collapsedForActive[block.dateKey])
@@ -44,42 +45,72 @@ export default function MemoReadView({
         let timedItems = []
         let tabNoTimeItems = []
         let tabTimedItems = []
+        const useOrderedEntries = isAll && Array.isArray(block.entries)
+        const blockGeneral = Array.isArray(block.general) ? block.general : []
+        const blockGroups = Array.isArray(block.groups) ? block.groups : []
+        const blockTimed = Array.isArray(block.timed) ? block.timed : []
 
         if (isAll) {
-          const groups = block.groups ?? []
-          const groupItemCount = groups.reduce((sum, group) => sum + (group.items?.length ?? 0), 0)
-          hasContent = block.general.length > 0 || (block.timed?.length ?? 0) > 0 || groupItemCount > 0
-          if (hasContent) {
-            for (const group of groups) {
-              for (const item of group.items ?? []) {
+          if (useOrderedEntries) {
+            const entries = block.entries ?? []
+            hasContent = entries.length > 0
+            if (hasContent) {
+              for (const item of entries) {
                 const text = (item.text ?? "").trim()
                 if (!text) continue
                 const entry = {
                   time: item.time || "",
                   text,
-                  title: group.title,
+                  title: item.title || "",
                   order: item.order ?? 0
                 }
                 if (entry.time) timedItems.push(entry)
                 else noTimeGroupItems.push(entry)
               }
+              noTimeGroupItems.sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+              timedItems.sort((a, b) => {
+                const ta = timeToMinutes(a.time)
+                const tb = timeToMinutes(b.time)
+                if (ta !== tb) return ta - tb
+                return (a.order ?? 0) - (b.order ?? 0)
+              })
             }
-            const timedNoGroup = (block.timed ?? [])
-              .map((item) => ({
-                time: item.time || "",
-                text: (item.text ?? "").trim(),
-                title: "",
-                order: item.order ?? 0
-              }))
-              .filter((item) => item.text)
-            timedItems.push(...timedNoGroup)
-            noTimeGroupItems.sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
-            timedItems.sort((a, b) => {
-              const ta = timeToMinutes(a.time)
-              const tb = timeToMinutes(b.time)
-              if (ta !== tb) return ta - tb
-              return (a.order ?? 0) - (b.order ?? 0)
-            })
+          } else {
+            const groups = blockGroups
+            const groupItemCount = groups.reduce((sum, group) => sum + (group.items?.length ?? 0), 0)
+            hasContent = blockGeneral.length > 0 || blockTimed.length > 0 || groupItemCount > 0
+            if (hasContent) {
+              for (const group of groups) {
+                for (const item of group.items ?? []) {
+                  const text = (item.text ?? "").trim()
+                  if (!text) continue
+                  const entry = {
+                    time: item.time || "",
+                    text,
+                    title: group.title,
+                    order: item.order ?? 0
+                  }
+                  if (entry.time) timedItems.push(entry)
+                  else noTimeGroupItems.push(entry)
+                }
+              }
+              const timedNoGroup = blockTimed
+                .map((item) => ({
+                  time: item.time || "",
+                  text: (item.text ?? "").trim(),
+                  title: "",
+                  order: item.order ?? 0
+                }))
+                .filter((item) => item.text)
+              timedItems.push(...timedNoGroup)
+              noTimeGroupItems.sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+              timedItems.sort((a, b) => {
+                const ta = timeToMinutes(a.time)
+                const tb = timeToMinutes(b.time)
+                if (ta !== tb) return ta - tb
+                return (a.order ?? 0) - (b.order ?? 0)
+              })
+            }
           }
         } else {
           hasContent = Array.isArray(block.items) && block.items.length > 0
@@ -204,14 +235,15 @@ export default function MemoReadView({
                     ))}
                     {noTimeGroupItems.map((item, idx) => (
                       <div key={`${block.dateKey}-group-notime-${idx}`} style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}>
-                        [{item.title}] {item.text}
+                        {item.title ? `[${item.title}] ` : ""}{item.text}
                       </div>
                     ))}
-                    {block.general.map((line, idx) => (
-                      <div key={`${block.dateKey}-general-${idx}`} style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}>
-                        {line}
-                      </div>
-                    ))}
+                    {!useOrderedEntries &&
+                      blockGeneral.map((line, idx) => (
+                        <div key={`${block.dateKey}-general-${idx}`} style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}>
+                          {line}
+                        </div>
+                      ))}
                   </>
                 ) : (
                   <>

@@ -60,6 +60,36 @@ export default function DayListModal({
     () => buildMentionMatches(editableWindows, mentionState.query),
     [editableWindows, mentionState.query]
   )
+  const readIsAll = Boolean(dayListReadItems?.isAll)
+  const readTimedItems = useMemo(() => {
+    const items = Array.isArray(dayListReadItems?.timedItems) ? dayListReadItems.timedItems : []
+    return items
+      .map((item) => {
+        if (item && typeof item === "object") {
+          return {
+            time: String(item.time ?? "").trim(),
+            text: String(item.text ?? "").trim(),
+            title: String(item.title ?? "").trim()
+          }
+        }
+        return { time: "", text: String(item ?? "").trim(), title: "" }
+      })
+      .filter((item) => item.text)
+  }, [dayListReadItems])
+  const readNoTimeItems = useMemo(() => {
+    const items = Array.isArray(dayListReadItems?.noTimeItems) ? dayListReadItems.noTimeItems : []
+    return items
+      .map((item) => {
+        if (item && typeof item === "object") {
+          return {
+            text: String(item.text ?? "").trim(),
+            title: String(item.title ?? "").trim()
+          }
+        }
+        return { text: String(item ?? "").trim(), title: "" }
+      })
+      .filter((item) => item.text)
+  }, [dayListReadItems])
 
   function hideMentionMenu() {
     setMentionState((prev) =>
@@ -360,48 +390,42 @@ export default function DayListModal({
               cursor: readOnly ? "default" : "text"
             }}
           >
-            {dayListReadItems ? (
-              dayListReadItems.isAll ? (
-                <>
-                  {dayListReadItems.timedItems.map((item, idx) => (
-                    <div key={`daylist-timed-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
-                      {item.time} {item.title ? `[${item.title}] ` : ""}
-                      {item.text}
-                    </div>
-                  ))}
-                  {dayListReadItems.noTimeGroupItems.map((item, idx) => (
-                    <div key={`daylist-group-notime-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
-                      [{item.title}] {item.text}
-                    </div>
-                  ))}
-                  {dayListReadItems.general.map((line, idx) => (
-                    <div key={`daylist-general-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
-                      {line}
-                    </div>
-                  ))}
-                  {dayListReadItems.general.length === 0 &&
-                    dayListReadItems.noTimeGroupItems.length === 0 &&
-                    dayListReadItems.timedItems.length === 0 && <div style={{ color: ui.text2 }}>No content.</div>}
-                </>
-              ) : (
-                <>
-                  {dayListReadItems.timedItems.map((item, idx) => (
-                    <div key={`daylist-timed-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
-                      {item.time} {item.text}
-                    </div>
-                  ))}
-                  {dayListReadItems.noTimeItems.map((line, idx) => (
-                    <div key={`daylist-notime-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
-                      {line}
-                    </div>
-                  ))}
-                  {dayListReadItems.noTimeItems.length === 0 && dayListReadItems.timedItems.length === 0 && (
-                    <div style={{ color: ui.text2 }}>No content.</div>
-                  )}
-                </>
-              )
+            {readIsAll ? (
+              <>
+                {readTimedItems.map((item, idx) => (
+                  <div key={`daylist-timed-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
+                    {item.time ? `${item.time} ` : ""}
+                    {item.title ? `[${item.title}] ` : ""}
+                    {item.text}
+                  </div>
+                ))}
+                {readNoTimeItems.map((item, idx) => (
+                  <div key={`daylist-notime-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
+                    {item.title ? `[${item.title}] ` : ""}
+                    {item.text}
+                  </div>
+                ))}
+                {readNoTimeItems.length === 0 && readTimedItems.length === 0 && (
+                  <div style={{ color: ui.text2 }}>No content.</div>
+                )}
+              </>
             ) : (
-              <span style={{ color: ui.text2 }}>No content.</span>
+              <>
+                {readTimedItems.map((item, idx) => (
+                  <div key={`daylist-timed-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
+                    {item.time ? `${item.time} ` : ""}
+                    {item.text}
+                  </div>
+                ))}
+                {readNoTimeItems.map((item, idx) => (
+                  <div key={`daylist-notime-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
+                    {item.text}
+                  </div>
+                ))}
+                {readNoTimeItems.length === 0 && readTimedItems.length === 0 && (
+                  <div style={{ color: ui.text2 }}>No content.</div>
+                )}
+              </>
             )}
           </div>
         )}
