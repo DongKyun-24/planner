@@ -313,6 +313,105 @@ export function parseDashboardBlockContent(body) {
   return { general, groups, timed }
 }
 
+export function buildOrderedEntriesFromBody(bodyText) {
+  const entries = []
+  const normalized = normalizeGroupLineNewlines(bodyText ?? "")
+  const lines = normalized.split("\n")
+  let order = 0
+
+  for (const raw of lines) {
+    const trimmed = raw.trim()
+    if (!trimmed) continue
+
+    const semicolon = parseDashboardSemicolonLine(trimmed)
+    if (semicolon) {
+      const text = String(semicolon.text ?? "").trim()
+      if (!text) continue
+      entries.push({
+        time: semicolon.time || "",
+        text,
+        title: String(semicolon.group ?? "").trim(),
+        order
+      })
+      order++
+      continue
+    }
+
+    const emptySemicolon = parseDashboardSemicolonLine(trimmed, { allowEmptyText: true })
+    if (emptySemicolon && !emptySemicolon.text) continue
+
+    const match = trimmed.match(groupLineRegex)
+    if (match) {
+      const title = String(match[1] ?? "").trim()
+      if (!title) continue
+      const items = String(match[2] ?? "")
+        .split(";")
+        .map((x) => x.trim())
+        .filter((x) => x !== "")
+      for (const item of items) {
+        const parsed = parseTimePrefix(item)
+        const text = String(parsed ? parsed.text : item).trim()
+        if (!text) continue
+        entries.push({
+          time: parsed ? parsed.time : "",
+          text,
+          title,
+          order
+        })
+        order++
+      }
+      continue
+    }
+
+    const timeLine = parseTimePrefix(trimmed)
+    if (timeLine) {
+      const text = String(timeLine.text ?? "").trim()
+      if (!text) continue
+      entries.push({ time: timeLine.time || "", text, title: "", order })
+      order++
+      continue
+    }
+
+    entries.push({ time: "", text: trimmed, title: "", order })
+    order++
+  }
+
+  return entries
+}
+
+export function reorderBlockBodyByTime(bodyText) {
+  const entries = buildOrderedEntriesFromBody(bodyText ?? "")
+  if (entries.length === 0) return ""
+
+  const timed = []
+  const noTime = []
+  for (const entry of entries) {
+    if (entry.time) timed.push(entry)
+    else noTime.push(entry)
+  }
+
+  timed.sort((a, b) => {
+    const ta = timeToMinutes(a.time)
+    const tb = timeToMinutes(b.time)
+    if (ta !== tb) return ta - tb
+    return (a.order ?? 0) - (b.order ?? 0)
+  })
+  noTime.sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+
+  const ordered = [...timed, ...noTime]
+  const lines = ordered
+    .map((entry) => {
+      const text = String(entry.text ?? "").trim()
+      if (!text) return ""
+      const title = String(entry.title ?? "").trim()
+      if (title) return entry.time ? `${entry.time};@${title};${text}` : `@${title};${text}`
+      return entry.time ? `${entry.time};${text}` : text
+    })
+    .filter((line) => line !== "")
+
+  return lines.join("\n").trimEnd()
+}
+
 export function parseBlocksAndItems(rawText, baseYear, { allowAnyYear = false } = {}) {
   const s = rawText ?? ""
   const lines = s.split("\n")
@@ -631,6 +730,23 @@ export function updateDateBlockBody(text, baseYear, dateKey, bodyText) {
     body = "\n"
   }
   return text.slice(0, block.bodyStartPos) + body + after
+}
+
+export function normalizeBlockOrderByTime(text, baseYear, { allowAnyYear = false } = {}) {
+  let current = String(text ?? "")
+  const parsed = parseBlocksAndItems(current, baseYear, { allowAnyYear })
+  if (!parsed.blocks || parsed.blocks.length === 0) return current.trimEnd()
+
+  for (const block of parsed.blocks) {
+    const body = current.slice(block.bodyStartPos, block.blockEndPos)
+    const trimmedBody = body.replace(/^\n+/, "").replace(/\n+$/, "")
+    const reordered = reorderBlockBodyByTime(trimmedBody)
+    if (reordered !== trimmedBody) {
+      current = updateDateBlockBody(current, baseYear, block.dateKey, reordered)
+    }
+  }
+
+  return current.trimEnd()
 }
 
 export function syncMirrorStyleFromTextarea(ta, mirror) {
