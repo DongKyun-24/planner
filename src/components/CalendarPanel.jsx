@@ -41,6 +41,7 @@ export default function CalendarPanel({
         flex: "1 1 0",
         minWidth: 0,
         minHeight: 0,
+        height: "100%",
         borderRadius: 8,
         background: ui.surface,
         fontFamily: "inherit",
@@ -236,7 +237,8 @@ export default function CalendarPanel({
         style={{
           padding: 6,
           overflow: "auto",
-          minHeight: 0
+          minHeight: 0,
+          flex: "1 1 auto"
         }}
       >
         <div

@@ -4210,20 +4210,31 @@ function stripEmptyGroupLines(bodyText) {
     const top = calendarTopRef.current
     if (!panel || !top) return
 
-    const ro = new ResizeObserver(() => {
+    const recalcCalendarCellHeight = () => {
       const panelH = panel.clientHeight
       const topH = top.offsetHeight
       const paddingAndGaps = 6 * 2 + 22
       const usable = Math.max(0, panelH - topH - paddingAndGaps)
       const h = usable > 0 ? Math.floor(usable / weeks) : 110
-      setCalendarCellH(Math.max(86, h))
-    })
+      const next = Math.max(86, h)
+      setCalendarCellH((prev) => (prev === next ? prev : next))
+    }
 
-    ro.observe(panel)
-    ro.observe(top)
+    recalcCalendarCellHeight()
 
-    return () => ro.disconnect()
-  }, [weeks])
+    let ro = null
+    if (typeof ResizeObserver !== "undefined") {
+      ro = new ResizeObserver(recalcCalendarCellHeight)
+      ro.observe(panel)
+      ro.observe(top)
+    }
+    window.addEventListener("resize", recalcCalendarCellHeight)
+
+    return () => {
+      if (ro) ro.disconnect()
+      window.removeEventListener("resize", recalcCalendarCellHeight)
+    }
+  }, [weeks, outerCollapsed, layoutPreset])
 
   // ===== 리사이즈(달력/메모 스플릿) =====
   const draggingRef = useRef(false)
