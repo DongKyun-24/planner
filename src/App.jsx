@@ -4216,7 +4216,7 @@ function stripEmptyGroupLines(bodyText) {
       const paddingAndGaps = 6 * 2 + 22
       const usable = Math.max(0, panelH - topH - paddingAndGaps)
       const h = usable > 0 ? Math.floor(usable / weeks) : 110
-      setCalendarCellH(clamp(h, 86, 140))
+      setCalendarCellH(Math.max(86, h))
     })
 
     ro.observe(panel)
