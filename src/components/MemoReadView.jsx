@@ -8,7 +8,6 @@ export default function MemoReadView({
   setHoveredReadDateKey,
   collapsedForActive,
   toggleDashboardCollapse,
-  timeToMinutes,
   keyToYMD,
   buildHeaderLine,
   activeWindowId,
@@ -41,10 +40,7 @@ export default function MemoReadView({
             : "transparent"
 
         let hasContent = false
-        let noTimeGroupItems = []
-        let timedItems = []
-        let tabNoTimeItems = []
-        let tabTimedItems = []
+        let orderedItems = []
         const useOrderedEntries = isAll && Array.isArray(block.entries)
         const blockGeneral = Array.isArray(block.general) ? block.general : []
         const blockGroups = Array.isArray(block.groups) ? block.groups : []
@@ -53,28 +49,17 @@ export default function MemoReadView({
         if (isAll) {
           if (useOrderedEntries) {
             const entries = block.entries ?? []
-            hasContent = entries.length > 0
-            if (hasContent) {
-              for (const item of entries) {
-                const text = (item.text ?? "").trim()
-                if (!text) continue
-                const entry = {
-                  time: item.time || "",
-                  text,
-                  title: item.title || "",
-                  order: item.order ?? 0
-                }
-                if (entry.time) timedItems.push(entry)
-                else noTimeGroupItems.push(entry)
-              }
-              noTimeGroupItems.sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
-              timedItems.sort((a, b) => {
-                const ta = timeToMinutes(a.time)
-                const tb = timeToMinutes(b.time)
-                if (ta !== tb) return ta - tb
-                return (a.order ?? 0) - (b.order ?? 0)
+            for (const item of entries) {
+              const text = (item.text ?? "").trim()
+              if (!text) continue
+              orderedItems.push({
+                time: item.time || "",
+                text,
+                title: item.title || "",
+                order: item.order ?? 0
               })
             }
+            hasContent = orderedItems.length > 0
           } else {
             const groups = blockGroups
             const groupItemCount = groups.reduce((sum, group) => sum + (group.items?.length ?? 0), 0)
@@ -90,46 +75,31 @@ export default function MemoReadView({
                     title: group.title,
                     order: item.order ?? 0
                   }
-                  if (entry.time) timedItems.push(entry)
-                  else noTimeGroupItems.push(entry)
+                  orderedItems.push(entry)
                 }
               }
-              const timedNoGroup = blockTimed
-                .map((item) => ({
-                  time: item.time || "",
-                  text: (item.text ?? "").trim(),
-                  title: "",
-                  order: item.order ?? 0
-                }))
-                .filter((item) => item.text)
-              timedItems.push(...timedNoGroup)
-              noTimeGroupItems.sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
-              timedItems.sort((a, b) => {
-                const ta = timeToMinutes(a.time)
-                const tb = timeToMinutes(b.time)
-                if (ta !== tb) return ta - tb
-                return (a.order ?? 0) - (b.order ?? 0)
-              })
+              for (const item of blockTimed) {
+                const text = (item.text ?? "").trim()
+                if (!text) continue
+                orderedItems.push({ time: item.time || "", text, title: "", order: item.order ?? 0 })
+              }
+              for (const line of blockGeneral) {
+                const text = String(line ?? "").trim()
+                if (!text) continue
+                orderedItems.push({ time: "", text, title: "", order: Number.MAX_SAFE_INTEGER })
+              }
+              orderedItems.sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
             }
           }
         } else {
-          hasContent = Array.isArray(block.items) && block.items.length > 0
-          if (hasContent && Array.isArray(block.items)) {
+          if (Array.isArray(block.items)) {
             for (const item of block.items) {
               const text = (item.text ?? "").trim()
               if (!text) continue
-              const entry = { time: item.time || "", text, order: item.order ?? 0 }
-              if (entry.time) tabTimedItems.push(entry)
-              else tabNoTimeItems.push(entry)
+              orderedItems.push({ time: item.time || "", text, order: item.order ?? 0 })
             }
-            tabNoTimeItems.sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
-            tabTimedItems.sort((a, b) => {
-              const ta = timeToMinutes(a.time)
-              const tb = timeToMinutes(b.time)
-              if (ta !== tb) return ta - tb
-              return (a.order ?? 0) - (b.order ?? 0)
-            })
           }
+          hasContent = orderedItems.length > 0
         }
 
         if (!hasContent) return null
@@ -226,45 +196,16 @@ export default function MemoReadView({
             </div>
             {!isCollapsed && (
               <div style={{ marginTop: 4, display: "flex", flexDirection: "column", gap: 2 }}>
-                {isAll ? (
-                  <>
-                    {timedItems.map((item, idx) => (
-                      <div key={`${block.dateKey}-timed-${idx}`} style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}>
-                        {item.time} {item.title ? `[${item.title}] ` : ""}{item.text}
-                      </div>
-                    ))}
-                    {noTimeGroupItems.map((item, idx) => (
-                      <div key={`${block.dateKey}-group-notime-${idx}`} style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}>
-                        {item.title ? `[${item.title}] ` : ""}{item.text}
-                      </div>
-                    ))}
-                    {!useOrderedEntries &&
-                      blockGeneral.map((line, idx) => (
-                        <div key={`${block.dateKey}-general-${idx}`} style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}>
-                          {line}
-                        </div>
-                      ))}
-                  </>
-                ) : (
-                  <>
-                    {tabTimedItems.map((item, ii) => (
-                      <div
-                        key={`${block.dateKey}-${activeWindowId ?? "tab"}-time-${ii}`}
-                        style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}
-                      >
-                        {item.time} {item.text}
-                      </div>
-                    ))}
-                    {tabNoTimeItems.map((item, ii) => (
-                      <div
-                        key={`${block.dateKey}-${activeWindowId ?? "tab"}-notime-${ii}`}
-                        style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}
-                      >
-                        {item.text}
-                      </div>
-                    ))}
-                  </>
-                )}
+                {orderedItems.map((item, idx) => (
+                  <div
+                    key={`${block.dateKey}-${activeWindowId ?? "tab"}-item-${idx}`}
+                    style={{ fontWeight: 400, color: ui.text, lineHeight: 1.25 }}
+                  >
+                    {item.time ? `${item.time} ` : ""}
+                    {isAll && item.title ? `[${item.title}] ` : ""}
+                    {item.text}
+                  </div>
+                ))}
               </div>
             )}
           </div>

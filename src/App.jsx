@@ -25,7 +25,6 @@ import {
   groupLineTitleOnlyRegex,
   groupLineCloseRegex,
   parseTimePrefix,
-  timeToMinutes,
   parseDashboardSemicolonLine,
   normalizeGroupLineNewlines,
   normalizeWindowTitle,
@@ -37,7 +36,6 @@ import {
   buildMemoOverlayLines,
   syncOverlayScroll,
   normalizePrettyAndMerge,
-  normalizeBlockOrderByTime,
   getDateKeyFromLine,
   buildCombinedRightText,
   splitCombinedRightText,
@@ -307,6 +305,7 @@ function App() {
   const dayListSyncTimerRef = useRef(null)
   const dayListPendingSyncRef = useRef(null)
   const dayListSyncQueueRef = useRef(Promise.resolve())
+  const dayListEditGuardRef = useRef({ open: false, mode: "read", dirty: false })
   const sortOrderSupportedRef = useRef(true)
   const sortOrderSyncTimerRef = useRef(null)
 
@@ -592,15 +591,19 @@ function App() {
       const header = buildHeaderLine(year, m, d)
       const items = byDate.get(dateKey) ?? []
       items.sort((a, b) => {
-        const ta = timeToMinutes(a.time)
-        const tb = timeToMinutes(b.time)
-        if (ta !== tb) return ta - tb
-        const oa = a.sortOrder ?? a.order
-        const ob = b.sortOrder ?? b.order
+        const oa = a.order
+        const ob = b.order
         if (oa != null || ob != null) {
           if (oa == null) return 1
           if (ob == null) return -1
           if (oa !== ob) return oa - ob
+        }
+        const sa = a.sortOrder
+        const sb = b.sortOrder
+        if (sa != null || sb != null) {
+          if (sa == null) return 1
+          if (sb == null) return -1
+          if (sa !== sb) return sa - sb
         }
         const ca = a.createdAtMs
         const cb = b.createdAtMs
@@ -1651,9 +1654,11 @@ function App() {
     if (!session?.user?.id || !remoteLoaded) return
     const forceApply = forceRemoteApplyRef.current
     if (!forceApply && isEditingLeftMemo) return
+    const dayListGuard = dayListEditGuardRef.current
+    if (!forceApply && dayListGuard.open && dayListGuard.mode === "edit") return
     const last = lastCloudSyncRef.current
     if (ENABLE_WEB_TEXT_PLAN_SYNC && !forceApply && last.year === baseYear && last.text !== textRef.current) return
-    const previousText = getWindowMemoTextSync(baseYear, "all") ?? textRef.current ?? ""
+    const previousText = textRef.current ?? getWindowMemoTextSync(baseYear, "all") ?? ""
     if (!forceApply && (remotePlans ?? []).length === 0 && previousText.trim()) {
       return
     }
@@ -2725,7 +2730,6 @@ function stripEmptyGroupLines(bodyText) {
     }
 
     nextAll = normalizePrettyAndMerge(nextAll, baseYear)
-    nextAll = normalizeBlockOrderByTime(nextAll, baseYear, { allowAnyYear: true })
     setWindowMemoTextSync(baseYear, "all", nextAll)
     if (activeWindowId === "all") updateEditorText(nextAll)
     setDashboardSourceTick((x) => x + 1)
@@ -2755,7 +2759,6 @@ function stripEmptyGroupLines(bodyText) {
     }
 
     nextAll = normalizePrettyAndMerge(nextAll, baseYear)
-    nextAll = normalizeBlockOrderByTime(nextAll, baseYear, { allowAnyYear: true })
     setWindowMemoTextSync(baseYear, "all", nextAll)
     if (activeWindowId === "all") updateEditorText(nextAll)
     setDashboardSourceTick((x) => x + 1)
@@ -3183,8 +3186,7 @@ function stripEmptyGroupLines(bodyText) {
         const parsedBlock = dashboardByDate[block.dateKey]
         if (!parsedBlock) continue
         const entries = parsedBlock.entries ?? []
-        const timedItems = []
-        const noTimeItems = []
+        const orderedItems = []
         for (const entry of entries) {
           const text = String(entry?.text ?? "").trim()
           if (!text) continue
@@ -3199,17 +3201,10 @@ function stripEmptyGroupLines(bodyText) {
             color,
             sourceTitle: title
           }
-          if (base.time) timedItems.push({ ...base, order })
-          else noTimeItems.push({ ...base, order })
+          orderedItems.push({ ...base, order })
         }
-        timedItems.sort((a, b) => {
-          const ta = timeToMinutes(a.time)
-          const tb = timeToMinutes(b.time)
-          if (ta !== tb) return ta - tb
-          return (a.order ?? 0) - (b.order ?? 0)
-        })
-        noTimeItems.sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
-        const bucket = [...timedItems, ...noTimeItems].map((item) => {
+        orderedItems.sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+        const bucket = orderedItems.map((item) => {
           const next = { ...item }
           delete next.order
           return next
@@ -3385,39 +3380,27 @@ function stripEmptyGroupLines(bodyText) {
   const dayListReadItems = useMemo(() => {
     if (!dayListView) return null
     const isAll = activeWindowId === "all"
-    if (isAll) {
-      const entries = buildOrderedEntriesFromBody(dayListEditText)
-      const filtered = allowedDashboardGroupTitles
-        ? entries.filter((entry) => !entry.title || allowedDashboardGroupTitles.has(entry.title))
-        : entries
-      const timedItems = []
-      const noTimeItems = []
-      for (const entry of filtered) {
-        const text = String(entry.text ?? "").trim()
-        if (!text) continue
-        const item = { time: entry.time || "", text, title: entry.title || "", order: entry.order ?? 0 }
-        if (item.time) timedItems.push(item)
-        else noTimeItems.push(item)
-      }
-      timedItems.sort((a, b) => {
-        const ta = timeToMinutes(a.time)
-        const tb = timeToMinutes(b.time)
-        if (ta !== tb) return ta - tb
-        return (a.order ?? 0) - (b.order ?? 0)
-      })
-      noTimeItems.sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
-      return { isAll, timedItems, noTimeItems }
-    }
-    const noTimeItems = dayListView.general.filter((line) => String(line ?? "").trim())
-    const timedItems = (dayListView.timed ?? [])
-      .map((item) => ({
-        time: item.time || "",
-        text: (item.text ?? "").trim()
+    const entries = buildOrderedEntriesFromBody(dayListEditText)
+    const filtered = isAll && allowedDashboardGroupTitles
+      ? entries.filter((entry) => !entry.title || allowedDashboardGroupTitles.has(entry.title))
+      : entries
+    const orderedItems = filtered
+      .map((entry) => ({
+        time: entry.time || "",
+        text: String(entry.text ?? "").trim(),
+        title: isAll ? String(entry.title ?? "").trim() : "",
+        order: entry.order ?? 0
       }))
-      .filter((item) => item.text)
-    timedItems.sort((a, b) => timeToMinutes(a.time) - timeToMinutes(b.time))
-    return { isAll, noTimeItems, timedItems }
-  }, [dayListView, dayListEditText, activeWindowId, windowTitleRank, allowedDashboardGroupTitles])
+      .filter((entry) => entry.text)
+      .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+    return { isAll, orderedItems }
+  }, [dayListView, dayListEditText, activeWindowId, allowedDashboardGroupTitles])
+
+  useEffect(() => {
+    dayListEditGuardRef.current.open = Boolean(dayListModal)
+    dayListEditGuardRef.current.mode = dayListMode
+    dayListEditGuardRef.current.dirty = dayListDirtyRef.current
+  }, [dayListModal, dayListMode, dayListEditText])
 
   const setReadBlockRef = useCallback((dateKey) => {
     return (el) => {
@@ -3498,34 +3481,38 @@ function stripEmptyGroupLines(bodyText) {
     if (!dayListModal) {
       setDayListEditText("")
       dayListDirtyRef.current = false
+      dayListEditGuardRef.current.dirty = false
       return
     }
     const sourceText = activeWindowId === "all" ? textRef.current ?? text : tabEditText ?? ""
     const body = getDateBlockBodyText(sourceText, baseYear, dayListModal.key)
     setDayListEditText(body)
     dayListDirtyRef.current = false
+    dayListEditGuardRef.current.dirty = false
     setDayListMode("read")
   }, [dayListModal ? dayListModal.key : null, baseYear, activeWindowId])
 
   useEffect(() => {
     if (!dayListModal) return
-    if (dayListMode === "edit" && dayListDirtyRef.current) return
+    if (dayListMode === "edit") return
     const sourceText = activeWindowId === "all" ? textRef.current ?? text : tabEditText ?? ""
     const body = getDateBlockBodyText(sourceText, baseYear, dayListModal.key)
     if (body === dayListEditText) return
     dayListDirtyRef.current = false
+    dayListEditGuardRef.current.dirty = false
     setDayListEditText(body)
   }, [text, tabEditText, baseYear, activeWindowId, dayListModal ? dayListModal.key : null, dayListMode])
 
   const handleDayListEditTextChange = useCallback((next) => {
     dayListDirtyRef.current = true
+    dayListEditGuardRef.current.dirty = true
     setDayListEditText(next)
   }, [])
 
   useEffect(() => {
     if (!session?.user?.id || !remoteLoaded) return
     if (isEditingLeftMemo) return
-    if (dayListModal && dayListMode === "edit" && dayListDirtyRef.current) return
+    if (dayListModal && dayListMode === "edit") return
     if (sortOrderSyncTimerRef.current) clearTimeout(sortOrderSyncTimerRef.current)
     const sourceText =
       activeWindowId === "all"
@@ -3557,6 +3544,27 @@ function stripEmptyGroupLines(bodyText) {
     setIsEditingLeftMemo(false)
   }, [isMainMemoReadOnly, isEditingLeftMemo])
 
+  function scrollReadDateIntoView(dateKey, behavior = "smooth") {
+    if (!dateKey) return
+    let attempts = 0
+
+    const tryScroll = () => {
+      const container = readScrollContainerRef.current
+      const target = readBlockRefs.current?.get(dateKey)
+      if (!container || !target) {
+        attempts += 1
+        if (attempts < 10) requestAnimationFrame(tryScroll)
+        return
+      }
+      const containerRect = container.getBoundingClientRect()
+      const targetRect = target.getBoundingClientRect()
+      const nextTop = targetRect.top - containerRect.top + container.scrollTop - READ_SCROLL_MARGIN_TOP
+      container.scrollTo({ top: Math.max(0, nextTop), behavior })
+    }
+
+    requestAnimationFrame(tryScroll)
+  }
+
   function setActiveDateKey(key) {
     if (!key) return
     lastActiveDateKeyRef.current = key
@@ -3583,6 +3591,7 @@ function stripEmptyGroupLines(bodyText) {
     if (nextText === current) return
     if (isAll) {
       updateEditorText(nextText)
+      setWindowMemoTextSync(baseYear, "all", nextText)
       return
     }
     setTabEditText(nextText)
@@ -3992,11 +4001,6 @@ function stripEmptyGroupLines(bodyText) {
         nextTabText = cleaned.newText
         changed = true
       }
-      const reordered = normalizeBlockOrderByTime(nextTabText, baseYear, { allowAnyYear: true })
-      if (reordered !== nextTabText) {
-        nextTabText = reordered
-        changed = true
-      }
       if (changed) {
         setTabEditText(nextTabText)
         setWindowMemoTextSync(baseYear, activeWindowId, nextTabText)
@@ -4016,7 +4020,6 @@ function stripEmptyGroupLines(bodyText) {
     const cleaned = removeAllEmptyBlocks(normalized, baseYear, { allowAnyYear: true })
     if (cleaned.changed) normalized = cleaned.newText
     normalized = normalizePrettyAndMerge(normalized, baseYear, { allowAnyYear: true })
-    normalized = normalizeBlockOrderByTime(normalized, baseYear, { allowAnyYear: true })
 
     if (normalized !== current) {
       updateEditorText(normalized)
@@ -4113,15 +4116,18 @@ function stripEmptyGroupLines(bodyText) {
 
   // ===== Today 버튼 동작 =====
   function goToday() {
-    const y = today.getFullYear()
-    const m = today.getMonth() + 1
-    const d = today.getDate()
+    const now = new Date()
+    setToday(now)
+    const y = now.getFullYear()
+    const m = now.getMonth() + 1
+    const d = now.getDate()
     const key = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`
     if (isMainMemoReadOnly) {
       setView({ year: y, month: m })
       viewRef.current = { year: y, month: m }
       setBaseYear(y)
       setActiveDateKey(key)
+      scrollReadDateIntoView(key, "smooth")
       return
     }
 
@@ -4520,6 +4526,7 @@ function stripEmptyGroupLines(bodyText) {
 
 
   function openDayList(key, items) {
+    dayListEditGuardRef.current = { open: true, mode: "read", dirty: false }
     setDayListModal({ key, items })
     setDayListMode("read")
   }
@@ -4528,6 +4535,7 @@ function stripEmptyGroupLines(bodyText) {
     flushPendingDayListSync()
     setDayListModal(null)
     dayListDirtyRef.current = false
+    dayListEditGuardRef.current = { open: false, mode: "read", dirty: false }
   }
 
   function toggleLeftMemo() {
@@ -5075,7 +5083,6 @@ function stripEmptyGroupLines(bodyText) {
                     setHoveredReadDateKey={setHoveredReadDateKey}
                     collapsedForActive={collapsedForActive}
                     toggleDashboardCollapse={toggleDashboardCollapse}
-                    timeToMinutes={timeToMinutes}
                     keyToYMD={keyToYMD}
                     buildHeaderLine={buildHeaderLine}
                     activeWindowId={activeWindowId}

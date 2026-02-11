@@ -217,6 +217,7 @@ export default function CalendarPanel({
             </div>
 
             <button
+              type="button"
               onClick={goToday}
               style={{ ...pillButton, padding: "0 10px 2px", borderRadius: 12, lineHeight: 1 }}
               title="오늘로 이동"
@@ -226,6 +227,7 @@ export default function CalendarPanel({
             </button>
 
             <button
+              type="button"
               onClick={goPrevMonth}
               className="arrow-button"
               style={arrowButton}
@@ -235,6 +237,7 @@ export default function CalendarPanel({
               ◀
             </button>
             <button
+              type="button"
               onClick={goNextMonth}
               className="arrow-button"
               style={arrowButton}
@@ -248,6 +251,7 @@ export default function CalendarPanel({
           <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
             {(layoutPreset === "calendar-left" || outerCollapsed === "left") && (
               <button
+                type="button"
                 onClick={() => setLayoutPreset((p) => (p === "memo-left" ? "calendar-left" : "memo-left"))}
                 style={{ ...pillButton, padding: "0 10px" }}
                 title="메모/달력 위치 변경"

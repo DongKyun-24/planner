@@ -48,6 +48,7 @@ export default function DayListModal({
 }) {
   const textareaRef = useRef(null)
   const mentionOptionRefs = useRef(new Map())
+  const backdropPressStartedRef = useRef(false)
   const [mentionState, setMentionState] = useState({
     visible: false,
     query: "",
@@ -62,34 +63,44 @@ export default function DayListModal({
     [editableWindows, mentionState.query]
   )
   const readIsAll = Boolean(dayListReadItems?.isAll)
-  const readTimedItems = useMemo(() => {
-    const items = Array.isArray(dayListReadItems?.timedItems) ? dayListReadItems.timedItems : []
-    return items
-      .map((item) => {
-        if (item && typeof item === "object") {
-          return {
-            time: String(item.time ?? "").trim(),
-            text: String(item.text ?? "").trim(),
-            title: String(item.title ?? "").trim()
-          }
-        }
-        return { time: "", text: String(item ?? "").trim(), title: "" }
-      })
-      .filter((item) => item.text)
-  }, [dayListReadItems])
-  const readNoTimeItems = useMemo(() => {
-    const items = Array.isArray(dayListReadItems?.noTimeItems) ? dayListReadItems.noTimeItems : []
-    return items
-      .map((item) => {
-        if (item && typeof item === "object") {
-          return {
-            text: String(item.text ?? "").trim(),
-            title: String(item.title ?? "").trim()
-          }
-        }
-        return { text: String(item ?? "").trim(), title: "" }
-      })
-      .filter((item) => item.text)
+  const readOrderedItems = useMemo(() => {
+    if (Array.isArray(dayListReadItems?.orderedItems)) {
+      return dayListReadItems.orderedItems
+        .map((item) => ({
+          time: String(item?.time ?? "").trim(),
+          text: String(item?.text ?? "").trim(),
+          title: String(item?.title ?? "").trim()
+        }))
+        .filter((item) => item.text)
+    }
+
+    const timed = Array.isArray(dayListReadItems?.timedItems) ? dayListReadItems.timedItems : []
+    const noTime = Array.isArray(dayListReadItems?.noTimeItems) ? dayListReadItems.noTimeItems : []
+    const ordered = []
+
+    for (const item of timed) {
+      if (item && typeof item === "object") {
+        ordered.push({
+          time: String(item.time ?? "").trim(),
+          text: String(item.text ?? "").trim(),
+          title: String(item.title ?? "").trim()
+        })
+      } else {
+        ordered.push({ time: "", text: String(item ?? "").trim(), title: "" })
+      }
+    }
+    for (const item of noTime) {
+      if (item && typeof item === "object") {
+        ordered.push({
+          time: "",
+          text: String(item.text ?? "").trim(),
+          title: String(item.title ?? "").trim()
+        })
+      } else {
+        ordered.push({ time: "", text: String(item ?? "").trim(), title: "" })
+      }
+    }
+    return ordered.filter((item) => item.text)
   }, [dayListReadItems])
 
   function hideMentionMenu() {
@@ -194,7 +205,17 @@ export default function DayListModal({
 
   return (
     <div
-      onClick={onClose}
+      onPointerDown={(e) => {
+        backdropPressStartedRef.current = e.target === e.currentTarget
+      }}
+      onPointerUp={(e) => {
+        const shouldClose = backdropPressStartedRef.current && e.target === e.currentTarget
+        backdropPressStartedRef.current = false
+        if (shouldClose) onClose()
+      }}
+      onPointerCancel={() => {
+        backdropPressStartedRef.current = false
+      }}
       style={{
         position: "fixed",
         inset: 0,
@@ -412,37 +433,26 @@ export default function DayListModal({
           >
             {readIsAll ? (
               <>
-                {readTimedItems.map((item, idx) => (
-                  <div key={`daylist-timed-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
+                {readOrderedItems.map((item, idx) => (
+                  <div key={`daylist-all-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
                     {item.time ? `${item.time} ` : ""}
                     {item.title ? `[${item.title}] ` : ""}
                     {item.text}
                   </div>
                 ))}
-                {readNoTimeItems.map((item, idx) => (
-                  <div key={`daylist-notime-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
-                    {item.title ? `[${item.title}] ` : ""}
-                    {item.text}
-                  </div>
-                ))}
-                {readNoTimeItems.length === 0 && readTimedItems.length === 0 && (
+                {readOrderedItems.length === 0 && (
                   <div style={{ color: ui.text2 }}>No content.</div>
                 )}
               </>
             ) : (
               <>
-                {readTimedItems.map((item, idx) => (
-                  <div key={`daylist-timed-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
+                {readOrderedItems.map((item, idx) => (
+                  <div key={`daylist-tab-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
                     {item.time ? `${item.time} ` : ""}
                     {item.text}
                   </div>
                 ))}
-                {readNoTimeItems.map((item, idx) => (
-                  <div key={`daylist-notime-${idx}`} style={{ color: ui.text, lineHeight: 1.25 }}>
-                    {item.text}
-                  </div>
-                ))}
-                {readNoTimeItems.length === 0 && readTimedItems.length === 0 && (
+                {readOrderedItems.length === 0 && (
                   <div style={{ color: ui.text2 }}>No content.</div>
                 )}
               </>
