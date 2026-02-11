@@ -47,6 +47,7 @@ export default function DayListModal({
   editableWindows = []
 }) {
   const textareaRef = useRef(null)
+  const mentionOptionRefs = useRef(new Map())
   const [mentionState, setMentionState] = useState({
     visible: false,
     query: "",
@@ -139,6 +140,13 @@ export default function DayListModal({
     applyDayListEdit(nextText)
   }
 
+  function scrollMentionOptionIntoView(optionId) {
+    if (!optionId) return
+    const target = mentionOptionRefs.current.get(optionId)
+    if (!target) return
+    target.scrollIntoView({ block: "nearest" })
+  }
+
   function handleMentionPick(title) {
     const ta = textareaRef.current
     if (!ta) return
@@ -173,6 +181,14 @@ export default function DayListModal({
       hideMentionMenu()
     }
   }, [open, effectiveMode])
+
+  useEffect(() => {
+    if (!mentionState.visible || !mentionHoverId) return
+    const rafId = requestAnimationFrame(() => {
+      scrollMentionOptionIntoView(mentionHoverId)
+    })
+    return () => cancelAnimationFrame(rafId)
+  }, [mentionState.visible, mentionHoverId])
 
   if (!open) return null
 
@@ -283,8 +299,8 @@ export default function DayListModal({
                   e.preventDefault()
                   setMentionHoverId((prev) => {
                     const currentIndex = mentionMatches.findIndex((item) => item.id === prev)
-                    const baseIndex = currentIndex >= 0 ? currentIndex : 0
                     const delta = e.key === "ArrowDown" ? 1 : -1
+                    const baseIndex = currentIndex >= 0 ? currentIndex : delta > 0 ? -1 : 0
                     const nextIndex = (baseIndex + delta + mentionMatches.length) % mentionMatches.length
                     return mentionMatches[nextIndex]?.id ?? null
                   })
@@ -340,6 +356,10 @@ export default function DayListModal({
                 {mentionMatches.map((w) => (
                   <button
                     key={w.id}
+                    ref={(el) => {
+                      if (el) mentionOptionRefs.current.set(w.id, el)
+                      else mentionOptionRefs.current.delete(w.id)
+                    }}
                     type="button"
                     onMouseDown={(e) => {
                       e.preventDefault()

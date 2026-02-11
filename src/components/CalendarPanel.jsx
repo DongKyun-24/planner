@@ -34,6 +34,14 @@ export default function CalendarPanel({
   calendarInteractingRef,
   goToday
 }) {
+  function splitTimeLabel(value) {
+    const raw = String(value ?? "").trim()
+    if (!raw) return { start: "", end: "" }
+    const match = raw.match(/^(\d{1,2}:\d{2})\s*[~-]\s*(\d{1,2}:\d{2})$/)
+    if (!match) return { start: raw, end: "" }
+    return { start: match[1], end: match[2] }
+  }
+
   return (
     <div
       ref={calendarPanelRef}
@@ -209,10 +217,22 @@ export default function CalendarPanel({
               Today
             </button>
 
-            <button onClick={goPrevMonth} className="arrow-button" style={arrowButton} title="이전 달" aria-label="이전 달">
+            <button
+              onClick={goPrevMonth}
+              className="arrow-button"
+              style={arrowButton}
+              title="이전 달"
+              aria-label="이전 달"
+            >
               ◀
             </button>
-            <button onClick={goNextMonth} className="arrow-button" style={arrowButton} title="다음 달" aria-label="다음 달">
+            <button
+              onClick={goNextMonth}
+              className="arrow-button"
+              style={arrowButton}
+              title="다음 달"
+              aria-label="다음 달"
+            >
               ▶
             </button>
           </div>
@@ -291,7 +311,7 @@ export default function CalendarPanel({
               display: "grid",
               gridTemplateColumns: "repeat(7, 1fr)",
               gap: 0,
-              gridAutoRows: `${calendarCellH}px`
+              gridAutoRows: `minmax(${calendarCellH}px, auto)`
             }}
           >
             {Array.from({ length: firstWeekday }).map((_, i) => {
@@ -321,12 +341,6 @@ export default function CalendarPanel({
               const isLastRow = row === weeks - 1
 
               const items = itemsByDate[key] || []
-              const itemLineH = 14
-              const headerH = 28
-              const maxItems = Math.max(1, Math.floor((calendarCellH - headerH) / itemLineH))
-              const visibleCount = Math.min(items.length, maxItems)
-              const recent = visibleCount > 0 ? items.slice(0, visibleCount) : []
-              const hiddenCount = items.length - visibleCount
 
               const isSelected = selectedDateKey === key
               const isToday = key === todayKey
@@ -473,7 +487,7 @@ export default function CalendarPanel({
                           flexShrink: 0,
                           cursor: "pointer"
                         }}
-                        title={hiddenCount > 0 ? "전체 일정 보기" : "메모 항목 보기"}
+                        title="일정 목록 보기"
                       >
                         {items.length}개
                       </button>
@@ -504,49 +518,76 @@ export default function CalendarPanel({
 
                   <div
                     style={{
-                      marginTop: 2,
+                      marginTop: 4,
                       fontSize: 10,
                       lineHeight: 1.2,
                       color: ui.text,
-                      minWidth: 0
+                      minWidth: 0,
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: 2
                     }}
                   >
-                    {recent.map((it) => (
-                      <div
-                        key={it.id}
-                        style={{
-                          whiteSpace: "nowrap",
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 4,
-                          minWidth: 0
-                        }}
-                      >
-                        {it.color && (
+                    {items.map((it) => {
+                      const timeInfo = splitTimeLabel(it.time)
+                      return (
+                        <div
+                          key={it.id}
+                          style={{
+                            display: "flex",
+                            alignItems: "flex-start",
+                            gap: 3,
+                            minWidth: 0
+                          }}
+                        >
+                          {it.color && (
+                            <span
+                              title={it.sourceTitle ? `[${it.sourceTitle}]` : "항목"}
+                              style={{
+                                width: 6,
+                                height: 6,
+                                borderRadius: 999,
+                                background: it.color,
+                                flexShrink: 0,
+                                alignSelf: it.time ? "center" : "flex-start",
+                                marginTop: it.time ? 0 : 3
+                              }}
+                            />
+                          )}
+                          {it.time ? (
+                            <span
+                              style={{
+                                color: ui.text2,
+                                fontWeight: 900,
+                                fontSize: 9,
+                                lineHeight: 1.05,
+                                display: "inline-flex",
+                                flexDirection: "column",
+                                alignItems: "flex-start",
+                                alignSelf: "center",
+                                flexShrink: 0
+                              }}
+                            >
+                              <span>{timeInfo.start}</span>
+                              {timeInfo.end ? <span>{timeInfo.end}</span> : null}
+                            </span>
+                          ) : null}
                           <span
-                            title={it.sourceTitle ? `[${it.sourceTitle}]` : "항목"}
                             style={{
-                              width: 6,
-                              height: 6,
-                              borderRadius: 999,
-                              background: it.color,
-                              flexShrink: 0,
-                              marginTop: 0
+                              fontWeight: 650,
+                              alignSelf: timeInfo.end ? "center" : "flex-start",
+                              minWidth: 0,
+                              lineHeight: 1.2,
+                              whiteSpace: "normal",
+                              overflowWrap: "anywhere",
+                              wordBreak: "break-word"
                             }}
-                          />
-                        )}
-                        {it.time ? (
-                          <span style={{ color: ui.text2, fontWeight: 900, flexShrink: 0, fontSize: 9 }}>
-                            {it.time}
+                          >
+                            {it.text}
                           </span>
-                        ) : null}
-                        <span style={{ fontWeight: 650, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" }}>
-                          {it.text}
-                        </span>
-                      </div>
-                    ))}
+                        </div>
+                      )
+                    })}
                   </div>
                 </div>
               )
@@ -557,3 +598,4 @@ export default function CalendarPanel({
     </div>
   )
 }
+
