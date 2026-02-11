@@ -19,6 +19,7 @@ export default function CalendarPanel({
   arrowButton,
   ui,
   calendarCellH,
+  calendarFontPx,
   firstWeekday,
   weeks,
   lastDay,
@@ -41,6 +42,13 @@ export default function CalendarPanel({
     if (!match) return { start: raw, end: "" }
     return { start: match[1], end: match[2] }
   }
+
+  const itemFontPx = Math.max(8, Number(calendarFontPx) || 10)
+  const timeFontPx = Math.max(8, itemFontPx - 1)
+  const dotSizePx = Math.max(5, Math.round(itemFontPx * 0.6))
+  const itemGapPx = Math.max(2, Math.round(itemFontPx * 0.3))
+  const itemGroupGapPx = Math.max(2, Math.round(itemFontPx * 0.2))
+  const dotOffsetPx = Math.max(1, Math.round(itemFontPx * 0.25))
 
   return (
     <div
@@ -518,14 +526,14 @@ export default function CalendarPanel({
 
                   <div
                     style={{
-                      marginTop: 4,
-                      fontSize: 10,
+                      marginTop: Math.max(2, Math.round(itemFontPx * 0.35)),
+                      fontSize: itemFontPx,
                       lineHeight: 1.2,
                       color: ui.text,
                       minWidth: 0,
                       display: "flex",
                       flexDirection: "column",
-                      gap: 2
+                      gap: itemGroupGapPx
                     }}
                   >
                     {items.map((it) => {
@@ -536,7 +544,7 @@ export default function CalendarPanel({
                           style={{
                             display: "flex",
                             alignItems: "flex-start",
-                            gap: 3,
+                            gap: itemGapPx,
                             minWidth: 0
                           }}
                         >
@@ -544,13 +552,13 @@ export default function CalendarPanel({
                             <span
                               title={it.sourceTitle ? `[${it.sourceTitle}]` : "항목"}
                               style={{
-                                width: 6,
-                                height: 6,
+                                width: dotSizePx,
+                                height: dotSizePx,
                                 borderRadius: 999,
                                 background: it.color,
                                 flexShrink: 0,
                                 alignSelf: it.time ? "center" : "flex-start",
-                                marginTop: it.time ? 0 : 3
+                                marginTop: it.time ? 0 : dotOffsetPx
                               }}
                             />
                           )}
@@ -559,7 +567,7 @@ export default function CalendarPanel({
                               style={{
                                 color: ui.text2,
                                 fontWeight: 900,
-                                fontSize: 9,
+                                fontSize: timeFontPx,
                                 lineHeight: 1.05,
                                 display: "inline-flex",
                                 flexDirection: "column",

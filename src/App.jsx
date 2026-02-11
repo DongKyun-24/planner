@@ -1574,6 +1574,8 @@ function App() {
 
   const FONT_MIN = 12
   const FONT_MAX = 26
+  const CALENDAR_FONT_MIN = 8
+  const CALENDAR_FONT_MAX = 24
 
   const [splitRatio, setSplitRatio] = useState(DEFAULT_SPLIT)
   const [outerCollapsed, setOuterCollapsed] = useState("none") // "none" | "left" | "right"
@@ -1582,6 +1584,8 @@ function App() {
   const [memoFontInput, setMemoFontInput] = useState("16")
   const [tabFontPx, setTabFontPx] = useState(15)
   const [tabFontInput, setTabFontInput] = useState("15")
+  const [calendarFontPx, setCalendarFontPx] = useState(10)
+  const [calendarFontInput, setCalendarFontInput] = useState("10")
 
   // ? 설정 패널(톱니) 토글
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -1993,6 +1997,9 @@ function App() {
         if (typeof parsed.splitRatio === "number") setSplitRatio(clamp(parsed.splitRatio, 0.15, 0.85))
         if (typeof parsed.memoFontPx === "number") setMemoFontPx(clamp(parsed.memoFontPx, FONT_MIN, FONT_MAX))
         if (typeof parsed.tabFontPx === "number") setTabFontPx(clamp(parsed.tabFontPx, FONT_MIN, FONT_MAX))
+        if (typeof parsed.calendarFontPx === "number") {
+          setCalendarFontPx(clamp(parsed.calendarFontPx, CALENDAR_FONT_MIN, CALENDAR_FONT_MAX))
+        }
       }
     } catch (err) { void err }
 
@@ -2016,10 +2023,14 @@ function App() {
   }, [tabFontPx])
 
   useEffect(() => {
+    setCalendarFontInput(String(calendarFontPx))
+  }, [calendarFontPx])
+
+  useEffect(() => {
     try {
-      localStorage.setItem(LAYOUT_KEY, JSON.stringify({ splitRatio, memoFontPx, tabFontPx }))
+      localStorage.setItem(LAYOUT_KEY, JSON.stringify({ splitRatio, memoFontPx, tabFontPx, calendarFontPx }))
     } catch (err) { void err }
-  }, [splitRatio, memoFontPx, tabFontPx])
+  }, [splitRatio, memoFontPx, tabFontPx, calendarFontPx])
 
   useEffect(() => {
     try {
@@ -3355,8 +3366,10 @@ function stripEmptyGroupLines(bodyText) {
   const [selectedDateKey, setSelectedDateKey] = useState(null)
   const [lastEditedDateKey, setLastEditedDateKey] = useState(null)
   const [hoveredReadDateKey, setHoveredReadDateKey] = useState(null)
+  const readScrollContainerRef = useRef(null)
   const lastActiveDateKeyRef = useRef(null)
   const lastCaretDateKeyRef = useRef(null)
+  const initialReadScrollPendingRef = useRef(true)
   const editSessionRef = useRef({ id: 0, entryKey: null, lastChangeKey: null })
   const calendarInteractingRef = useRef(false)
   const readDateCreateButtonRef = useRef(null)
@@ -3414,6 +3427,62 @@ function stripEmptyGroupLines(bodyText) {
       else map.delete(dateKey)
     }
   }, [])
+
+  useEffect(() => {
+    initialReadScrollPendingRef.current = true
+  }, [session?.user?.id])
+
+  useEffect(() => {
+    if (!initialReadScrollPendingRef.current) return
+    if (session?.user?.id && !remoteLoaded) return
+    if (isEditingLeftMemo) return
+    if (activeWindowId !== "all") return
+    if (dayListModal) return
+
+    const list = Array.isArray(dashboardBlocks) ? dashboardBlocks : []
+    if (list.length === 0) return
+
+    const todayTime = keyToTime(todayKey)
+    let targetKey = list.find((b) => b?.dateKey === todayKey)?.dateKey ?? ""
+    if (!targetKey) {
+      targetKey =
+        list.find((b) => b?.dateKey && keyToTime(b.dateKey) >= todayTime)?.dateKey ??
+        list[list.length - 1]?.dateKey ??
+        ""
+    }
+    if (!targetKey) return
+
+    const target = readBlockRefs.current?.get(targetKey)
+    if (!target) return
+
+    let rafId = 0
+    let attempts = 0
+    const tryScroll = () => {
+      const container = readScrollContainerRef.current
+      const nextTarget = readBlockRefs.current?.get(targetKey)
+      if (!nextTarget) return
+      if (container) {
+        const containerRect = container.getBoundingClientRect()
+        const targetRect = nextTarget.getBoundingClientRect()
+        const nextTop = targetRect.top - containerRect.top + container.scrollTop - READ_SCROLL_MARGIN_TOP
+        const clampedTop = Math.max(0, nextTop)
+        container.scrollTop = clampedTop
+        attempts += 1
+        if (attempts < 8 && Math.abs(container.scrollTop - clampedTop) > 1) {
+          rafId = requestAnimationFrame(tryScroll)
+          return
+        }
+      } else {
+        nextTarget.scrollIntoView({ block: "start", behavior: "auto" })
+      }
+      initialReadScrollPendingRef.current = false
+    }
+
+    rafId = requestAnimationFrame(tryScroll)
+    return () => {
+      if (rafId) cancelAnimationFrame(rafId)
+    }
+  }, [activeWindowId, dayListModal, dashboardBlocks, isEditingLeftMemo, todayKey, session?.user?.id, remoteLoaded])
 
   useEffect(() => {
     if (isEditingLeftMemo) return
@@ -4821,6 +4890,8 @@ function stripEmptyGroupLines(bodyText) {
             setTheme={setTheme}
             FONT_MIN={FONT_MIN}
             FONT_MAX={FONT_MAX}
+            CALENDAR_FONT_MIN={CALENDAR_FONT_MIN}
+            CALENDAR_FONT_MAX={CALENDAR_FONT_MAX}
             tabFontInput={tabFontInput}
             setTabFontInput={setTabFontInput}
             tabFontPx={tabFontPx}
@@ -4829,6 +4900,10 @@ function stripEmptyGroupLines(bodyText) {
             setMemoFontInput={setMemoFontInput}
             memoFontPx={memoFontPx}
             setMemoFontPx={setMemoFontPx}
+            calendarFontInput={calendarFontInput}
+            setCalendarFontInput={setCalendarFontInput}
+            calendarFontPx={calendarFontPx}
+            setCalendarFontPx={setCalendarFontPx}
             showLogout={Boolean(session)}
             onSignOut={() => {
               setSettingsOpen(false)
@@ -4974,6 +5049,7 @@ function stripEmptyGroupLines(bodyText) {
                 />
               ) : (
                 <div
+                  ref={readScrollContainerRef}
                   onClick={enterEditMode}
                   style={{
                     width: "100%",
@@ -5120,6 +5196,7 @@ function stripEmptyGroupLines(bodyText) {
       arrowButton={arrowButton}
       ui={ui}
       calendarCellH={calendarCellH}
+      calendarFontPx={calendarFontPx}
       firstWeekday={firstWeekday}
       weeks={weeks}
       lastDay={lastDay}

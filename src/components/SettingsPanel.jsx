@@ -11,6 +11,8 @@ export default function SettingsPanel({
   setTheme,
   FONT_MIN,
   FONT_MAX,
+  CALENDAR_FONT_MIN,
+  CALENDAR_FONT_MAX,
   tabFontInput,
   setTabFontInput,
   tabFontPx,
@@ -19,6 +21,10 @@ export default function SettingsPanel({
   setMemoFontInput,
   memoFontPx,
   setMemoFontPx,
+  calendarFontInput,
+  setCalendarFontInput,
+  calendarFontPx,
+  setCalendarFontPx,
   showLogout = false,
   onSignOut,
   onClose
@@ -112,6 +118,40 @@ export default function SettingsPanel({
             }}
             style={{ ...settingsNumberInput, width: 48 }}
             title="본문 글씨 크기(px)"
+          />
+          <div style={{ fontSize: 12, fontWeight: 700, color: ui.text2 }}>px</div>
+        </div>
+      </div>
+
+      <div style={settingsRowStyle}>
+        <div style={settingsLabelTextStyle}>Calendar</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <input
+            type="number"
+            inputMode="numeric"
+            min={CALENDAR_FONT_MIN}
+            max={CALENDAR_FONT_MAX}
+            value={calendarFontInput}
+            onChange={(e) => {
+              const raw = e.target.value
+              setCalendarFontInput(raw)
+              if (raw.trim() === "") return
+              const n = Number(raw)
+              if (!Number.isFinite(n)) return
+              setCalendarFontPx(n)
+            }}
+            onBlur={(e) => {
+              const n = Number(e.target.value)
+              if (!Number.isFinite(n)) {
+                setCalendarFontInput(String(calendarFontPx))
+                return
+              }
+              const clamped = Math.max(CALENDAR_FONT_MIN, Math.min(CALENDAR_FONT_MAX, n))
+              setCalendarFontPx(clamped)
+              setCalendarFontInput(String(clamped))
+            }}
+            style={{ ...settingsNumberInput, width: 48 }}
+            title="Calendar font size (px)"
           />
           <div style={{ fontSize: 12, fontWeight: 700, color: ui.text2 }}>px</div>
         </div>
