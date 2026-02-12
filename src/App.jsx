@@ -591,19 +591,19 @@ function App() {
       const header = buildHeaderLine(year, m, d)
       const items = byDate.get(dateKey) ?? []
       items.sort((a, b) => {
-        const oa = a.order
-        const ob = b.order
-        if (oa != null || ob != null) {
-          if (oa == null) return 1
-          if (ob == null) return -1
-          if (oa !== ob) return oa - ob
-        }
         const sa = a.sortOrder
         const sb = b.sortOrder
         if (sa != null || sb != null) {
           if (sa == null) return 1
           if (sb == null) return -1
           if (sa !== sb) return sa - sb
+        }
+        const oa = a.order
+        const ob = b.order
+        if (oa != null || ob != null) {
+          if (oa == null) return 1
+          if (ob == null) return -1
+          if (oa !== ob) return oa - ob
         }
         const ca = a.createdAtMs
         const cb = b.createdAtMs
@@ -1485,6 +1485,44 @@ function App() {
     }
   }, [session?.user?.id])
 
+  // Realtime fallback: periodically pull plans and refresh on tab focus/visibility.
+  useEffect(() => {
+    const userId = session?.user?.id
+    if (!supabase || !userId) return
+    if (typeof window === "undefined" || typeof document === "undefined") return
+    let disposed = false
+    let inflight = false
+    const safePull = async () => {
+      if (disposed || inflight) return
+      inflight = true
+      try {
+        await loadRemotePlans(userId)
+      } catch (err) {
+        console.error("fallback pull plans", err)
+      } finally {
+        inflight = false
+      }
+    }
+    const handleVisibilityOrFocus = () => {
+      if (document.visibilityState === "visible") safePull()
+    }
+
+    const timer = setInterval(() => {
+      if (document.visibilityState !== "visible") return
+      safePull()
+    }, 12000)
+
+    window.addEventListener("focus", handleVisibilityOrFocus)
+    document.addEventListener("visibilitychange", handleVisibilityOrFocus)
+
+    return () => {
+      disposed = true
+      clearInterval(timer)
+      window.removeEventListener("focus", handleVisibilityOrFocus)
+      document.removeEventListener("visibilitychange", handleVisibilityOrFocus)
+    }
+  }, [session?.user?.id])
+
   // ===== 연도(메모 기준) =====
   const [baseYear, setBaseYear] = useState(today.getFullYear())
   const baseYearRef = useRef(baseYear)
@@ -1653,9 +1691,15 @@ function App() {
   useEffect(() => {
     if (!session?.user?.id || !remoteLoaded) return
     const forceApply = forceRemoteApplyRef.current
-    if (!forceApply && isEditingLeftMemo) return
+    if (!forceApply && isEditingLeftMemo) {
+      forceRemoteApplyRef.current = true
+      return
+    }
     const dayListGuard = dayListEditGuardRef.current
-    if (!forceApply && dayListGuard.open && dayListGuard.mode === "edit") return
+    if (!forceApply && dayListGuard.open && dayListGuard.mode === "edit") {
+      forceRemoteApplyRef.current = true
+      return
+    }
     const last = lastCloudSyncRef.current
     if (ENABLE_WEB_TEXT_PLAN_SYNC && !forceApply && last.year === baseYear && last.text !== textRef.current) return
     const previousText = textRef.current ?? getWindowMemoTextSync(baseYear, "all") ?? ""
@@ -3510,6 +3554,8 @@ function stripEmptyGroupLines(bodyText) {
   }, [])
 
   useEffect(() => {
+    // Keep mobile as source of truth when text-sync is disabled.
+    if (!ENABLE_WEB_TEXT_PLAN_SYNC) return
     if (!session?.user?.id || !remoteLoaded) return
     if (isEditingLeftMemo) return
     if (dayListModal && dayListMode === "edit") return
@@ -4536,6 +4582,12 @@ function stripEmptyGroupLines(bodyText) {
     setDayListModal(null)
     dayListDirtyRef.current = false
     dayListEditGuardRef.current = { open: false, mode: "read", dirty: false }
+    const userId = session?.user?.id
+    if (userId && forceRemoteApplyRef.current) {
+      loadRemotePlans(userId).catch((err) => {
+        console.error("reload plans after day modal close", err)
+      })
+    }
   }
 
   function toggleLeftMemo() {
