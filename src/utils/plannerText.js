@@ -1,5 +1,6 @@
 import { buildHeaderLine } from "./holiday"
 import { buildLineStartPositions, keyToTime, keyToYMD } from "./dateUtils"
+import { stripTaskSuffix } from "./taskMarkers"
 
 export const groupLineRegex = /^\s*@(.+)\(([^)]*)\)\s*$/
 export const groupLineStartRegex = /^\s*@(.+)\s*\(\s*$/
@@ -7,12 +8,12 @@ export const groupLineTitleOnlyRegex = /^\s*@(.+)\s*$/
 export const groupLineCloseRegex = /^\s*\)\s*$/
 
 export const timeTokenRegex = /^(\d{1,2}):(\d{2})$/
-export const timeRangeRegex = /^(\d{1,2}):(\d{2})\s*([~-])\s*(\d{1,2}):(\d{2})$/
-export const timePrefixRegex = /^(\d{1,2}):(\d{2})(?:\s*([~-])\s*(\d{1,2}):(\d{2}))?(?:\s*;\s*|\s+)(.+)$/
+export const timeRangeRegex = /^(\d{1,2}):(\d{2})(?:\s*([~-])\s*|\s+)(\d{1,2}):(\d{2})$/
+export const timePrefixRegex = /^(\d{1,2}):(\d{2})(?:(?:\s*([~-])\s*|\s+)(\d{1,2}):(\d{2}))?(?:\s*;\s*|\s+)(.+)$/
 
 export const mdOnlyRegex = /^\s*(\d{1,2})\/(\d{1,2})(?:\s+.*)?\s*$/
 export const ymdOnlyRegex = /^\s*(\d{4})[/-](\d{1,2})[/-](\d{1,2})(?:\s+.*)?\s*$/
-export const timeOnlyRegex = /^\s*(\d{1,2}):(\d{2})(?:\s*([~-])\s*(\d{1,2}):(\d{2}))?\s+(.+)\s*$/
+export const timeOnlyRegex = /^\s*(\d{1,2}):(\d{2})(?:(?:\s*([~-])\s*|\s+)(\d{1,2}):(\d{2}))?\s+(.+)\s*$/
 export const tabTitleRegex = /^\s*\[.+\]\s*$/
 
 export function normalizeTimeToken(token) {
@@ -27,7 +28,7 @@ export function normalizeTimeRangeToken(token) {
   if (!match) return ""
   const startH = String(Number(match[1])).padStart(2, "0")
   const endH = String(Number(match[4])).padStart(2, "0")
-  return `${startH}:${match[2]}${match[3]}${endH}:${match[5]}`
+  return `${startH}:${match[2]}${match[3] || "-"}${endH}:${match[5]}`
 }
 
 export function normalizeTimeTokenOrRange(token) {
@@ -39,7 +40,7 @@ export function parseTimePrefix(value) {
   if (!trimmed) return null
   const match = trimmed.match(timePrefixRegex)
   if (!match) return null
-  const rawTime = match[3] ? `${match[1]}:${match[2]}${match[3]}${match[4]}:${match[5]}` : `${match[1]}:${match[2]}`
+  const rawTime = match[4] ? `${match[1]}:${match[2]}${match[3] || "-"}${match[4]}:${match[5]}` : `${match[1]}:${match[2]}`
   const time = normalizeTimeTokenOrRange(rawTime)
   const text = (match[6] ?? "").trim()
   if (!text) return null
@@ -84,6 +85,22 @@ export function parseDashboardSemicolonLine(value, { allowEmptyText = false } = 
 
   if (!allowEmptyText && !text) return null
   return { time: time || "", group, text }
+}
+
+export function parseLeadingTimeDashboardLine(value, { allowEmptyText = false } = {}) {
+  const timed = parseTimePrefix(value)
+  if (!timed) return null
+
+  const combined = `${timed.time};${timed.text}`
+  const semicolon = parseDashboardSemicolonLine(combined, { allowEmptyText })
+  if (semicolon) return semicolon
+  if (!allowEmptyText && !String(timed.text ?? "").trim()) return null
+
+  return {
+    time: timed.time || "",
+    group: "",
+    text: String(timed.text ?? "").trim()
+  }
 }
 
 export function addGroupItem(groupIndex, groups, title, item) {
@@ -266,12 +283,17 @@ export function parseDashboardBlockContent(body) {
     if (!trimmed) continue
     const semicolon = parseDashboardSemicolonLine(trimmed)
     if (semicolon) {
+      const taskAware = stripTaskSuffix(semicolon.text)
       if (semicolon.group) {
-        addGroupItem(groupIndex, groups, semicolon.group, { text: semicolon.text, time: semicolon.time, order })
+        addGroupItem(groupIndex, groups, semicolon.group, {
+          text: taskAware.text,
+          time: semicolon.time,
+          order
+        })
       } else if (semicolon.time) {
-        timed.push({ time: semicolon.time, text: semicolon.text, order })
+        timed.push({ time: semicolon.time, text: taskAware.text, order })
       } else {
-        general.push(semicolon.text)
+        general.push(taskAware.text)
       }
       order++
       continue
@@ -290,8 +312,9 @@ export function parseDashboardBlockContent(body) {
         .filter((x) => x !== "")
       for (const item of items) {
         const parsed = parseTimePrefix(item)
+        const taskAware = stripTaskSuffix(parsed ? parsed.text : item)
         addGroupItem(groupIndex, groups, title, {
-          text: parsed ? parsed.text : item,
+          text: taskAware.text,
           time: parsed ? parsed.time : "",
           order
         })
@@ -302,12 +325,14 @@ export function parseDashboardBlockContent(body) {
 
     const timeLine = parseTimePrefix(trimmed)
     if (timeLine) {
-      timed.push({ time: timeLine.time, text: timeLine.text, order })
+      const taskAware = stripTaskSuffix(timeLine.text)
+      timed.push({ time: timeLine.time, text: taskAware.text, order })
       order++
       continue
     }
 
-    general.push(trimmed)
+    const taskAware = stripTaskSuffix(trimmed)
+    general.push(taskAware.text)
     order++
   }
   return { general, groups, timed }
@@ -325,7 +350,8 @@ export function buildOrderedEntriesFromBody(bodyText) {
 
     const semicolon = parseDashboardSemicolonLine(trimmed)
     if (semicolon) {
-      const text = String(semicolon.text ?? "").trim()
+      const taskAware = stripTaskSuffix(semicolon.text)
+      const text = String(taskAware.text ?? "").trim()
       if (!text) continue
       entries.push({
         time: semicolon.time || "",
@@ -350,7 +376,8 @@ export function buildOrderedEntriesFromBody(bodyText) {
         .filter((x) => x !== "")
       for (const item of items) {
         const parsed = parseTimePrefix(item)
-        const text = String(parsed ? parsed.text : item).trim()
+        const taskAware = stripTaskSuffix(parsed ? parsed.text : item)
+        const text = String(taskAware.text ?? "").trim()
         if (!text) continue
         entries.push({
           time: parsed ? parsed.time : "",
@@ -365,14 +392,16 @@ export function buildOrderedEntriesFromBody(bodyText) {
 
     const timeLine = parseTimePrefix(trimmed)
     if (timeLine) {
-      const text = String(timeLine.text ?? "").trim()
+      const taskAware = stripTaskSuffix(timeLine.text)
+      const text = String(taskAware.text ?? "").trim()
       if (!text) continue
       entries.push({ time: timeLine.time || "", text, title: "", order })
       order++
       continue
     }
 
-    entries.push({ time: "", text: trimmed, title: "", order })
+    const taskAware = stripTaskSuffix(trimmed)
+    entries.push({ time: "", text: taskAware.text, title: "", order })
     order++
   }
 
@@ -480,9 +509,9 @@ export function parseBlocksAndItems(rawText, baseYear, { allowAnyYear = false } 
       const mm = t.match(timeOnlyRegex)
       if (mm) {
         const hh = String(Number(mm[1])).padStart(2, "0")
-        if (mm[3]) {
+        if (mm[4]) {
           const endH = String(Number(mm[4])).padStart(2, "0")
-          time = `${hh}:${mm[2]}${mm[3]}${endH}:${mm[5]}`
+          time = `${hh}:${mm[2]}${mm[3] || "-"}${endH}:${mm[5]}`
           text = mm[6]
         } else {
           time = `${hh}:${mm[2]}`
@@ -511,7 +540,7 @@ export function isMemoHeaderLine(line) {
 }
 
 export function buildMemoOverlayLines(text) {
-  const lines = (text ?? "").split("\n")
+  const lines = String(text ?? "").split("\n")
   const overlay = []
 
   for (const line of lines) {

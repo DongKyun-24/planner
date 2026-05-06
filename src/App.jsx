@@ -1,10 +1,12 @@
 ﻿import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import CalendarPanel from "./components/CalendarPanel"
+import QuickCreateModal from "./components/QuickCreateModal"
 import DayListModal from "./components/DayListModal"
 import DeleteConfirmModal from "./components/DeleteConfirmModal"
-import FilterPanel from "./components/FilterPanel"
 import MemoEditor from "./components/MemoEditor"
 import MemoReadView from "./components/MemoReadView"
+import MonthNavigator from "./components/MonthNavigator"
+import RecurringRuleModal from "./components/RecurringRuleModal"
 import RightMemoEditor from "./components/RightMemoEditor"
 import SettingsPanel from "./components/SettingsPanel"
 import WindowTabs from "./components/WindowTabs"
@@ -24,8 +26,8 @@ import {
   groupLineStartRegex,
   groupLineTitleOnlyRegex,
   groupLineCloseRegex,
-  parseTimePrefix,
   parseDashboardSemicolonLine,
+  parseLeadingTimeDashboardLine,
   normalizeGroupLineNewlines,
   normalizeWindowTitle,
   makeUniqueWindowTitle,
@@ -52,6 +54,31 @@ import {
   removeEmptyBlockByDateKey,
   removeAllEmptyBlocks
 } from "./utils/plannerText"
+import {
+  addDaysToKey,
+  buildOccurrenceDateKeys,
+  buildRecurringByDate,
+  genRecurringId,
+  getPreviousDateKey,
+  isValidDateKey,
+  normalizeRepeatDays,
+  normalizeRepeatInterval,
+  normalizeRepeatType,
+  parseRecurringRawLine
+} from "./utils/recurringRules"
+import { extractTasksFromPlannerText, removeTaskLineFromBody, updateTaskLineStatusInBody } from "./utils/tasks"
+import {
+  buildTaskMetaText,
+  decodeTaskLineBreaks,
+  removeTaskLinesFromBody,
+  stripTaskSuffix
+} from "./utils/taskMarkers"
+import {
+  buildRightMemoCombinedText,
+  getRightMemoDocDisplayTitle,
+  normalizeRightMemoDocState,
+  serializeRightMemoDocState
+} from "./utils/rightMemoDocs"
 
 const CATEGORY_ID_MAP = {}
 const GENERAL_CATEGORY_ID = "__general__"
@@ -72,6 +99,14 @@ function normalizeWindowTitleValue(value) {
 
 const CLIENT_ID_KEY = "planner-client-id"
 const REMEMBER_CREDENTIALS_KEY = "planner-remember-credentials"
+const AUTH_IDENTIFIER_EMAIL_DOMAIN = "planner.local"
+const AUTH_MIN_PASSWORD_LENGTH = 6
+const OFFLINE_RECURRING_RULES_KEY = "planner-recurring-rules-offline-v1"
+const OFFLINE_RECURRING_OVERRIDES_KEY = "planner-recurring-overrides-offline-v1"
+const USER_RECURRING_RULES_KEY_PREFIX = "planner-recurring-rules-user-v1"
+const USER_RECURRING_OVERRIDES_KEY_PREFIX = "planner-recurring-overrides-user-v1"
+const USER_RECURRING_CLOUD_MIGRATION_KEY_PREFIX = "planner-recurring-cloud-migrated-v1"
+const OPEN_ENDED_REPEAT_LOOKAHEAD_DAYS = 730
 
 function getClientId() {
   if (typeof window === "undefined") return "server"
@@ -98,6 +133,8 @@ function App() {
   const readBlockRefs = useRef(new Map())
   const clientIdRef = useRef(getClientId())
   const endTimeSupportedRef = useRef(true)
+  const repeatColumnsSupportedRef = useRef(true)
+  const alarmColumnsSupportedRef = useRef(true)
 
   // ===== 창(캘린더) 탭 =====
   const WINDOWS_KEY = "planner-windows-v1"
@@ -125,6 +162,37 @@ function App() {
 
   function getMemoStoragePrefix(userId) {
     return userId ? `${USER_MEMO_PREFIX}-${userId}` : OFFLINE_MEMO_PREFIX
+  }
+
+  function getRecurringRulesStorageKey(userId) {
+    return userId ? `${USER_RECURRING_RULES_KEY_PREFIX}-${userId}` : OFFLINE_RECURRING_RULES_KEY
+  }
+
+  function getRecurringOverridesStorageKey(userId) {
+    return userId ? `${USER_RECURRING_OVERRIDES_KEY_PREFIX}-${userId}` : OFFLINE_RECURRING_OVERRIDES_KEY
+  }
+
+  function getRecurringCloudMigrationKey(userId) {
+    return userId ? `${USER_RECURRING_CLOUD_MIGRATION_KEY_PREFIX}-${userId}` : ""
+  }
+
+  function loadRecurringList(storageKey) {
+    try {
+      const raw = localStorage.getItem(storageKey)
+      if (!raw) return []
+      const parsed = JSON.parse(raw)
+      return Array.isArray(parsed) ? parsed : []
+    } catch {
+      return []
+    }
+  }
+
+  function saveRecurringList(storageKey, value) {
+    try {
+      localStorage.setItem(storageKey, JSON.stringify(Array.isArray(value) ? value : []))
+    } catch (err) {
+      void err
+    }
   }
 
   function getMemoKey(prefix, year, windowId) {
@@ -173,6 +241,61 @@ function App() {
     }
   }
 
+  const LEGACY_WINDOW_COLORS = [
+    "#c40000",
+    "#ff7a00",
+    "#ff4a00",
+    "#ffe94a",
+    "#ffd21a",
+    "#dff08a",
+    "#86e000",
+    "#0b7a0b",
+    "#0a5a1f",
+    "#7fe8d2",
+    "#98ddff",
+    "#cfe0ff",
+    "#14a7d8",
+    "#1f33d6",
+    "#1b0f7d",
+    "#6b2e8f",
+    "#e1c2ff",
+    "#ffd1e7"
+  ]
+
+  const WINDOW_COLORS = [
+    "#d7686d",
+    "#de8b5b",
+    "#e28a67",
+    "#d9c56a",
+    "#d6ba58",
+    "#c5d97b",
+    "#93c96a",
+    "#4f9d63",
+    "#4e7f65",
+    "#79c9b8",
+    "#86c0e6",
+    "#b2c8eb",
+    "#5eaed1",
+    "#5a78cf",
+    "#5b62aa",
+    "#8765b3",
+    "#c9b4e8",
+    "#e5b9cf"
+  ]
+
+  const WINDOW_COLOR_LEGACY_MAP = Object.freeze(
+    LEGACY_WINDOW_COLORS.reduce((acc, legacy, index) => {
+      acc[legacy] = WINDOW_COLORS[index] || legacy
+      return acc
+    }, {})
+  )
+
+  function normalizeWindowColor(value) {
+    const key = String(value ?? "").trim().toLowerCase()
+    if (!key) return ""
+    return WINDOW_COLOR_LEGACY_MAP[key] || (WINDOW_COLORS.includes(key) ? key : key)
+  }
+
   function loadWindows(storageKey) {
   try {
     const raw = localStorage.getItem(storageKey ?? WINDOWS_KEY)
@@ -185,7 +308,7 @@ function App() {
       .map((w) => ({
         id: w.id,
         title: normalizeWindowTitleValue(w.title),
-        color: typeof w.color === "string" ? w.color : "#2563eb",
+        color: normalizeWindowColor(typeof w.color === "string" ? w.color : "#2563eb") || "#2563eb",
         fixed: Boolean(w.fixed) || w.id === "all"
       }))
 
@@ -213,45 +336,68 @@ function App() {
 
   function saveWindows(ws, storageKey) {
   try {
-    localStorage.setItem(storageKey ?? WINDOWS_KEY, JSON.stringify(ws))
+    const normalized = (Array.isArray(ws) ? ws : []).map((w) => ({
+      ...w,
+      color: normalizeWindowColor(w?.color) || "#2563eb"
+    }))
+    localStorage.setItem(storageKey ?? WINDOWS_KEY, JSON.stringify(normalized))
   } catch (err) { void err }
   }
 
-  const WINDOW_COLORS = [
-    "#c40000", // 153 red
-    "#ff7a00", // 1201 orange
-    "#ff4a00", // 255 fluorescent orange
-    "#ffe94a", // 355 yellow
-    "#ffd21a", // 356 deep yellow
-    "#dff08a", // 452 pale yellow-green
-    "#86e000", // 455 light green
-    "#0b7a0b", // 457 green
-    "#0a5a1f", // 460 deep green
-    "#7fe8d2", // 463 jade
-    "#98ddff", // 1501 sky
-    "#cfe0ff", // 551 light sky
-    "#14a7d8", // 553 deep sky
-    "#1f33d6", // 558 blue
-    "#1b0f7d", // 562 navy
-    "#6b2e8f", // 654 purple
-    "#e1c2ff", // 657 lavender
-    "#ffd1e7" // 656 light pink
-  ]
+  function hashAuthIdentifier(value = "") {
+    let left = 0x811c9dc5
+    let right = 0x9e3779b9
+    const text = String(value ?? "")
+    for (let i = 0; i < text.length; i += 1) {
+      const code = text.charCodeAt(i)
+      left ^= code
+      left = Math.imul(left, 0x01000193) >>> 0
+      right ^= code + 0x9e37
+      right = Math.imul(right, 0x85ebca6b) >>> 0
+    }
+    return `${left.toString(16).padStart(8, "0")}${right.toString(16).padStart(8, "0")}`
+  }
+
+  function isValidAuthEmail(value = "") {
+    const text = String(value ?? "").trim()
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)
+  }
+
+  function resolveAuthIdentifier(value = "") {
+    const raw = String(value ?? "").trim()
+    if (!raw) return { input: "", email: "", isEmail: false }
+    if (isValidAuthEmail(raw)) {
+      const normalizedEmail = raw.toLowerCase()
+      return { input: raw, email: normalizedEmail, isEmail: true }
+    }
+    const normalizedId = raw.toLowerCase()
+    return {
+      input: raw,
+      email: `id_${hashAuthIdentifier(normalizedId)}@${AUTH_IDENTIFIER_EMAIL_DOMAIN}`,
+      isEmail: false
+    }
+  }
 
   // ===== Supabase (웹-앱 데이터 연동) =====
   const [session, setSession] = useState(null)
   const [authMode, setAuthMode] = useState("signIn") // "signIn" | "signUp"
   const [authEmail, setAuthEmail] = useState("")
   const [authPassword, setAuthPassword] = useState("")
+  const [authPasswordConfirm, setAuthPasswordConfirm] = useState("")
   const [authLoading, setAuthLoading] = useState(false)
   const [authMessage, setAuthMessage] = useState("")
   const [loginModalOpen, setLoginModalOpen] = useState(false)
   const [rememberCredentials, setRememberCredentials] = useState(false)
+  const [deleteAccountLoading, setDeleteAccountLoading] = useState(false)
+  const [signupTermsAgreed, setSignupTermsAgreed] = useState(false)
+  const [signupPrivacyAgreed, setSignupPrivacyAgreed] = useState(false)
+  const [signupUpdatesAgreed, setSignupUpdatesAgreed] = useState(false)
+  const [signupDetailsOpen, setSignupDetailsOpen] = useState(false)
 
-  function persistCredentials(email, password) {
+  function persistCredentials(email) {
     if (typeof window === "undefined") return
     try {
-      localStorage.setItem(REMEMBER_CREDENTIALS_KEY, JSON.stringify({ email, password }))
+      localStorage.setItem(REMEMBER_CREDENTIALS_KEY, JSON.stringify({ email }))
     } catch {
       /* ignore */
     }
@@ -267,9 +413,9 @@ function App() {
   }
 
   function closeLoginModal() {
-    if (!session) return
     setLoginModalOpen(false)
     setAuthMessage("")
+    setAuthPasswordConfirm("")
   }
 
   useEffect(() => {
@@ -279,10 +425,8 @@ function App() {
       if (!raw) return
       const parsed = JSON.parse(raw)
       const email = typeof parsed?.email === "string" ? parsed.email : ""
-      const password = typeof parsed?.password === "string" ? parsed.password : ""
       if (email) setAuthEmail(email)
-      if (password) setAuthPassword(password)
-      if (email || password) setRememberCredentials(true)
+      if (email) setRememberCredentials(true)
     } catch {
       /* ignore */
     }
@@ -294,6 +438,9 @@ function App() {
   const lastCloudSyncRef = useRef({ year: null, text: "" })
   const forceRemoteApplyRef = useRef(false)
   const lastSessionIdRef = useRef(null)
+  const remotePlansLoadSeqRef = useRef(0)
+  const remotePlansIgnoreLoadsUntilRef = useRef(0)
+  const openEndedRecurringSyncRef = useRef(false)
   const [remoteWindows, setRemoteWindows] = useState([])
   const [remoteWindowsLoaded, setRemoteWindowsLoaded] = useState(false)
   const applyingRemoteWindowsRef = useRef(false)
@@ -308,6 +455,23 @@ function App() {
   const dayListEditGuardRef = useRef({ open: false, mode: "read", dirty: false })
   const sortOrderSupportedRef = useRef(true)
   const sortOrderSyncTimerRef = useRef(null)
+  const recurringRulesStorageKey = useMemo(
+    () => getRecurringRulesStorageKey(session?.user?.id ?? null),
+    [session?.user?.id]
+  )
+  const recurringOverridesStorageKey = useMemo(
+    () => getRecurringOverridesStorageKey(session?.user?.id ?? null),
+    [session?.user?.id]
+  )
+  const recurringCloudMigrationKey = useMemo(
+    () => getRecurringCloudMigrationKey(session?.user?.id ?? null),
+    [session?.user?.id]
+  )
+  const [recurringRules, setRecurringRules] = useState(() => loadRecurringList(OFFLINE_RECURRING_RULES_KEY))
+  const [recurringOverrides, setRecurringOverrides] = useState(() => loadRecurringList(OFFLINE_RECURRING_OVERRIDES_KEY))
+  const [recurringModalState, setRecurringModalState] = useState(null)
+  const recurringCloudMigrationRunningRef = useRef(false)
+  const [quickCreateModalState, setQuickCreateModalState] = useState(null)
 
   const [text, setText] = useState("")
   const [today, setToday] = useState(() => new Date())
@@ -341,7 +505,7 @@ function App() {
   }, [])
 
   function pickNextWindowColor(ws) {
-    const used = new Set(ws.map((w) => w.color))
+    const used = new Set(ws.map((w) => normalizeWindowColor(w?.color)).filter(Boolean))
     const available = WINDOW_COLORS.find((c) => !used.has(c))
     return available ?? WINDOW_COLORS[ws.length % WINDOW_COLORS.length]
   }
@@ -392,18 +556,40 @@ function App() {
     return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`
   }
 
+  function normalizeAlarmLeadMinutes(value) {
+    const n = Number.parseInt(String(value ?? "0"), 10)
+    if (!Number.isFinite(n) || n < 0) return 0
+    return [0, 5, 10, 30].includes(n) ? n : 0
+  }
+
   function parseTimeSpanToken(value) {
     const raw = String(value ?? "").trim()
     if (!raw) return { startTime: "", endTime: "", hasInput: false, isValid: true }
     const single = normalizeClockTime(raw)
     if (single) return { startTime: single, endTime: "", hasInput: true, isValid: true }
-    const match = raw.match(/^(\d{1,2}):(\d{2})\s*[~-]\s*(\d{1,2}):(\d{2})$/)
+    const match = raw.match(/^(\d{1,2}):(\d{2})(?:\s*[~-]\s*|\s+)(\d{1,2}):(\d{2})$/)
     if (!match) return { startTime: "", endTime: "", hasInput: true, isValid: false }
     const startTime = normalizeClockTime(`${match[1]}:${match[2]}`)
     const endTime = normalizeClockTime(`${match[3]}:${match[4]}`)
     if (!startTime) return { startTime: "", endTime: "", hasInput: true, isValid: false }
     if (!endTime || endTime === startTime) return { startTime, endTime: "", hasInput: true, isValid: false }
     return { startTime, endTime, hasInput: true, isValid: true }
+  }
+
+  function parseLeadingPlanTimeText(value) {
+    const raw = String(value ?? "").trim()
+    if (!raw) return null
+    const match = raw.match(/^(\d{1,2}:\d{2})(?:(?:\s*[~-]\s*|\s+)(\d{1,2}:\d{2}))?(?:\s*;\s*|\s+)(.+)$/)
+    if (!match) return null
+    const timeToken = match[2] ? `${match[1]}-${match[2]}` : match[1]
+    const parsed = parseTimeSpanToken(timeToken)
+    const content = String(match[3] ?? "").trim()
+    if (!parsed.isValid || !parsed.startTime || !content) return null
+    return {
+      time: parsed.startTime,
+      end_time: parsed.endTime || null,
+      content
+    }
   }
 
   function normalizePlanTimeFields(row) {
@@ -425,6 +611,278 @@ function App() {
     return start
   }
 
+  function genSeriesId() {
+    return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (ch) => {
+      const r = Math.floor(Math.random() * 16)
+      const v = ch === "x" ? r : (r & 0x3) | 0x8
+      return v.toString(16)
+    })
+  }
+
+  function dateToKey(date) {
+    const year = date.getFullYear()
+    const month = String(date.getMonth() + 1).padStart(2, "0")
+    const day = String(date.getDate()).padStart(2, "0")
+    return `${year}-${month}-${day}`
+  }
+
+  function getDefaultWeeklyDaysForDate(dateKey) {
+    const key = String(dateKey ?? "").trim()
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(key)) return []
+    const { y, m, d } = keyToYMD(key)
+    return [dayOfWeek(y, m, d)]
+  }
+
+  function getOpenEndedRepeatHorizonDateKey(baseDate = new Date(), lookaheadDays = OPEN_ENDED_REPEAT_LOOKAHEAD_DAYS) {
+    const start = new Date(baseDate.getFullYear(), baseDate.getMonth(), baseDate.getDate())
+    start.setDate(start.getDate() + Math.max(1, Number(lookaheadDays) || OPEN_ENDED_REPEAT_LOOKAHEAD_DAYS))
+    return dateToKey(start)
+  }
+
+  function getOpenEndedRepeatSpanDays(startDateKey, baseDate = new Date(), lookaheadDays = OPEN_ENDED_REPEAT_LOOKAHEAD_DAYS) {
+    const startMs = keyToTime(startDateKey)
+    if (!Number.isFinite(startMs)) return 365
+    const horizonMs = keyToTime(getOpenEndedRepeatHorizonDateKey(baseDate, lookaheadDays))
+    const diffDays = Math.ceil((horizonMs - startMs) / (24 * 60 * 60 * 1000))
+    return Math.max(365, diffDays)
+  }
+
+  function normalizeRepeatMeta(row) {
+    const repeatType = normalizeRepeatType(row?.repeat_type ?? row?.repeatType)
+    const repeatInterval = repeatType === "none" ? 1 : normalizeRepeatInterval(row?.repeat_interval ?? row?.repeatInterval)
+    const repeatDays = repeatType === "weekly" ? normalizeRepeatDays(row?.repeat_days ?? row?.repeatDays) : []
+    const repeatUntil = repeatType === "none" ? "" : String(row?.repeat_until ?? row?.repeatUntil ?? "").trim()
+    const seriesId = String(row?.series_id ?? row?.seriesId ?? "").trim()
+    return { repeatType, repeatInterval, repeatDays, repeatUntil, seriesId }
+  }
+
+  function isRecurringPlanRow(row) {
+    const repeatMeta = normalizeRepeatMeta(row)
+    return repeatMeta.repeatType !== "none" || Boolean(repeatMeta.seriesId)
+  }
+
+  function buildRecurringRawLineFromPlanRow(row) {
+    const taskAware = stripTaskSuffix(String(row?.content ?? "").trim())
+    const baseText = String(taskAware.text ?? "").trim()
+    if (!baseText) return ""
+    const normalizedTime = normalizePlanTimeFields(row)
+    const timeLabel = buildTimeSpanLabel(normalizedTime.time, normalizedTime.end_time)
+
+    const parts = []
+    if (timeLabel) parts.push(timeLabel)
+    parts.push(baseText)
+
+    return buildTaskMetaText(parts.join(";"), {
+      completed: taskAware.completed
+    })
+  }
+
+  function getNextSortOrderForDate(dateKey, planRows, excludedIds = null) {
+    if (!sortOrderSupportedRef.current) return null
+    const key = String(dateKey ?? "").trim()
+    if (!key) return null
+    const excludeSet = excludedIds instanceof Set ? excludedIds : null
+    const list = (planRows ?? []).filter((row) => {
+      if (!row || row?.deleted_at) return false
+      if (String(row?.date ?? "").trim() !== key) return false
+      const id = String(row?.id ?? "").trim()
+      if (excludeSet && id && excludeSet.has(id)) return false
+      return true
+    })
+    if (list.length === 0) return 0
+    const values = list
+      .map((row) => parsePlanOrderValue(row?.sort_order ?? row?.sortOrder ?? row?.order))
+      .filter((n) => n != null)
+    if (values.length === 0) return null
+    return Math.max(...values) + 1
+  }
+
+  function comparePlanRowsForDefaultInsert(a, b) {
+    const sortA = parsePlanOrderValue(a?.sort_order ?? a?.sortOrder ?? a?.order)
+    const sortB = parsePlanOrderValue(b?.sort_order ?? b?.sortOrder ?? b?.order)
+    if (sortA != null || sortB != null) {
+      if (sortA == null) return 1
+      if (sortB == null) return -1
+      if (sortA !== sortB) return sortA - sortB
+    }
+    const timeA = buildTimeSpanLabel(a?.time, a?.end_time ?? a?.endTime)
+    const timeB = buildTimeSpanLabel(b?.time, b?.end_time ?? b?.endTime)
+    if (timeA && timeB && timeA !== timeB) return timeA.localeCompare(timeB)
+    if (timeA && !timeB) return -1
+    if (!timeA && timeB) return 1
+    const createdA = parsePlanTimestampMs(a?.created_at ?? a?.createdAt)
+    const createdB = parsePlanTimestampMs(b?.created_at ?? b?.createdAt)
+    if (createdA != null || createdB != null) {
+      if (createdA == null) return 1
+      if (createdB == null) return -1
+      if (createdA !== createdB) return createdA - createdB
+    }
+    return String(a?.id ?? "").localeCompare(String(b?.id ?? ""), "en")
+  }
+
+  function compareTimedPlanRowsByStart(a, b) {
+    const normalizedA = normalizePlanTimeFields(a)
+    const normalizedB = normalizePlanTimeFields(b)
+    const timeA = String(normalizedA?.time ?? "").trim()
+    const timeB = String(normalizedB?.time ?? "").trim()
+    if (timeA && timeB && timeA !== timeB) return timeA.localeCompare(timeB)
+    if (timeA && !timeB) return -1
+    if (!timeA && timeB) return 1
+    const endA = String(normalizedA?.end_time ?? "").trim()
+    const endB = String(normalizedB?.end_time ?? "").trim()
+    if (endA && endB && endA !== endB) return endA.localeCompare(endB)
+    if (endA && !endB) return -1
+    if (!endA && endB) return 1
+    return comparePlanRowsForDefaultInsert(a, b)
+  }
+
+  function enforceTimedPlanOrderInSlots(rows) {
+    const list = Array.isArray(rows) ? rows : []
+    if (list.length <= 1) return list
+    const timedRows = list
+      .filter((row) => String(normalizePlanTimeFields(row)?.time ?? "").trim())
+      .sort(compareTimedPlanRowsByStart)
+    if (timedRows.length <= 1) return list
+    let timedIndex = 0
+    return list.map((row) =>
+      String(normalizePlanTimeFields(row)?.time ?? "").trim() ? timedRows[timedIndex++] ?? row : row
+    )
+  }
+
+  function buildDefaultInsertSortPlan(dateKey, planRows, nextRow) {
+    if (!sortOrderSupportedRef.current) return null
+    const key = String(dateKey ?? "").trim()
+    if (!key) return null
+    const rows = (planRows ?? [])
+      .filter((row) => {
+        if (!row || row?.deleted_at) return false
+        return String(row?.date ?? "").trim() === key
+      })
+      .sort(comparePlanRowsForDefaultInsert)
+    const nextTime = buildTimeSpanLabel(nextRow?.time, nextRow?.end_time ?? nextRow?.endTime)
+    let insertIndex = rows.length
+    if (nextTime) {
+      const earlierTimedIndex = rows.findIndex((row) => {
+        const rowTime = buildTimeSpanLabel(row?.time, row?.end_time ?? row?.endTime)
+        return rowTime && rowTime.localeCompare(nextTime) > 0
+      })
+      if (earlierTimedIndex >= 0) {
+        insertIndex = earlierTimedIndex
+      } else {
+        const lastTimedIndex = rows.reduce((last, row, idx) => {
+          const rowTime = buildTimeSpanLabel(row?.time, row?.end_time ?? row?.endTime)
+          return rowTime ? idx : last
+        }, -1)
+        insertIndex = lastTimedIndex >= 0 ? lastTimedIndex + 1 : 0
+      }
+    }
+    const updates = rows
+      .map((row, index) => {
+        const rowId = String(row?.id ?? "").trim()
+        if (!rowId) return null
+        const order = index >= insertIndex ? index + 1 : index
+        return { id: rowId, order }
+      })
+      .filter(Boolean)
+    return { sortOrder: insertIndex, updates }
+  }
+
+  function buildCloudRecurringByDate(planRows, year, categoryFilter = null) {
+    const yearPrefix = `${year}-`
+    const familyRange = new Map()
+
+    for (const row of planRows ?? []) {
+      if (!row || row?.deleted_at || !isRecurringPlanRow(row)) continue
+      const dateKey = String(row?.date ?? "").trim()
+      if (!dateKey) continue
+      const repeatMeta = normalizeRepeatMeta(row)
+      const familyId = repeatMeta.seriesId || String(row?.id ?? "").trim()
+      if (!familyId) continue
+      const untilDateKey = repeatMeta.repeatUntil || dateKey
+      const current = familyRange.get(familyId)
+      if (!current) {
+        familyRange.set(familyId, { startDateKey: dateKey, untilDateKey })
+        continue
+      }
+      if (keyToTime(dateKey) < keyToTime(current.startDateKey)) current.startDateKey = dateKey
+      if (keyToTime(untilDateKey) > keyToTime(current.untilDateKey)) current.untilDateKey = untilDateKey
+    }
+
+    const out = {}
+    for (const row of planRows ?? []) {
+      if (!row || row?.deleted_at || !isRecurringPlanRow(row)) continue
+      const dateKey = String(row?.date ?? "").trim()
+      if (!dateKey.startsWith(yearPrefix)) continue
+
+      const rawLine = buildRecurringRawLineFromPlanRow(row)
+      if (!rawLine) continue
+
+      let categoryTitle = normalizeCategoryId(String(row?.category_id ?? "").trim())
+      if (isGeneralCategoryId(categoryTitle)) categoryTitle = ""
+      if (categoryFilter) {
+        if (!categoryTitle || categoryTitle !== categoryFilter) continue
+      }
+
+      const repeatMeta = normalizeRepeatMeta(row)
+      const familyId = repeatMeta.seriesId || String(row?.id ?? "").trim()
+      const family = familyRange.get(familyId) ?? {
+        startDateKey: dateKey,
+        untilDateKey: repeatMeta.repeatUntil || dateKey
+      }
+
+      ;(out[dateKey] ??= []).push({
+        id: `rec-plan-${String(row?.id ?? familyId)}`,
+        planId: row?.id,
+        row,
+        ruleId: String(row?.id ?? "").trim(),
+        familyId,
+        dateKey,
+        repeat: repeatMeta.repeatType,
+        repeatInterval: repeatMeta.repeatInterval,
+        repeatDays: repeatMeta.repeatDays,
+        rawLine,
+        display: "",
+        time: "",
+        title: categoryTitle,
+        text: "",
+        createdAt: String(row?.created_at ?? row?.createdAt ?? "").trim(),
+        updatedAt: String(row?.updated_at ?? row?.updatedAt ?? "").trim(),
+        familyStartDateKey: family.startDateKey,
+        familyUntilDateKey: family.untilDateKey,
+        repeatUntilKey: repeatMeta.repeatUntil || ""
+      })
+    }
+
+    for (const dateKey of Object.keys(out)) {
+      out[dateKey].sort((a, b) => {
+        const rowA = a?.row ?? null
+        const rowB = b?.row ?? null
+        const sortA = parsePlanOrderValue(rowA?.sort_order ?? rowA?.sortOrder ?? rowA?.order)
+        const sortB = parsePlanOrderValue(rowB?.sort_order ?? rowB?.sortOrder ?? rowB?.order)
+        if (sortA != null || sortB != null) {
+          if (sortA == null) return 1
+          if (sortB == null) return -1
+          if (sortA !== sortB) return sortA - sortB
+        }
+        const timeA = buildTimeSpanLabel(rowA?.time, rowA?.end_time ?? rowA?.endTime)
+        const timeB = buildTimeSpanLabel(rowB?.time, rowB?.end_time ?? rowB?.endTime)
+        if (timeA && timeB && timeA !== timeB) return timeA.localeCompare(timeB)
+        if (timeA && !timeB) return -1
+        if (!timeA && timeB) return 1
+        const createdA = parsePlanTimestampMs(rowA?.created_at ?? rowA?.createdAt)
+        const createdB = parsePlanTimestampMs(rowB?.created_at ?? rowB?.createdAt)
+        if (createdA != null || createdB != null) {
+          if (createdA == null) return 1
+          if (createdB == null) return -1
+          if (createdA !== createdB) return createdA - createdB
+        }
+        return String(rowA?.id ?? "").localeCompare(String(rowB?.id ?? ""), "en")
+      })
+    }
+
+    return out
+  }
+
   function isSortOrderColumnError(error) {
     const msg = String(error?.message ?? "").toLowerCase()
     return msg.includes("sort_order") || (msg.includes("column") && msg.includes("sort") && msg.includes("order"))
@@ -433,6 +891,44 @@ function App() {
   function isEndTimeColumnError(error) {
     const msg = String(error?.message ?? "").toLowerCase()
     return msg.includes("end_time") || (msg.includes("column") && msg.includes("end") && msg.includes("time"))
+  }
+
+  function isRepeatColumnError(error) {
+    const msg = String(error?.message ?? "").toLowerCase()
+    if (!msg) return false
+    return (
+      msg.includes("repeat_type") ||
+      msg.includes("repeat_interval") ||
+      msg.includes("repeat_days") ||
+      msg.includes("repeat_until") ||
+      msg.includes("series_id") ||
+      msg.includes("invalid input syntax for type uuid")
+    )
+  }
+
+  function isAlarmColumnError(error) {
+    const msg = String(error?.message ?? "").toLowerCase()
+    if (!msg) return false
+    return (
+      msg.includes("alarm_enabled") ||
+      msg.includes("alarm_lead_minutes") ||
+      (msg.includes("column") && msg.includes("alarm"))
+    )
+  }
+
+  function markRepeatFallbackNotice() {
+    if (!repeatColumnsSupportedRef.current) return
+    repeatColumnsSupportedRef.current = false
+    setAuthMessage("반복 일정 DB 컬럼이 없어 웹 반복 일정은 기기 간 동기화되지 않습니다. SQL 마이그레이션을 먼저 적용해야 합니다.")
+  }
+
+  function isRightMemoMetaColumnError(error) {
+    const msg = String(error?.message ?? "").toLowerCase()
+    if (!msg) return false
+    return (
+      msg.includes("right_memos") &&
+      (msg.includes("client_id") || msg.includes("updated_at") || (msg.includes("column") && msg.includes("memo")))
+    )
   }
 
   function stripEndTimeFromRows(rows) {
@@ -453,107 +949,67 @@ function App() {
     })
   }
 
+  function stripAlarmFromRows(rows) {
+    const list = Array.isArray(rows) ? rows : []
+    return list.map((row) => {
+      const next = { ...(row ?? {}) }
+      delete next.alarm_enabled
+      delete next.alarm_lead_minutes
+      return next
+    })
+  }
+
+  function buildPlanContentWithMeta(
+    baseText,
+    { completed = null } = {}
+  ) {
+    return buildTaskMetaText(baseText, { completed })
+  }
+
+  function pushExtractedPlanRow(out, { dateKey, time = "", title = "", rawText = "", order = 0 } = {}) {
+    const taskAware = stripTaskSuffix(rawText)
+    const text = String(taskAware.text ?? "").trim()
+    if (!text) return
+    const normalizedTitle = normalizeCategoryId(String(title ?? "").trim())
+    const timeFields = normalizePlanTimeFields({ time: String(time ?? "").trim() })
+    out.push({
+      date: String(dateKey ?? "").trim(),
+      time: timeFields.time,
+      end_time: timeFields.end_time,
+      category_id: normalizedTitle || GENERAL_CATEGORY_ID,
+      content: buildPlanContentWithMeta(text, {
+        completed: taskAware.completed
+      }),
+      sort_order: Number.isFinite(order) ? order : 0
+    })
+  }
+
   function buildPlanOrderMapFromText(sourceText, year) {
     const map = new Map()
-    const src = String(sourceText ?? "")
-    if (!src.trim()) return map
-
-    const parsed = parseBlocksAndItems(src, year, { allowAnyYear: true })
-    for (const block of parsed.blocks) {
-      const body = src.slice(block.bodyStartPos, block.blockEndPos)
-      const normalizedBody = normalizeGroupLineNewlines(body)
-      const lines = normalizedBody.split("\n")
-      let order = 0
-
-      for (const rawLine of lines) {
-        const trimmed = rawLine.trim()
-        if (!trimmed) continue
-
-        const semicolon = parseDashboardSemicolonLine(trimmed)
-        if (semicolon) {
-          const categoryId = semicolon.group ? normalizeCategoryId(semicolon.group) : GENERAL_CATEGORY_ID
-          const timeFields = normalizePlanTimeFields({ time: semicolon.time || "" })
-          const key = buildPlanKey({
-            date: block.dateKey,
-            time: timeFields.time,
-            end_time: timeFields.end_time,
-            category_id: categoryId,
-            content: semicolon.text
-          })
-          if (!map.has(key)) map.set(key, order)
-          order++
-          continue
-        }
-
-        const emptySemicolon = parseDashboardSemicolonLine(trimmed, { allowEmptyText: true })
-        if (emptySemicolon && !emptySemicolon.text) continue
-
-        const match = trimmed.match(groupLineRegex)
-        if (match) {
-          const title = normalizeCategoryId(match[1].trim())
-          if (!title) continue
-          const items = String(match[2] ?? "")
-            .split(";")
-            .map((x) => x.trim())
-            .filter((x) => x !== "")
-          for (const item of items) {
-            const parsedItem = parseTimePrefix(item)
-            const text = parsedItem ? parsedItem.text : item
-            if (!text) continue
-            const timeFields = normalizePlanTimeFields({ time: parsedItem ? parsedItem.time : "" })
-            const key = buildPlanKey({
-              date: block.dateKey,
-              time: timeFields.time,
-              end_time: timeFields.end_time,
-              category_id: title,
-              content: text
-            })
-            if (!map.has(key)) map.set(key, order)
-            order++
-          }
-          continue
-        }
-
-        const timeLine = parseTimePrefix(trimmed)
-        if (timeLine) {
-          const timeFields = normalizePlanTimeFields({ time: timeLine.time || "" })
-          const key = buildPlanKey({
-            date: block.dateKey,
-            time: timeFields.time,
-            end_time: timeFields.end_time,
-            category_id: GENERAL_CATEGORY_ID,
-            content: timeLine.text
-          })
-          if (!map.has(key)) map.set(key, order)
-          order++
-          continue
-        }
-
-        const key = buildPlanKey({
-          date: block.dateKey,
-          time: "",
-          category_id: GENERAL_CATEGORY_ID,
-          content: trimmed
-        })
-        if (!map.has(key)) map.set(key, order)
-        order++
-      }
+    const extracted = extractPlansFromText(sourceText ?? "", year)
+    for (const row of extracted) {
+      const key = buildPlanKey(row)
+      if (!key || map.has(key)) continue
+      const order = Number.isFinite(row?.sort_order) ? row.sort_order : map.size
+      map.set(key, order)
     }
-
     return map
   }
 
   function buildTextFromPlans(plans, year, previousText = "") {
     const yearPrefix = `${year}-`
     const orderMap = buildPlanOrderMapFromText(previousText, year)
+
     const byDate = new Map()
     let rowIndex = 0
     for (const row of plans ?? []) {
       if (row?.deleted_at) continue
+      if (isRecurringPlanRow(row)) continue
       const dateKey = String(row?.date ?? "")
       if (!dateKey.startsWith(yearPrefix)) continue
-      const content = String(row?.content ?? "").trim()
-      if (!content) continue
+      const taskAware = stripTaskSuffix(row?.content)
+      const baseContent = String(taskAware.text ?? "").trim()
+      if (!baseContent) continue
       const category = normalizeCategoryId(String(row?.category_id ?? "").trim())
       const isGeneral = isGeneralCategoryId(category)
       const normalizedTime = normalizePlanTimeFields(row)
@@ -561,6 +1017,9 @@ function App() {
       const endTime = normalizedTime.end_time ?? ""
       const timeLabel = buildTimeSpanLabel(time, endTime)
       const categoryId = isGeneral ? GENERAL_CATEGORY_ID : category
+      const content = buildPlanContentWithMeta(baseContent, {
+        completed: taskAware.completed
+      })
       const sortOrder = parsePlanOrderValue(row?.sort_order ?? row?.sortOrder ?? row?.order)
       const createdAtMs = parsePlanTimestampMs(row?.created_at ?? row?.createdAt)
       const updatedAtMs = parsePlanTimestampMs(row?.updated_at ?? row?.updatedAt)
@@ -574,6 +1033,9 @@ function App() {
         category: isGeneral ? "" : category,
         categoryId,
         content,
+        baseContent,
+        isTask: taskAware.completed != null,
+        taskCompleted: Boolean(taskAware.completed),
         isGeneral,
         order: preservedOrder,
         sortOrder,
@@ -627,8 +1089,16 @@ function App() {
         return (a.idx ?? 0) - (b.idx ?? 0)
       })
       const lines = items.map((item) => {
-        if (item.isGeneral) return item.timeLabel ? `${item.timeLabel};${item.content}` : item.content
-        return item.timeLabel ? `${item.timeLabel};@${item.category};${item.content}` : `@${item.category};${item.content}`
+        const baseLine = item.isGeneral
+          ? item.timeLabel
+            ? `${item.timeLabel};${item.baseContent}`
+            : item.baseContent
+          : item.timeLabel
+            ? `${item.timeLabel};@${item.category};${item.baseContent}`
+            : `@${item.category};${item.baseContent}`
+        let line = baseLine
+        if (item.isTask) line += `;${item.taskCompleted ? "O" : "X"}`
+        return line
       })
       return lines.length > 0 ? `${header}\n${lines.join("\n")}` : header
     })
@@ -639,21 +1109,73 @@ function App() {
     const out = []
     const parsed = parseBlocksAndItems(sourceText ?? "", year)
     for (const block of parsed.blocks) {
-      const body = (sourceText ?? "").slice(block.bodyStartPos, block.blockEndPos)
-      const entries = buildOrderedEntriesFromBody(body)
-      for (const entry of entries) {
-        const text = String(entry?.text ?? "").trim()
-        if (!text) continue
-        const title = normalizeCategoryId(String(entry?.title ?? "").trim())
-        const timeFields = normalizePlanTimeFields({ time: entry?.time ? String(entry.time).trim() : "" })
-        out.push({
-          date: block.dateKey,
-          time: timeFields.time,
-          end_time: timeFields.end_time,
-          category_id: title || GENERAL_CATEGORY_ID,
-          content: text,
-          sort_order: entry?.order ?? 0
+      const body = normalizeGroupLineNewlines(
+        (sourceText ?? "")
+          .slice(block.bodyStartPos, block.blockEndPos)
+      )
+      const lines = body.split("\n")
+      let order = 0
+      for (const rawLine of lines) {
+        const trimmed = String(rawLine ?? "").trim()
+        if (!trimmed) continue
+
+        const semicolon = parseDashboardSemicolonLine(trimmed)
+        if (semicolon) {
+          pushExtractedPlanRow(out, {
+            dateKey: block.dateKey,
+            time: semicolon.time || "",
+            title: semicolon.group ?? "",
+            rawText: semicolon.text,
+            order
+          })
+          order += 1
+          continue
+        }
+
+        const emptySemicolon = parseDashboardSemicolonLine(trimmed, { allowEmptyText: true })
+        if (emptySemicolon && !emptySemicolon.text) continue
+
+        const match = trimmed.match(groupLineRegex)
+        if (match) {
+          const title = normalizeCategoryId(String(match[1] ?? "").trim())
+          if (!title) continue
+          const items = String(match[2] ?? "")
+            .split(";")
+            .map((x) => x.trim())
+            .filter((x) => x !== "")
+          for (const item of items) {
+            const parsedItem = parseLeadingTimeDashboardLine(item)
+            pushExtractedPlanRow(out, {
+              dateKey: block.dateKey,
+              time: parsedItem ? parsedItem.time : "",
+              title: parsedItem?.group || title,
+              rawText: parsedItem ? parsedItem.text : item,
+              order
+            })
+            order += 1
+          }
+          continue
+        }
+
+        const timeLine = parseLeadingTimeDashboardLine(trimmed)
+        if (timeLine) {
+          pushExtractedPlanRow(out, {
+            dateKey: block.dateKey,
+            time: timeLine.time || "",
+            title: timeLine.group ?? "",
+            rawText: timeLine.text,
+            order
+          })
+          order += 1
+          continue
+        }
+
+        pushExtractedPlanRow(out, {
+          dateKey: block.dateKey,
+          rawText: trimmed,
+          order
         })
+        order += 1
       }
     }
     return out
@@ -676,8 +1198,15 @@ function App() {
     )
   }
 
-  async function loadRemotePlans(userId) {
+  function suspendRemotePlansLoads(ms = 2500) {
+    remotePlansIgnoreLoadsUntilRef.current = Math.max(remotePlansIgnoreLoadsUntilRef.current, Date.now() + ms)
+  }
+
+  async function loadRemotePlans(userId, options = {}) {
     if (!supabase) return
+    const force = Boolean(options?.force)
+    const requestSeq = ++remotePlansLoadSeqRef.current
+    const blockedUntilAtStart = remotePlansIgnoreLoadsUntilRef.current
     const { data, error } = await supabase
       .from("plans")
       .select("*")
@@ -685,6 +1214,14 @@ function App() {
       .is("deleted_at", null)
     if (error) {
       console.error("load plans", error)
+      return
+    }
+    if (requestSeq !== remotePlansLoadSeqRef.current) return
+    if (
+      !force &&
+      (blockedUntilAtStart !== remotePlansIgnoreLoadsUntilRef.current ||
+        Date.now() < remotePlansIgnoreLoadsUntilRef.current)
+    ) {
       return
     }
     const updates = []
@@ -708,6 +1245,12 @@ function App() {
     setRemoteLoaded(true)
     const titles = new Set(rows.map((row) => String(row.category_id ?? "").trim()).filter(Boolean))
     ensureWindowsForCategories(titles)
+    ensureOpenEndedRecurringCoverage(userId, rows)
+      .then((changed) => {
+        if (!changed) return
+        loadRemotePlans(userId, { force: true }).catch(() => {})
+      })
+      .catch(() => {})
   }
 
   async function loadRemoteWindows(userId) {
@@ -725,7 +1268,7 @@ function App() {
     const rows = (data ?? []).filter((row) => row && row.title).map((row) => ({
       id: row.id,
       title: normalizeWindowTitleValue(row.title),
-      color: typeof row.color === "string" ? row.color : "#2563eb",
+      color: normalizeWindowColor(typeof row.color === "string" ? row.color : "#2563eb") || "#2563eb",
       fixed: Boolean(row.is_fixed)
     }))
 
@@ -773,7 +1316,7 @@ function App() {
       .map((w, idx) => ({
         id: isUuid(w.id) ? w.id : null,
         title: normalizeWindowTitleValue(w.title),
-        color: typeof w.color === "string" ? w.color : "#2563eb",
+        color: normalizeWindowColor(typeof w.color === "string" ? w.color : "#2563eb") || "#2563eb",
         sort_order: idx,
         is_fixed: Boolean(w.fixed)
       }))
@@ -1067,35 +1610,87 @@ function App() {
 
   function extractPlansFromDayBody(bodyText, dateKey, scopedWindowTitle = null) {
     const out = []
-    const entries = buildOrderedEntriesFromBody(bodyText ?? "")
     const scopedTitle = scopedWindowTitle ? normalizeCategoryId(scopedWindowTitle) : null
+    const body = normalizeGroupLineNewlines(String(bodyText ?? ""))
+    const lines = body.split("\n")
+    let order = 0
 
-    for (const entry of entries) {
-      const text = String(entry?.text ?? "").trim()
-      if (!text) continue
-      const entryTitle = normalizeCategoryId(String(entry?.title ?? "").trim())
-      const timeFields = normalizePlanTimeFields({ time: entry?.time ? String(entry.time).trim() : "" })
-      if (scopedTitle) {
-        if (entryTitle && entryTitle !== scopedTitle) continue
-        out.push({
-          date: dateKey,
-          time: timeFields.time,
-          end_time: timeFields.end_time,
-          category_id: scopedTitle,
-          content: text,
-          sort_order: entry?.order ?? 0
+    for (const rawLine of lines) {
+      const trimmed = String(rawLine ?? "").trim()
+      if (!trimmed) continue
+
+      const semicolon = parseDashboardSemicolonLine(trimmed)
+      if (semicolon) {
+        const entryTitle = normalizeCategoryId(String(semicolon.group ?? "").trim())
+        if (scopedTitle && entryTitle && entryTitle !== scopedTitle) {
+          order += 1
+          continue
+        }
+        pushExtractedPlanRow(out, {
+          dateKey,
+          time: semicolon.time || "",
+          title: scopedTitle || entryTitle || "",
+          rawText: semicolon.text,
+          order
         })
+        order += 1
         continue
       }
 
-      out.push({
-        date: dateKey,
-        time: timeFields.time,
-        end_time: timeFields.end_time,
-        category_id: entryTitle || GENERAL_CATEGORY_ID,
-        content: text,
-        sort_order: entry?.order ?? 0
+      const emptySemicolon = parseDashboardSemicolonLine(trimmed, { allowEmptyText: true })
+      if (emptySemicolon && !emptySemicolon.text) continue
+
+      const match = trimmed.match(groupLineRegex)
+      if (match) {
+        const title = normalizeCategoryId(String(match[1] ?? "").trim())
+        if (!title) continue
+        const items = String(match[2] ?? "")
+          .split(";")
+          .map((x) => x.trim())
+          .filter((x) => x !== "")
+        for (const item of items) {
+          const parsedItem = parseLeadingTimeDashboardLine(item)
+          if (scopedTitle && title !== scopedTitle) {
+            order += 1
+            continue
+          }
+          pushExtractedPlanRow(out, {
+            dateKey,
+            time: parsedItem ? parsedItem.time : "",
+            title: scopedTitle || parsedItem?.group || title,
+            rawText: parsedItem ? parsedItem.text : item,
+            order
+          })
+          order += 1
+        }
+        continue
+      }
+
+      const timeLine = parseLeadingTimeDashboardLine(trimmed)
+      if (timeLine) {
+        const entryTitle = normalizeCategoryId(String(timeLine.group ?? "").trim())
+        if (scopedTitle && entryTitle && entryTitle !== scopedTitle) {
+          order += 1
+          continue
+        }
+        pushExtractedPlanRow(out, {
+          dateKey,
+          time: timeLine.time || "",
+          title: scopedTitle || entryTitle || "",
+          rawText: timeLine.text,
+          order
+        })
+        order += 1
+        continue
+      }
+
+      pushExtractedPlanRow(out, {
+        dateKey,
+        title: scopedTitle || "",
+        rawText: trimmed,
+        order
       })
+      order += 1
     }
     return out
   }
@@ -1104,6 +1699,7 @@ function App() {
     if (!canUseWebRowPlanEdit) return
     if (!supabase || !session?.user?.id) return
     const userId = session.user.id
+    suspendRemotePlansLoads()
     const scopedWindow =
       windowId && windowId !== "all" ? windows.find((w) => String(w?.id) === String(windowId)) : null
     if (windowId && windowId !== "all" && !scopedWindow) return
@@ -1131,9 +1727,10 @@ function App() {
       return
     }
 
+    const currentRowsFiltered = (currentRows ?? []).filter((row) => !isRecurringPlanRow(row))
     const currentMap = new Map()
     const duplicateRows = []
-    for (const row of currentRows ?? []) {
+    for (const row of currentRowsFiltered) {
       const key = buildPlanKey(row)
       if (!key) continue
       if (currentMap.has(key)) {
@@ -1242,7 +1839,7 @@ function App() {
         .filter((title) => title && !isGeneralCategoryId(title))
     )
     ensureWindowsForCategories(categoryTitles)
-    await loadRemotePlans(userId)
+    await loadRemotePlans(userId, { force: true })
   }
 
   function runPendingDayListSyncNow() {
@@ -1429,12 +2026,186 @@ function App() {
   }, [session])
 
   useEffect(() => {
+    setAuthMessage("")
+    if (authMode === "signIn") setAuthPasswordConfirm("")
+  }, [authMode])
+
+  useEffect(() => {
     const nextId = session?.user?.id ?? null
     if (nextId && nextId !== lastSessionIdRef.current) {
       forceRemoteApplyRef.current = true
     }
     lastSessionIdRef.current = nextId
   }, [session?.user?.id])
+
+  useEffect(() => {
+    setRecurringRules(loadRecurringList(recurringRulesStorageKey))
+  }, [recurringRulesStorageKey])
+
+  useEffect(() => {
+    setRecurringOverrides(loadRecurringList(recurringOverridesStorageKey))
+  }, [recurringOverridesStorageKey])
+
+  useEffect(() => {
+    saveRecurringList(recurringRulesStorageKey, recurringRules)
+  }, [recurringRulesStorageKey, recurringRules])
+
+  useEffect(() => {
+    saveRecurringList(recurringOverridesStorageKey, recurringOverrides)
+  }, [recurringOverridesStorageKey, recurringOverrides])
+
+  useEffect(() => {
+    const userId = session?.user?.id ?? null
+    if (!supabase || !userId || !remoteLoaded) return
+    if (!hasCloudSession) return
+    if (recurringCloudMigrationRunningRef.current) return
+    if (!recurringCloudMigrationKey) return
+
+    const localRules = Array.isArray(recurringRules) ? recurringRules : []
+    if (localRules.length === 0) return
+
+    let alreadyMigrated = false
+    try {
+      alreadyMigrated = localStorage.getItem(recurringCloudMigrationKey) === "1"
+    } catch {
+      alreadyMigrated = false
+    }
+    if (alreadyMigrated) return
+
+    const hasCloudRecurring = (remotePlans ?? []).some((row) => isRecurringPlanRow(row))
+    if (hasCloudRecurring) {
+      try {
+        localStorage.setItem(recurringCloudMigrationKey, "1")
+      } catch {
+        // ignore
+      }
+      return
+    }
+
+    const localOverrides = Array.isArray(recurringOverrides) ? recurringOverrides : []
+    const validRules = localRules.filter((rule) => {
+      const startDateKey = String(rule?.startDateKey ?? rule?.start_date ?? "").trim()
+      const untilDateKey = String(rule?.untilDateKey ?? rule?.until_date ?? "").trim()
+      const rawLine = String(rule?.rawLine ?? rule?.raw_line ?? "").trim()
+      return isValidDateKey(startDateKey) && (!untilDateKey || isValidDateKey(untilDateKey)) && rawLine
+    })
+    if (validRules.length === 0) {
+      try {
+        localStorage.setItem(recurringCloudMigrationKey, "1")
+      } catch {
+        // ignore
+      }
+      return
+    }
+
+    const rangeStartKey = validRules
+      .map((rule) => String(rule?.startDateKey ?? rule?.start_date ?? "").trim())
+      .sort()[0]
+    const rangeEndKey = validRules
+      .map((rule) => {
+        const startDateKey = String(rule?.startDateKey ?? rule?.start_date ?? "").trim()
+        const untilDateKey = String(rule?.untilDateKey ?? rule?.until_date ?? "").trim()
+        return untilDateKey || addDaysToKey(startDateKey, getOpenEndedRepeatSpanDays(startDateKey))
+      })
+      .sort()
+      .slice(-1)[0]
+    const occurrencesByDate = buildRecurringByDate(validRules, localOverrides, rangeStartKey, rangeEndKey, null)
+    const allDates = Object.keys(occurrencesByDate).sort()
+    if (allDates.length === 0) {
+      try {
+        localStorage.setItem(recurringCloudMigrationKey, "1")
+      } catch {
+        // ignore
+      }
+      return
+    }
+
+    recurringCloudMigrationRunningRef.current = true
+    let cancelled = false
+
+    ;(async () => {
+      try {
+        const familySeriesMap = new Map()
+        const sortSeeds = new Map()
+        const rows = []
+
+        for (const dateKey of allDates) {
+          for (const occurrence of occurrencesByDate[dateKey] ?? []) {
+            const familyKey = String(occurrence?.familyId ?? occurrence?.ruleId ?? "").trim()
+            if (!familyKey) continue
+            if (!familySeriesMap.has(familyKey)) familySeriesMap.set(familyKey, genSeriesId())
+            const seriesId = familySeriesMap.get(familyKey)
+            let sortOrderOverride = null
+            if (sortOrderSupportedRef.current) {
+              const existingSeed = sortSeeds.get(dateKey)
+              if (existingSeed != null) {
+                sortOrderOverride = existingSeed
+                sortSeeds.set(dateKey, existingSeed + 1)
+              } else {
+                const seed = getNextSortOrderForDate(dateKey, remotePlans)
+                if (seed != null) {
+                  sortOrderOverride = seed
+                  sortSeeds.set(dateKey, seed + 1)
+                }
+              }
+            }
+            const row = buildSingleRecurringPlanPayload(
+              userId,
+              {
+                rawLine: occurrence?.rawLine,
+                categoryTitle: occurrence?.title,
+                repeat: occurrence?.repeat,
+                repeatInterval: occurrence?.repeatInterval,
+                repeatDays: occurrence?.repeatDays,
+                untilDateKey: occurrence?.repeatUntilKey
+              },
+              dateKey,
+              {
+                seriesIdOverride: seriesId,
+                repeatTypeOverride: occurrence?.repeat,
+                sortOrderOverride
+              }
+            )
+            if (row) rows.push(row)
+          }
+        }
+
+        if (rows.length > 0) {
+          suspendRemotePlansLoads()
+          await insertRecurringPlanRows(rows)
+        }
+
+        if (cancelled) return
+        setRecurringRules([])
+        setRecurringOverrides([])
+        try {
+          localStorage.setItem(recurringCloudMigrationKey, "1")
+        } catch {
+          // ignore
+        }
+        ensureWindowsForCategories(
+          new Set(rows.map((row) => normalizeCategoryId(String(row?.category_id ?? "").trim())).filter((title) => title && !isGeneralCategoryId(title)))
+        )
+        await loadRemotePlans(userId, { force: true })
+      } catch (error) {
+        console.error("migrate local recurring rules", error)
+      } finally {
+        recurringCloudMigrationRunningRef.current = false
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [
+    hasCloudSession,
+    recurringCloudMigrationKey,
+    recurringOverrides,
+    recurringRules,
+    remoteLoaded,
+    remotePlans,
+    session?.user?.id
+  ])
 
   useEffect(() => {
     if (!supabase || !session?.user?.id) return
@@ -1607,10 +2378,11 @@ function App() {
   const LAYOUT_KEY = "planner-layout"
   const PREF_KEY = "planner-preferences"
 
-  const MIN_LEFT_PX = 320
-  const MIN_RIGHT_PX = 360
+  const MIN_MEMO_PANEL_PX = 320
+  const MIN_CALENDAR_PANEL_PX = 520
   const DEFAULT_SPLIT = 0.58
   const DIVIDER_W = 10
+  const OUTER_SPLIT_GAP_PX = 12
   const OUTER_EDGE_PAD = 24
 
   const FONT_MIN = 12
@@ -1619,12 +2391,16 @@ function App() {
   const CALENDAR_FONT_MAX = 24
 
   const [splitRatio, setSplitRatio] = useState(DEFAULT_SPLIT)
-  const [outerCollapsed, setOuterCollapsed] = useState("none") // "none" | "left" | "right"
+  const [outerCollapsed, setOuterCollapsed] = useState("left") // "none" | "left" | "right"
   const lastSplitRatioRef = useRef(DEFAULT_SPLIT)
-  const [memoFontPx, setMemoFontPx] = useState(16)
-  const [memoFontInput, setMemoFontInput] = useState("16")
-  const [tabFontPx, setTabFontPx] = useState(15)
-  const [tabFontInput, setTabFontInput] = useState("15")
+  const [memoFontPx, setMemoFontPx] = useState(15)
+  const [memoFontInput, setMemoFontInput] = useState("15")
+  const [memoTabFontPx, setMemoTabFontPx] = useState(15)
+  const [memoTabFontInput, setMemoTabFontInput] = useState("15")
+  const [memoBodyFontPx, setMemoBodyFontPx] = useState(15)
+  const [memoBodyFontInput, setMemoBodyFontInput] = useState("15")
+  const [tabFontPx, setTabFontPx] = useState(14)
+  const [tabFontInput, setTabFontInput] = useState("14")
   const [calendarFontPx, setCalendarFontPx] = useState(10)
   const [calendarFontInput, setCalendarFontInput] = useState("10")
 
@@ -1639,6 +2415,7 @@ function App() {
   // ===== 테마/레이아웃 프리셋 =====
   const [theme, setTheme] = useState("light") // "light" | "dark"
   const [layoutPreset, setLayoutPreset] = useState("memo-left") // "memo-left" | "calendar-left"
+  const [calendarViewMode, setCalendarViewMode] = useState("month") // "month" | "blocks"
   const isSwapped = layoutPreset === "calendar-left"
 
   // ===== ? 메모 패널 내부(좌/우 메모) 스플릿 =====
@@ -1650,13 +2427,17 @@ function App() {
   const MEMO_INNER_GAP = 10
 
   const [memoInnerSplit, setMemoInnerSplit] = useState(DEFAULT_MEMO_INNER_SPLIT)
-  const [memoInnerCollapsed, setMemoInnerCollapsed] = useState("none") // "none" | "left" | "right"
+  const [memoInnerCollapsed, setMemoInnerCollapsed] = useState("right") // "left" | "right"
   const [memoCollapsedByWindow, setMemoCollapsedByWindow] = useState(() => ({}))
   const [rightMemoText, setRightMemoText] = useState("") // ? 오른쪽 메모(기능 없음)
+  const rightMemoTextRef = useRef("")
+  const [rightMemoJumpTarget, setRightMemoJumpTarget] = useState(null)
+  const [integratedRightMemoSelectionByYear, setIntegratedRightMemoSelectionByYear] = useState({})
   const [tabEditText, setTabEditText] = useState("")
   const [dashboardSourceTick, setDashboardSourceTick] = useState(0)
   const [isEditingLeftMemo, setIsEditingLeftMemo] = useState(false)
   const [dashboardCollapsedByWindow, setDashboardCollapsedByWindow] = useState({})
+  const [readDateDraft, setReadDateDraft] = useState(null)
   const [mentionGhostText, setMentionGhostText] = useState("")
   const [mentionGhostPos, setMentionGhostPos] = useState({ top: 0, left: 0 })
   const [tabMentionMenu, setTabMentionMenu] = useState({ visible: false, top: 0, left: 0 })
@@ -1664,6 +2445,10 @@ function App() {
   const tabMentionRef = useRef(null)
   const tabMentionMouseDownRef = useRef(false)
   // ? 창 목록/활성 탭
+
+  useEffect(() => {
+    rightMemoTextRef.current = rightMemoText
+  }, [rightMemoText])
   const windowsKeyRef = useRef(getWindowsStorageKey(null))
   const [windows, setWindows] = useState(() => loadWindows(windowsKeyRef.current))
   const [activeWindowId, setActiveWindowId] = useState("all")
@@ -1811,10 +2596,19 @@ function App() {
   const updateTabScrollState = useCallback(() => {
     const el = tabsScrollRef.current
     if (!el) return
-    const max = Math.max(0, el.scrollWidth - el.clientWidth)
-    const canScroll = max > 8
-    const left = canScroll && el.scrollLeft > 2
-    const right = canScroll && el.scrollLeft < max - 2
+    const children = Array.from(el.children).filter((node) => node instanceof HTMLElement)
+    if (!children.length) {
+      setTabScrollState((prev) => (!prev.left && !prev.right ? prev : { left: false, right: false }))
+      return
+    }
+    const tolerance = 3
+    const viewportRect = el.getBoundingClientRect()
+    const firstRect = children[0].getBoundingClientRect()
+    const lastRect = children[children.length - 1].getBoundingClientRect()
+    const scrollMax = Math.max(0, el.scrollWidth - el.clientWidth)
+    const hasOverflow = scrollMax > tolerance
+    const left = hasOverflow && firstRect.left < viewportRect.left - tolerance
+    const right = hasOverflow && lastRect.right > viewportRect.right + tolerance
     setTabScrollState((prev) => (prev.left === left && prev.right === right ? prev : { left, right }))
   }, [])
 
@@ -1823,6 +2617,7 @@ function App() {
     if (!el) return
     const amount = Math.max(80, Math.floor(el.clientWidth * 0.6))
     el.scrollBy({ left: dir * amount, behavior: "smooth" })
+    requestAnimationFrame(updateTabScrollState)
   }
 
   useEffect(() => {
@@ -1832,9 +2627,13 @@ function App() {
     updateTabScrollState()
     el.addEventListener("scroll", onScroll, { passive: true })
     window.addEventListener("resize", onScroll)
+    const resizeObserver = typeof ResizeObserver !== "undefined" ? new ResizeObserver(onScroll) : null
+    resizeObserver?.observe(el)
+    if (el.parentElement) resizeObserver?.observe(el.parentElement)
     return () => {
       el.removeEventListener("scroll", onScroll)
       window.removeEventListener("resize", onScroll)
+      resizeObserver?.disconnect()
     }
   }, [updateTabScrollState])
 
@@ -1901,7 +2700,8 @@ function App() {
   }, [activeWindowId])
 
   useEffect(() => {
-    const next = memoCollapsedByWindow[activeWindowId] ?? "none"
+    const stored = memoCollapsedByWindow[activeWindowId]
+    const next = stored === "left" ? "left" : "right"
     if (next !== memoInnerCollapsed) setMemoInnerCollapsed(next)
   }, [activeWindowId, memoCollapsedByWindow, memoInnerCollapsed])
  
@@ -1937,7 +2737,7 @@ function App() {
       const newWin = {
         id,
         title,
-        color: "#22c55e"
+        color: pickNextWindowColor(prev)
       }
       return [...prev, newWin]
     })
@@ -2044,8 +2844,20 @@ function App() {
       if (raw) {
         const parsed = JSON.parse(raw)
         if (typeof parsed.splitRatio === "number") setSplitRatio(clamp(parsed.splitRatio, 0.15, 0.85))
-        if (typeof parsed.memoFontPx === "number") setMemoFontPx(clamp(parsed.memoFontPx, FONT_MIN, FONT_MAX))
+        const legacyMemoFont =
+          typeof parsed.memoFontPx === "number" ? clamp(parsed.memoFontPx, FONT_MIN, FONT_MAX) : null
+        if (legacyMemoFont != null) setMemoFontPx(legacyMemoFont)
         if (typeof parsed.tabFontPx === "number") setTabFontPx(clamp(parsed.tabFontPx, FONT_MIN, FONT_MAX))
+        if (typeof parsed.memoTabFontPx === "number") {
+          setMemoTabFontPx(clamp(parsed.memoTabFontPx, FONT_MIN, FONT_MAX))
+        } else if (legacyMemoFont != null) {
+          setMemoTabFontPx(legacyMemoFont)
+        }
+        if (typeof parsed.memoBodyFontPx === "number") {
+          setMemoBodyFontPx(clamp(parsed.memoBodyFontPx, FONT_MIN, FONT_MAX))
+        } else if (legacyMemoFont != null) {
+          setMemoBodyFontPx(legacyMemoFont)
+        }
         if (typeof parsed.calendarFontPx === "number") {
           setCalendarFontPx(clamp(parsed.calendarFontPx, CALENDAR_FONT_MIN, CALENDAR_FONT_MAX))
         }
@@ -2057,15 +2869,25 @@ function App() {
       if (raw2) {
         const p = JSON.parse(raw2)
         if (p && (p.theme === "light" || p.theme === "dark")) setTheme(p.theme)
-        if (p && (p.layoutPreset === "memo-left" || p.layoutPreset === "calendar-left")) setLayoutPreset(p.layoutPreset)
       }
     } catch (err) { void err }
+    setLayoutPreset("memo-left")
+    setOuterCollapsed("left")
+    setCalendarViewMode("month")
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
     setMemoFontInput(String(memoFontPx))
   }, [memoFontPx])
+
+  useEffect(() => {
+    setMemoTabFontInput(String(memoTabFontPx))
+  }, [memoTabFontPx])
+
+  useEffect(() => {
+    setMemoBodyFontInput(String(memoBodyFontPx))
+  }, [memoBodyFontPx])
 
   useEffect(() => {
     setTabFontInput(String(tabFontPx))
@@ -2077,9 +2899,19 @@ function App() {
 
   useEffect(() => {
     try {
-      localStorage.setItem(LAYOUT_KEY, JSON.stringify({ splitRatio, memoFontPx, tabFontPx, calendarFontPx }))
+      localStorage.setItem(
+        LAYOUT_KEY,
+        JSON.stringify({
+          splitRatio,
+          memoFontPx,
+          tabFontPx,
+          memoTabFontPx,
+          memoBodyFontPx,
+          calendarFontPx
+        })
+      )
     } catch (err) { void err }
-  }, [splitRatio, memoFontPx, tabFontPx, calendarFontPx])
+  }, [splitRatio, memoFontPx, tabFontPx, memoTabFontPx, memoBodyFontPx, calendarFontPx])
 
   useEffect(() => {
     try {
@@ -2154,7 +2986,9 @@ function App() {
   )
   const suppressRightSaveRef = useRef(false)
   const rightMemoSyncTimerRef = useRef(null)
+  const pendingRightMemoWritesRef = useRef({})
   const rightSaveSuppressResetRef = useRef(null)
+  const rightMemoMetaColumnsSupportedRef = useRef(true)
   const editableWindows = useMemo(() => windows.filter((w) => w.id !== "all"), [windows])
   const windowTitlesOrder = useMemo(() => windows.filter((w) => w.id !== "all").map((w) => w.title), [windows])
   const windowTitleRank = useMemo(() => {
@@ -2170,6 +3004,16 @@ function App() {
     }
     return map
   }, [windows])
+  const planCategoryOptions = useMemo(
+    () =>
+      editableWindows.map((w) => ({
+        id: String(w?.id ?? w?.title ?? ""),
+        title: String(w?.title ?? "").trim(),
+        value: String(w?.title ?? "").trim(),
+        color: typeof w?.color === "string" ? w.color : "#999"
+      })).filter((item) => item.title),
+    [editableWindows]
+  )
 
   function scheduleRightSaveUnsuppress() {
     if (typeof window === "undefined") {
@@ -2185,22 +3029,6 @@ function App() {
     })
   }
 
-  function sanitizeRightMemoBody(rawText, windowsForTitles) {
-    const titleSet = new Set(
-      (windowsForTitles ?? [])
-        .map((w) => String(w?.title ?? "").trim())
-        .filter(Boolean)
-    )
-    const lines = String(rawText ?? "").split("\n")
-    const out = []
-    for (const line of lines) {
-      const match = line.match(/^\s*\[(.+)\]\s*$/)
-      if (match && titleSet.has(String(match[1] ?? "").trim())) continue
-      out.push(line)
-    }
-    return out.join("\n").trimEnd()
-  }
-
   function getLeftMemoTextSync(year) {
     try {
       const key = getLeftMemoKey(memoKeyPrefix, year)
@@ -2213,7 +3041,7 @@ function App() {
   function setLeftMemoTextSync(year, value) {
     try {
       const key = getLeftMemoKey(memoKeyPrefix, year)
-      localStorage.setItem(key, value)
+      localStorage.setItem(key, String(value ?? ""))
     } catch (err) { void err }
   }
 
@@ -2229,7 +3057,7 @@ function App() {
   function setWindowMemoTextSync(year, windowId, value) {
     try {
       const key = getMemoKey(memoKeyPrefix, year, windowId)
-      localStorage.setItem(key, value ?? "")
+      localStorage.setItem(key, String(value ?? ""))
     } catch (err) { void err }
   }
 
@@ -2245,16 +3073,16 @@ function App() {
   function setRightWindowTextSync(year, windowId, value) {
     try {
       const key = getRightMemoKey(memoKeyPrefix, year, windowId)
-      localStorage.setItem(key, value)
+      localStorage.setItem(key, String(value ?? ""))
     } catch (err) { void err }
   }
 
   function buildCombinedRightTextForYear(year) {
     const windowTexts = {}
     for (const w of editableWindows) {
-      windowTexts[w.id] = sanitizeRightMemoBody(getRightWindowTextSync(year, w.id), editableWindows)
+      windowTexts[w.id] = buildRightMemoCombinedText(getRightWindowTextSync(year, w.id))
     }
-    const commonText = sanitizeRightMemoBody(getRightWindowTextSync(year, "all"), editableWindows)
+    const commonText = buildRightMemoCombinedText(getRightWindowTextSync(year, "all"))
     return buildCombinedRightText(commonText, editableWindows, integratedFilters, windowTexts)
   }
 
@@ -2278,32 +3106,234 @@ function App() {
     return buildCombinedRightText(normalizedCommon, editableWindows, integratedFilters, windowTexts)
   }
 
+  const allRightMemoGroups = useMemo(
+    () => {
+      const readWindowRaw = (windowId) => {
+        if (activeWindowId !== "all" && windowId === activeWindowId) {
+          return String(rightMemoText ?? "")
+        }
+        try {
+          const key = `${memoKeyPrefix}-right-text-${baseYear}-${windowId}`
+          return String(localStorage.getItem(key) ?? "")
+        } catch {
+          return ""
+        }
+      }
+
+      return editableWindows
+        .map((windowInfo) => {
+          const state = normalizeRightMemoDocState(readWindowRaw(windowInfo.id))
+          const docs = state.docs.map((doc, index) => {
+            const rawContent = String(doc.content ?? "")
+            const cleanedLines = rawContent
+              .split("\n")
+              .map((line) => line.trim())
+              .filter(Boolean)
+            const previewLine = cleanedLines[0] ?? ""
+            const excerpt = cleanedLines.slice(0, 5).join("\n")
+
+            return {
+              id: doc.id,
+              title: getRightMemoDocDisplayTitle(doc.title, index),
+              content: rawContent,
+              preview: previewLine,
+              excerpt,
+              lineCount: cleanedLines.length,
+              hasContent: cleanedLines.length > 0
+            }
+          })
+          const activeDocId =
+            typeof state.activeDocId === "string" && state.docs.some((doc) => doc.id === state.activeDocId)
+              ? state.activeDocId
+              : docs[0]?.id || null
+
+          return {
+            windowId: windowInfo.id,
+            title: windowInfo.title,
+            color: windowInfo.color,
+            activeDocId,
+            docs
+          }
+        })
+        .filter((group) => group.docs.length > 0)
+    },
+    [activeWindowId, baseYear, editableWindows, memoKeyPrefix, rightMemoText]
+  )
+
+  const integratedRightMemoSelection = useMemo(() => {
+    const current = integratedRightMemoSelectionByYear?.[baseYear]
+    return {
+      selectedWindowId: typeof current?.selectedWindowId === "string" ? current.selectedWindowId : null,
+      selectedDocIds: current?.selectedDocIds && typeof current.selectedDocIds === "object" ? current.selectedDocIds : {}
+    }
+  }, [baseYear, integratedRightMemoSelectionByYear])
+
+  const updateIntegratedRightMemoSelection = useCallback((next) => {
+    setIntegratedRightMemoSelectionByYear((prev) => {
+      const current = prev?.[baseYear] ?? { selectedWindowId: null, selectedDocIds: {} }
+      const resolved = typeof next === "function" ? next(current) : next
+      return {
+        ...(prev ?? {}),
+        [baseYear]: {
+          selectedWindowId: typeof resolved?.selectedWindowId === "string" ? resolved.selectedWindowId : null,
+          selectedDocIds:
+            resolved?.selectedDocIds && typeof resolved.selectedDocIds === "object" ? resolved.selectedDocIds : {}
+        }
+      }
+    })
+  }, [baseYear])
+
+  const openRightMemoDocFromAll = useCallback((windowId, docId) => {
+    if (!windowId || !docId) return
+    setRightMemoJumpTarget({ windowId, docId })
+    setActiveWindowId(windowId)
+  }, [])
+
+  const saveRightMemoDocFromAll = useCallback(
+    async (windowId, docId, updates) => {
+      if (!windowId || !docId) return
+
+      const currentRaw = getRightWindowTextSync(baseYear, windowId)
+      const state = normalizeRightMemoDocState(currentRaw)
+      const nextDocs = state.docs.map((doc) => {
+        if (doc.id !== docId) return doc
+        return {
+          ...doc,
+          title: typeof updates?.title === "string" ? updates.title : doc.title,
+          content: typeof updates?.content === "string" ? updates.content : doc.content
+        }
+      })
+
+      const nextRaw = serializeRightMemoDocState({
+        docs: nextDocs,
+        activeDocId:
+          typeof state.activeDocId === "string" && nextDocs.some((doc) => doc.id === state.activeDocId)
+            ? state.activeDocId
+            : docId
+      })
+
+      if (nextRaw === currentRaw) return
+
+      setRightWindowTextSync(baseYear, windowId, nextRaw)
+
+      if (activeWindowId === windowId) {
+        suppressRightSaveRef.current = true
+        setRightMemoText(nextRaw)
+        scheduleRightSaveUnsuppress()
+      }
+
+      if (!supabase || !session?.user?.id) return
+
+      try {
+        await saveRightMemoToSupabase(session.user.id, baseYear, windowId, nextRaw)
+      } catch (error) {
+        console.error("save integrated right memo doc", error)
+      }
+    },
+    [activeWindowId, baseYear, session?.user?.id, editableWindows, integratedFilters]
+  )
+
+  const saveRightMemoStateFromAll = useCallback(
+    async (windowId, nextState) => {
+      if (!windowId) return
+
+      const currentRaw = getRightWindowTextSync(baseYear, windowId)
+      const nextRaw =
+        typeof nextState === "string"
+          ? nextState
+          : serializeRightMemoDocState(nextState)
+
+      if (nextRaw === currentRaw) return
+
+      setRightWindowTextSync(baseYear, windowId, nextRaw)
+
+      if (activeWindowId === windowId) {
+        suppressRightSaveRef.current = true
+        setRightMemoText(nextRaw)
+        scheduleRightSaveUnsuppress()
+      }
+
+      if (!supabase || !session?.user?.id) return
+
+      try {
+        await saveRightMemoToSupabase(session.user.id, baseYear, windowId, nextRaw)
+      } catch (error) {
+        console.error("save integrated right memo state", error)
+      }
+    },
+    [activeWindowId, baseYear, session?.user?.id, editableWindows, integratedFilters]
+  )
+
   async function handleAuthSubmit() {
-    if (!supabase) return
-    if (!authEmail || !authPassword) {
-      setAuthMessage("이메일과 비밀번호를 모두 입력하세요.")
+    if (!supabase || authLoading) return
+    const resolvedAuth = resolveAuthIdentifier(authEmail)
+    if (!resolvedAuth.email || !authPassword) {
+      setAuthMessage("아이디 또는 이메일과 비밀번호를 모두 입력하세요.")
       return
+    }
+    if (resolvedAuth.input !== authEmail) setAuthEmail(resolvedAuth.input)
+    if (authMode === "signUp") {
+      if (authPassword.length < AUTH_MIN_PASSWORD_LENGTH) {
+        setAuthMessage(`비밀번호는 ${AUTH_MIN_PASSWORD_LENGTH}자 이상으로 입력해 주세요.`)
+        return
+      }
+      if (authPassword !== authPasswordConfirm) {
+        setAuthMessage("비밀번호 확인이 일치하지 않습니다.")
+        return
+      }
+      if (!signupTermsAgreed || !signupPrivacyAgreed) {
+        setAuthMessage("이용약관과 개인정보 수집·이용에 동의해 주세요.")
+        return
+      }
     }
     setAuthLoading(true)
     setAuthMessage("")
-    let error = null
-    if (authMode === "signIn") {
-      const result = await supabase.auth.signInWithPassword({ email: authEmail, password: authPassword })
-      error = result.error
-    } else {
-      const result = await supabase.auth.signUp({ email: authEmail, password: authPassword })
-      error = result.error
-    }
-    if (error) setAuthMessage(error.message)
-    else {
+    try {
+      let error = null
+      if (authMode === "signIn") {
+        const result = await supabase.auth.signInWithPassword({ email: resolvedAuth.email, password: authPassword })
+        error = result.error
+      } else {
+        const result = await supabase.auth.signUp({
+          email: resolvedAuth.email,
+          password: authPassword,
+          options: {
+            ...(typeof window !== "undefined" ? { emailRedirectTo: window.location.origin } : {}),
+            data: {
+              login_id: resolvedAuth.input,
+              login_kind: resolvedAuth.isEmail ? "email" : "id",
+              terms_agreed: true,
+              privacy_agreed: true,
+              updates_agreed: Boolean(signupUpdatesAgreed)
+            }
+          }
+        })
+        error = result.error
+      }
+      if (error) {
+        setAuthMessage(error.message)
+        return
+      }
       if (authMode === "signIn") {
         setAuthMessage("로그인 완료.")
+        if (rememberCredentials) persistCredentials(authEmail)
       } else {
-        setAuthMessage("가입 완료. 로그인해 주세요.")
+        setAuthPassword("")
+        setAuthPasswordConfirm("")
+        setSignupTermsAgreed(false)
+        setSignupPrivacyAgreed(false)
+        setSignupUpdatesAgreed(false)
+        setSignupDetailsOpen(false)
+        setAuthMessage(
+          resolvedAuth.isEmail
+            ? "가입 완료. 설정에 따라 이메일 인증이 필요할 수 있어요."
+            : "가입 완료. 이제 아이디로 로그인해 주세요."
+        )
         setAuthMode("signIn")
       }
+    } finally {
+      setAuthLoading(false)
     }
-    setAuthLoading(false)
   }
 
   async function handleSignOut() {
@@ -2336,13 +3366,71 @@ function App() {
         console.error("flush right memo before sign out", err)
       }
     }
-    await supabase.auth.signOut()
+    await supabase.auth.signOut({ scope: "local" })
     setAuthMessage("")
   }
 
+  async function runDeleteAccount() {
+    if (!supabase || !session?.user?.id || deleteAccountLoading) return
+    const accessToken = String(session?.access_token ?? "").trim()
+    if (!accessToken) {
+      setAuthMessage("로그인 세션을 확인하지 못했습니다. 다시 로그인 후 시도해 주세요.")
+      return
+    }
+    setDeleteAccountLoading(true)
+    setAuthMessage("")
+    try {
+      const { data, error } = await supabase.functions.invoke("delete-account", {
+        headers: {
+          Authorization: `Bearer ${accessToken}`
+        },
+        body: { confirm: true }
+      })
+      if (error) throw error
+      if (data?.error) throw new Error(String(data.error))
+
+      clearPersistedCredentials()
+      setRememberCredentials(false)
+      setAuthEmail("")
+      setAuthPassword("")
+      setAuthPasswordConfirm("")
+      closeLoginModal()
+      setSession(null)
+      setRemotePlans([])
+      setRemoteWindows([])
+      setRemoteLoaded(false)
+      setRemoteWindowsLoaded(false)
+      await supabase.auth.signOut({ scope: "local" })
+      setAuthMessage("계정 탈퇴가 완료됐습니다.")
+    } catch (error) {
+      setAuthMessage(String(error?.message ?? "계정 탈퇴에 실패했습니다."))
+    } finally {
+      setDeleteAccountLoading(false)
+    }
+  }
+
+  async function handleDeleteAccount() {
+    if (deleteAccountLoading) return
+    const confirmation = typeof window !== "undefined"
+      ? window.prompt("계정 탈퇴를 진행하려면 '탈퇴'를 입력하세요.")
+      : null
+    if (confirmation == null) return
+    if (String(confirmation).trim() !== "탈퇴") {
+      setAuthMessage("탈퇴 문구가 일치하지 않아 취소됐습니다.")
+      return
+    }
+    const accepted =
+      typeof window === "undefined"
+        ? true
+        : window.confirm("모든 일정, 메모, 설정이 삭제되고 되돌릴 수 없습니다. 계속할까요?")
+    if (!accepted) return
+    await runDeleteAccount()
+  }
+
   function updateEditorText(nextText) {
-    setText(nextText)
-    textRef.current = nextText
+    const normalized = String(nextText ?? "")
+    setText(normalized)
+    textRef.current = normalized
   }
 
   function handleLeftMemoChange(e) {
@@ -2361,7 +3449,7 @@ function parseTabEditItemsByDate(tabText, baseYear, title) {
     const out = {}
     for (const block of parsedTab.blocks) {
       const body = (tabText ?? "").slice(block.bodyStartPos, block.blockEndPos)
-      const normalizedBody = normalizeGroupLineNewlines(body)
+      const normalizedBody = normalizeGroupLineNewlines(removeTaskLinesFromBody(body))
       const lines = normalizedBody.split("\n")
       const items = []
       let order = 0
@@ -2378,8 +3466,8 @@ function parseTabEditItemsByDate(tabText, baseYear, title) {
             .map((x) => x.trim())
             .filter((x) => x !== "")
           for (const item of innerItems) {
-            const parsed = parseTimePrefix(item)
-            items.push({ text: parsed ? parsed.text : item, time: parsed ? parsed.time : "", order })
+          const parsed = parseLeadingTimeDashboardLine(item)
+          items.push({ text: parsed ? parsed.text : item, time: parsed ? parsed.time : "", order })
             order++
           }
           continue
@@ -2387,22 +3475,26 @@ function parseTabEditItemsByDate(tabText, baseYear, title) {
 
         const semicolon = parseDashboardSemicolonLine(trimmed)
         if (semicolon) {
+          const taskAware = stripTaskSuffix(semicolon.text)
           if (semicolon.group && title && semicolon.group !== title) continue
-          items.push({ text: semicolon.text, time: semicolon.time, order })
+          items.push({ text: taskAware.text, time: semicolon.time, order })
           order++
           continue
         }
         const emptySemicolon = parseDashboardSemicolonLine(trimmed, { allowEmptyText: true })
         if (emptySemicolon && !emptySemicolon.text) continue
 
-        const timeLine = parseTimePrefix(trimmed)
+        const timeLine = parseLeadingTimeDashboardLine(trimmed)
         if (timeLine) {
-          items.push({ text: timeLine.text, time: timeLine.time, order })
+          const taskAware = stripTaskSuffix(timeLine.text)
+          if (timeLine.group && title && timeLine.group !== title) continue
+          items.push({ text: taskAware.text, time: timeLine.time, order })
           order++
           continue
         }
 
-        items.push({ text: trimmed, time: "", order })
+        const taskAware = stripTaskSuffix(trimmed)
+        items.push({ text: taskAware.text, time: "", order })
         order++
       }
       if (items.length > 0) out[block.dateKey] = items
@@ -2872,24 +3964,61 @@ function stripEmptyGroupLines(bodyText) {
   async function saveRightMemoToSupabase(userId, year, windowId, content) {
     if (!supabase || !userId || !windowId) return
     const nextText = String(content ?? "")
-    if (!nextText.trim()) {
-      await supabase
-        .from("right_memos")
-        .delete()
-        .eq("user_id", userId)
-        .eq("year", year)
-        .eq("window_id", windowId)
+    const basePayload = {
+      user_id: userId,
+      year,
+      window_id: windowId,
+      content: nextText
+    }
+    if (rightMemoMetaColumnsSupportedRef.current) {
+      const { error } = await supabase.from("right_memos").upsert(
+        {
+          ...basePayload,
+          updated_at: new Date().toISOString(),
+          client_id: clientIdRef.current
+        },
+        { onConflict: "user_id,year,window_id" }
+      )
+      if (!error) return
+      if (!isRightMemoMetaColumnError(error)) throw error
+      rightMemoMetaColumnsSupportedRef.current = false
+    }
+    const { error } = await supabase.from("right_memos").upsert(basePayload, {
+      onConflict: "user_id,year,window_id"
+    })
+    if (error) throw error
+  }
+
+  function applyRemoteRightMemoWindowSync(windowId, rawText, year = baseYear) {
+    const targetWindowId = String(windowId ?? "").trim()
+    if (!targetWindowId) return
+    const nextRaw = String(rawText ?? "")
+    setRightWindowTextSync(year, targetWindowId, nextRaw)
+
+    const isFocusedSpecificEditor =
+      typeof document !== "undefined" &&
+      rightTextareaRef.current &&
+      document.activeElement === rightTextareaRef.current
+    const hasPendingSpecificSave = Boolean(rightMemoSyncTimerRef.current)
+    const pendingWrite = pendingRightMemoWritesRef.current?.[targetWindowId] ?? null
+    if (pendingWrite && String(pendingWrite.text ?? "") === nextRaw) {
+      delete pendingRightMemoWritesRef.current[targetWindowId]
+    }
+
+    if (activeWindowId === targetWindowId) {
+      if (isFocusedSpecificEditor || hasPendingSpecificSave || (pendingWrite && String(pendingWrite.text ?? "") !== nextRaw)) return
+      suppressRightSaveRef.current = true
+      setRightMemoText(nextRaw)
+      scheduleRightSaveUnsuppress()
       return
     }
-    await supabase.from("right_memos").upsert(
-      {
-        user_id: userId,
-        year,
-        window_id: windowId,
-        content: nextText
-      },
-      { onConflict: "user_id,year,window_id" }
-    )
+
+    if (activeWindowId === "all") {
+      if (pendingWrite && String(pendingWrite.text ?? "") !== nextRaw) return
+      suppressRightSaveRef.current = true
+      setRightMemoText(buildCombinedRightTextForYear(year))
+      scheduleRightSaveUnsuppress()
+    }
   }
 
   // ? 오른쪽 메모(연도별) 로드
@@ -2914,12 +4043,13 @@ function stripEmptyGroupLines(bodyText) {
           if (cancelled) return
           const normalizedWindowTexts = {}
           for (const w of editableWindows) {
-            const text = sanitizeRightMemoBody(String(windowTexts?.[w.id] ?? ""), editableWindows)
-            normalizedWindowTexts[w.id] = text
-            setRightWindowTextSync(baseYear, w.id, text)
+            const rawText = String(windowTexts?.[w.id] ?? "")
+            normalizedWindowTexts[w.id] = buildRightMemoCombinedText(rawText)
+            setRightWindowTextSync(baseYear, w.id, rawText)
           }
-          const commonText = sanitizeRightMemoBody(getRightWindowTextSync(baseYear, "all"), editableWindows)
-          setRightWindowTextSync(baseYear, "all", commonText)
+          const commonRawText = getRightWindowTextSync(baseYear, "all")
+          const commonText = buildRightMemoCombinedText(commonRawText)
+          setRightWindowTextSync(baseYear, "all", commonRawText)
           const combined = buildCombinedRightText(commonText, editableWindows, integratedFilters, normalizedWindowTexts)
           setRightMemoText(combined)
           scheduleRightSaveUnsuppress()
@@ -2937,10 +4067,10 @@ function stripEmptyGroupLines(bodyText) {
     const fallback = () => {
       try {
         const saved = localStorage.getItem(rightMemoKey)
-        const normalized = sanitizeRightMemoBody(saved ?? "", editableWindows)
-        setRightMemoText(normalized)
-        if (normalized && supabase && session?.user?.id) {
-          saveRightMemoToSupabase(session.user.id, baseYear, activeWindowId, normalized)
+        const rawText = String(saved ?? "")
+        setRightMemoText(rawText)
+        if (rawText && supabase && session?.user?.id) {
+          saveRightMemoToSupabase(session.user.id, baseYear, activeWindowId, rawText)
         }
       } catch {
         setRightMemoText("")
@@ -2957,10 +4087,10 @@ function stripEmptyGroupLines(bodyText) {
       .then((remoteText) => {
         if (cancelled) return
         if (remoteText != null) {
-          const normalized = sanitizeRightMemoBody(remoteText, editableWindows)
-          setRightMemoText(normalized)
+          const rawText = String(remoteText ?? "")
+          setRightMemoText(rawText)
           try {
-            localStorage.setItem(rightMemoKey, normalized)
+            localStorage.setItem(rightMemoKey, rawText)
           } catch (err) { void err }
           scheduleRightSaveUnsuppress()
         } else {
@@ -2976,6 +4106,45 @@ function stripEmptyGroupLines(bodyText) {
       cancelled = true
     }
   }, [rightMemoKey, baseYear, activeWindowId, editableWindows, integratedFilters, session?.user?.id])
+
+  useEffect(() => {
+    const userId = session?.user?.id
+    if (!supabase || !userId) return
+    const channel = supabase
+      .channel(`right-memos-changes-${userId}-${baseYear}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "right_memos", filter: `user_id=eq.${userId}` },
+        (payload) => {
+          const changedYear = Number(payload?.new?.year ?? payload?.old?.year ?? NaN)
+          if (Number.isFinite(changedYear) && changedYear !== baseYear) return
+
+          const incomingClientId = String(payload?.new?.client_id ?? payload?.old?.client_id ?? "").trim()
+          if (incomingClientId && incomingClientId === clientIdRef.current) return
+
+          const targetWindowId = String(payload?.new?.window_id ?? payload?.old?.window_id ?? "").trim()
+          if (!targetWindowId) return
+
+          const nextRaw =
+            payload?.eventType === "DELETE"
+              ? ""
+              : typeof payload?.new?.content === "string"
+                ? payload.new.content
+                : ""
+
+          applyRemoteRightMemoWindowSync(targetWindowId, nextRaw, baseYear)
+        }
+      )
+      .subscribe()
+
+    return () => {
+      try {
+        supabase.removeChannel(channel)
+      } catch (err) {
+        void err
+      }
+    }
+  }, [session?.user?.id, baseYear, activeWindowId, editableWindows, integratedFilters])
 
 
   useEffect(() => {
@@ -3011,6 +4180,11 @@ function stripEmptyGroupLines(bodyText) {
       suppressRightSaveRef.current = false
       return
     }
+
+    if (activeWindowId === "all") {
+      return
+    }
+
     try {
       localStorage.setItem(rightMemoKey, rightMemoText)
     } catch (err) { void err }
@@ -3023,31 +4197,20 @@ function stripEmptyGroupLines(bodyText) {
     const savedYear = baseYear
     const savedWindowId = activeWindowId
     const savedText = rightMemoText
-    const savedWindows = editableWindows
-    const savedFilters = integratedFilters
 
     const flush = () => {
       if (savedWindowId === "all") {
-        const { commonLines, windowLinesById } = splitCombinedRightText(savedText, savedWindows)
-        const normalizedCommon = sanitizeRightMemoBody(commonLines.join("\n").trimEnd(), savedWindows)
-        setRightWindowTextSync(savedYear, "all", normalizedCommon)
-        const visibleWindows = (savedWindows ?? []).filter((w) => !savedFilters || savedFilters[w.id] !== false)
-        for (const w of visibleWindows) {
-          const next = sanitizeRightMemoBody((windowLinesById.get(w.id) ?? []).join("\n").trimEnd(), savedWindows)
-          setRightWindowTextSync(savedYear, w.id, next)
-        }
-        Promise.all(
-          visibleWindows.map((w) => {
-            const next = sanitizeRightMemoBody((windowLinesById.get(w.id) ?? []).join("\n").trimEnd(), savedWindows)
-            return saveRightMemoToSupabase(userId, savedYear, w.id, next)
-          })
-        ).catch((err) => console.error("save all right memos", err))
         return
       }
-      saveRightMemoToSupabase(userId, savedYear, savedWindowId, sanitizeRightMemoBody(savedText, savedWindows))
+      const latestText = savedWindowId === activeWindowId ? rightMemoTextRef.current : savedText
+      pendingRightMemoWritesRef.current[savedWindowId] = {
+        text: latestText,
+        at: Date.now()
+      }
+      saveRightMemoToSupabase(userId, savedYear, savedWindowId, latestText)
     }
 
-    const t = setTimeout(flush, 800)
+    const t = setTimeout(flush, 350)
     rightMemoSyncTimerRef.current = t
 
     return () => {
@@ -3062,15 +4225,19 @@ function stripEmptyGroupLines(bodyText) {
     if (activeWindowId === "all") return buildMemoOverlayLines(text)
     return buildMemoOverlayLines(tabEditText)
   }, [activeWindowId, tabEditText, text])
-  const rightOverlayLines = useMemo(() => buildMemoOverlayLines(rightMemoText), [rightMemoText])
+  const rightOverlayLines = useMemo(() => {
+    if (activeWindowId === "all") return []
+    return buildMemoOverlayLines(rightMemoText)
+  }, [activeWindowId, rightMemoText])
 
   useEffect(() => {
     syncOverlayScroll(textareaRef.current, leftOverlayInnerRef.current)
   }, [text, memoFontPx, memoInnerSplit])
 
   useEffect(() => {
+    if (activeWindowId === "all") return
     syncOverlayScroll(rightTextareaRef.current, rightOverlayInnerRef.current)
-  }, [rightMemoText, memoFontPx, memoInnerSplit])
+  }, [activeWindowId, rightMemoText, memoFontPx, memoInnerSplit])
 
   useEffect(() => {
     updateMentionGhost()
@@ -3081,9 +4248,15 @@ function stripEmptyGroupLines(bodyText) {
     return getLeftMemoTextSync(year)
   }
 
+  const activeReadDateDraftKey =
+    readDateDraft &&
+    readDateDraft.windowId === activeWindowId &&
+    readDateDraft.year === baseYear
+      ? readDateDraft.dateKey
+      : null
+
   // ===== 파싱 =====
   const parsed = useMemo(() => parseBlocksAndItems(text, baseYear), [text, baseYear])
-  const blocks = parsed.blocks
   const dashboardSourceText = useMemo(() => {
     if (activeWindowId === "all") return text
     return getWindowMemoTextSync(baseYear, "all")
@@ -3099,11 +4272,210 @@ function stripEmptyGroupLines(bodyText) {
     }
     return set
   }, [activeWindowId, integratedFilters, windows])
+  const activeRecurringCategoryTitle = useMemo(() => {
+    if (activeWindowId === "all") return null
+    return String(windows.find((w) => w.id === activeWindowId)?.title ?? "").trim()
+  }, [activeWindowId, windows])
+  const recurringItemsByDate = useMemo(() => {
+    if (hasCloudSession) {
+      return buildCloudRecurringByDate(remotePlans, baseYear, activeRecurringCategoryTitle || null)
+    }
+    const rangeStartKey = `${baseYear}-01-01`
+    const rangeEndKey = `${baseYear}-12-31`
+    return buildRecurringByDate(
+      recurringRules,
+      recurringOverrides,
+      rangeStartKey,
+      rangeEndKey,
+      activeRecurringCategoryTitle || null
+    )
+  }, [baseYear, recurringRules, recurringOverrides, activeRecurringCategoryTitle, hasCloudSession, remotePlans])
+  const tasksSourceText = useMemo(() => {
+    if (activeWindowId === "all") return text
+    return tabEditText ?? ""
+  }, [activeWindowId, tabEditText, text])
+  const textTasks = useMemo(() => extractTasksFromPlannerText(tasksSourceText, baseYear), [tasksSourceText, baseYear])
+  const textTasksByDate = useMemo(() => {
+    const map = {}
+    for (const task of Array.isArray(textTasks) ? textTasks : []) {
+      const dateKey = String(task?.dateKey ?? "").trim()
+      if (!dateKey) continue
+      ;(map[dateKey] ??= []).push({ ...task, sourceType: "text" })
+    }
+    for (const dateKey of Object.keys(map)) {
+      map[dateKey].sort((a, b) => (a?.lineIndex ?? 0) - (b?.lineIndex ?? 0))
+    }
+    return map
+  }, [textTasks])
+
+  const cloudTaskItemsByDate = useMemo(() => {
+    if (!hasCloudSession) return {}
+    const map = {}
+    const activeTitle =
+      activeWindowId === "all"
+        ? ""
+        : normalizeCategoryId(String(windows.find((w) => w.id === activeWindowId)?.title ?? "").trim())
+
+    for (const [index, row] of (remotePlans ?? []).entries()) {
+      if (!row || row?.deleted_at || isRecurringPlanRow(row)) continue
+      const dateKey = String(row?.date ?? "").trim()
+      if (!dateKey.startsWith(`${baseYear}-`)) continue
+
+      let category = normalizeCategoryId(String(row?.category_id ?? "").trim())
+      if (isGeneralCategoryId(category)) category = ""
+      if (activeWindowId === "all") {
+        if (allowedDashboardGroupTitles && category && !allowedDashboardGroupTitles.has(category)) continue
+      } else if (category !== activeTitle) {
+        continue
+      }
+
+      const taskAware = stripTaskSuffix(String(row?.content ?? "").trim())
+      const textValue = decodeTaskLineBreaks(String(taskAware?.text ?? "").trim())
+      if (!textValue) continue
+      const normalizedTime = normalizePlanTimeFields(row)
+      const timeLabel = buildTimeSpanLabel(normalizedTime.time, normalizedTime.end_time)
+      const sortOrder = parsePlanOrderValue(row?.sort_order ?? row?.sortOrder ?? row?.order)
+      ;(map[dateKey] ??= []).push({
+        id: `plan-${row.id ?? `${dateKey}-${index}`}`,
+        rowId: row.id,
+        row,
+        dateKey,
+        lineIndex: sortOrder ?? index,
+        rawLine: buildPlanContentWithMeta(textValue, {
+          completed: taskAware.completed
+        }),
+        baseRaw: textValue,
+        completed: Boolean(taskAware.completed),
+        time: timeLabel,
+        title: category,
+        sourceTitle: category,
+        text: textValue,
+        display: textValue,
+        color: category ? windowColorByTitle.get(category) || "#64748b" : "#64748b",
+        sourceType: "text",
+        sortOrder,
+        order: sortOrder ?? index
+      })
+    }
+
+    for (const dateKey of Object.keys(map)) {
+      map[dateKey].sort((a, b) => {
+        const sortA = parsePlanOrderValue(a?.sortOrder)
+        const sortB = parsePlanOrderValue(b?.sortOrder)
+        if (sortA != null || sortB != null) {
+          if (sortA == null) return 1
+          if (sortB == null) return -1
+          if (sortA !== sortB) return sortA - sortB
+        }
+        const timeA = String(a?.time ?? "")
+        const timeB = String(b?.time ?? "")
+        if (timeA && timeB && timeA !== timeB) return timeA.localeCompare(timeB)
+        if (timeA && !timeB) return -1
+        if (!timeA && timeB) return 1
+        return String(a?.text ?? "").localeCompare(String(b?.text ?? ""), "ko")
+      })
+    }
+    return map
+  }, [
+    activeWindowId,
+    allowedDashboardGroupTitles,
+    baseYear,
+    hasCloudSession,
+    remotePlans,
+    windowColorByTitle,
+    windows
+  ])
+
+  const recurringDisplayByDate = useMemo(() => {
+    const recurringMap = {}
+    const recurringTaskMap = {}
+    for (const [dateKey, recurringItems] of Object.entries(recurringItemsByDate ?? {})) {
+      for (const item of Array.isArray(recurringItems) ? recurringItems : []) {
+        const parsed = parseRecurringRawLine(item?.rawLine, item?.title ?? "")
+        if (!parsed.text) continue
+      const baseItem = {
+          ...item,
+          display: parsed.display || item?.display || "",
+          text: parsed.text,
+          title: parsed.title || "",
+          time: parsed.time || "",
+          completed: Boolean(parsed.completed),
+          isTask: true,
+          baseRaw: parsed.baseRaw || String(item?.rawLine ?? "").trim(),
+          sourceType: "recurring",
+          sortOrder: parsePlanOrderValue(item?.row?.sort_order ?? item?.row?.sortOrder ?? item?.row?.order)
+        }
+        ;(recurringTaskMap[dateKey] ??= []).push(baseItem)
+      }
+    }
+    for (const dateKey of Object.keys(recurringTaskMap)) {
+      recurringTaskMap[dateKey].sort((a, b) => {
+        const sortA = parsePlanOrderValue(a?.sortOrder)
+        const sortB = parsePlanOrderValue(b?.sortOrder)
+        if (sortA != null || sortB != null) {
+          if (sortA == null) return 1
+          if (sortB == null) return -1
+          if (sortA !== sortB) return sortA - sortB
+        }
+        const timeA = String(a?.time ?? "")
+        const timeB = String(b?.time ?? "")
+        if (timeA && timeB && timeA !== timeB) return timeA.localeCompare(timeB)
+        if (timeA && !timeB) return -1
+        if (!timeA && timeB) return 1
+        const createdA = String(a?.createdAt ?? "")
+        const createdB = String(b?.createdAt ?? "")
+        if (createdA && createdB && createdA !== createdB) return createdA.localeCompare(createdB)
+        return String(a?.display ?? "").localeCompare(String(b?.display ?? ""), "ko")
+      })
+    }
+    return { recurringMap, recurringTaskMap }
+  }, [recurringItemsByDate])
+
+  const recurringDisplayItemsByDate = recurringDisplayByDate.recurringMap
+  const recurringTaskItemsByDate = recurringDisplayByDate.recurringTaskMap
+  const combinedTaskItemsByDate = useMemo(() => {
+    const map = {}
+    const baseTaskItemsByDate = hasCloudSession ? cloudTaskItemsByDate : textTasksByDate
+    for (const [dateKey, items] of Object.entries(baseTaskItemsByDate ?? {})) {
+      map[dateKey] = [...items]
+    }
+    for (const [dateKey, items] of Object.entries(recurringTaskItemsByDate ?? {})) {
+      map[dateKey] = [...(map[dateKey] ?? []), ...items]
+      map[dateKey].sort((a, b) => {
+        const sortA =
+          parsePlanOrderValue(a?.sortOrder) ??
+          (a?.sourceType === "text" && Number.isFinite(a?.lineIndex) ? a.lineIndex : null)
+        const sortB =
+          parsePlanOrderValue(b?.sortOrder) ??
+          (b?.sourceType === "text" && Number.isFinite(b?.lineIndex) ? b.lineIndex : null)
+        if (sortA != null || sortB != null) {
+          if (sortA == null) return 1
+          if (sortB == null) return -1
+          if (sortA !== sortB) return sortA - sortB
+        }
+        const timeA = String(a?.time ?? "")
+        const timeB = String(b?.time ?? "")
+        if (timeA && timeB && timeA !== timeB) return timeA.localeCompare(timeB)
+        if (timeA && !timeB) return -1
+        if (!timeA && timeB) return 1
+        if (a?.sourceType === "text" && b?.sourceType === "text") {
+          return (a?.lineIndex ?? 0) - (b?.lineIndex ?? 0)
+        }
+        if (a?.sourceType === "recurring" && b?.sourceType === "recurring") {
+          const createdA = String(a?.createdAt ?? "")
+          const createdB = String(b?.createdAt ?? "")
+          if (createdA && createdB && createdA !== createdB) return createdA.localeCompare(createdB)
+        }
+        return String(a?.display ?? "").localeCompare(String(b?.display ?? ""), "ko")
+      })
+    }
+    return map
+  }, [cloudTaskItemsByDate, hasCloudSession, textTasksByDate, recurringTaskItemsByDate])
 
   const dashboardByDate = useMemo(() => {
     const map = {}
     for (const block of dashboardBlocksSource) {
-      const body = dashboardSourceText.slice(block.bodyStartPos, block.blockEndPos)
+      const body = removeTaskLinesFromBody(dashboardSourceText.slice(block.bodyStartPos, block.blockEndPos))
       const parsedBlock = parseDashboardBlockContent(body)
       const entries = buildOrderedEntriesFromBody(body)
       const filteredGroups = allowedDashboardGroupTitles
@@ -3146,9 +4518,51 @@ function stripEmptyGroupLines(bodyText) {
         entries: parsedBlock.entries ?? null
       })
     }
+    if (activeWindowId === "all" && activeReadDateDraftKey && !out.some((block) => block.dateKey === activeReadDateDraftKey)) {
+      out.push({
+        dateKey: activeReadDateDraftKey,
+        general: [],
+        groups: [],
+        timed: [],
+        entries: [],
+        forceVisible: true
+      })
+    }
+    if (activeWindowId === "all") {
+      for (const dateKey of Object.keys(recurringDisplayItemsByDate ?? {})) {
+        if (out.some((block) => block.dateKey === dateKey)) continue
+        out.push({
+          dateKey,
+          general: [],
+          groups: [],
+          timed: [],
+          entries: [],
+          forceVisible: true
+        })
+      }
+      for (const dateKey of Object.keys(combinedTaskItemsByDate ?? {})) {
+        if (out.some((block) => block.dateKey === dateKey)) continue
+        out.push({
+          dateKey,
+          general: [],
+          groups: [],
+          timed: [],
+          entries: [],
+          forceVisible: true
+        })
+      }
+    }
     out.sort((a, b) => keyToTime(a.dateKey) - keyToTime(b.dateKey))
     return out
-  }, [dashboardBlocksSource, dashboardByDate, windowTitleRank])
+  }, [
+    activeReadDateDraftKey,
+    activeWindowId,
+    dashboardBlocksSource,
+    dashboardByDate,
+    windowTitleRank,
+    recurringDisplayItemsByDate,
+    combinedTaskItemsByDate
+  ])
 
   function buildTabEditTextForTitle(title) {
     if (!title) return ""
@@ -3203,9 +4617,38 @@ function stripEmptyGroupLines(bodyText) {
     const out = Object.entries(tabItemsByDate)
       .filter(([, items]) => Array.isArray(items) && items.length > 0)
       .map(([dateKey, items]) => ({ dateKey, items }))
+    if (activeReadDateDraftKey && !out.some((block) => block.dateKey === activeReadDateDraftKey)) {
+      out.push({ dateKey: activeReadDateDraftKey, items: [], forceVisible: true })
+    }
+    for (const dateKey of Object.keys(recurringDisplayItemsByDate ?? {})) {
+      if (out.some((block) => block.dateKey === dateKey)) continue
+      out.push({ dateKey, items: [], forceVisible: true })
+    }
+    for (const dateKey of Object.keys(combinedTaskItemsByDate ?? {})) {
+      if (out.some((block) => block.dateKey === dateKey)) continue
+      out.push({ dateKey, items: [], forceVisible: true })
+    }
     out.sort((a, b) => keyToTime(a.dateKey) - keyToTime(b.dateKey))
     return out
-  }, [activeWindowId, baseYear, tabEditText, windows])
+  }, [
+    activeReadDateDraftKey,
+    activeWindowId,
+    baseYear,
+    tabEditText,
+    windows,
+    recurringDisplayItemsByDate,
+    combinedTaskItemsByDate
+  ])
+
+  const visibleMonthPrefix = `${viewYear}-${String(viewMonth).padStart(2, "0")}-`
+  const visibleDashboardBlocks = useMemo(
+    () => dashboardBlocks.filter((block) => String(block?.dateKey ?? "").startsWith(visibleMonthPrefix)),
+    [dashboardBlocks, visibleMonthPrefix]
+  )
+  const visibleTabReadBlocks = useMemo(
+    () => tabReadBlocks.filter((block) => String(block?.dateKey ?? "").startsWith(visibleMonthPrefix)),
+    [tabReadBlocks, visibleMonthPrefix]
+  )
 
   useEffect(() => {
     if (activeWindowId === "all") return
@@ -3224,6 +4667,25 @@ function stripEmptyGroupLines(bodyText) {
     return () => clearTimeout(timer)
   }, [activeWindowId, baseYear, isEditingLeftMemo, tabEditText, windows])
   const itemsByDate = useMemo(() => {
+    const makeDisplayKey = (dateKey, item, fallbackTitle = "") => {
+      const time = String(item?.time ?? "").trim()
+      const title = String(item?.title ?? item?.sourceTitle ?? fallbackTitle ?? "").trim()
+      const textValue = String(item?.text ?? item?.display ?? "").trim()
+      return `${dateKey}|${time}|${title}|${textValue}`
+    }
+    const taskKeysByDate = new Map()
+    for (const [dateKey, taskItems] of Object.entries(combinedTaskItemsByDate ?? {})) {
+      const keys = new Set()
+      for (const task of Array.isArray(taskItems) ? taskItems : []) {
+        const textValue = String(task?.text ?? task?.display ?? "").trim()
+        if (!textValue) continue
+        keys.add(makeDisplayKey(dateKey, task))
+      }
+      taskKeysByDate.set(dateKey, keys)
+    }
+    const hasTaskDuplicate = (dateKey, item, fallbackTitle = "") =>
+      taskKeysByDate.get(dateKey)?.has(makeDisplayKey(dateKey, item, fallbackTitle))
+
     if (activeWindowId === "all") {
       const out = {}
       for (const block of dashboardBlocksSource) {
@@ -3236,24 +4698,69 @@ function stripEmptyGroupLines(bodyText) {
           if (!text) continue
           const title = String(entry?.title ?? "").trim()
           if (allowedDashboardGroupTitles && title && !allowedDashboardGroupTitles.has(title)) continue
+          if (hasTaskDuplicate(block.dateKey, { ...entry, text, title })) continue
           const color = title ? windowColorByTitle.get(title) || "#999" : "#999"
           const order = Number.isFinite(entry?.order) ? entry.order : 0
           const base = {
             id: `${block.dateKey}-${title || "general"}-${order}`,
+            dateKey: block.dateKey,
             time: entry?.time ? String(entry.time).trim() : "",
             text,
             color,
-            sourceTitle: title
+            sourceTitle: title,
+            isTask: false
           }
           orderedItems.push({ ...base, order })
         }
         orderedItems.sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
-        const bucket = orderedItems.map((item) => {
-          const next = { ...item }
-          delete next.order
-          return next
-        })
+        const bucket = orderedItems.map((item) => ({ ...item }))
         if (bucket.length > 0) out[block.dateKey] = bucket
+      }
+      for (const [dateKey, recurringItems] of Object.entries(recurringDisplayItemsByDate ?? {})) {
+        const bucket = (Array.isArray(recurringItems) ? recurringItems : [])
+          .map((item, idx) => {
+            const text = String(item?.text ?? "").trim()
+            if (!text) return null
+            const title = String(item?.title ?? "").trim()
+            if (hasTaskDuplicate(dateKey, { ...item, text, title })) return null
+            const color = title ? windowColorByTitle.get(title) || "#999" : "#999"
+            return {
+              id: `${dateKey}-rec-${item.id}-${idx}`,
+              dateKey,
+              ...item,
+              time: item?.time ? String(item.time).trim() : "",
+              text,
+              color,
+              sourceTitle: title,
+              sourceType: item?.sourceType ?? "recurring"
+            }
+          })
+          .filter(Boolean)
+        if (bucket.length > 0) out[dateKey] = (out[dateKey] ?? []).concat(bucket)
+      }
+    for (const [dateKey, taskItems] of Object.entries(combinedTaskItemsByDate ?? {})) {
+      const bucket = (Array.isArray(taskItems) ? taskItems : [])
+        .map((task, idx) => {
+          const text = String(task?.text ?? task?.display ?? "").trim()
+          if (!text) return null
+          const title = String(task?.title ?? "").trim()
+          if (allowedDashboardGroupTitles && title && !allowedDashboardGroupTitles.has(title)) return null
+          return {
+            id: `${dateKey}-task-${task.id}-${idx}`,
+            dateKey,
+            ...task,
+            time: task?.time ? String(task.time).trim() : "",
+            text,
+            color: title ? windowColorByTitle.get(title) || "#999" : "#999",
+            sourceTitle: title,
+            isTask: true,
+            completed: Boolean(task?.completed),
+            sourceType: task?.sourceType ?? "text",
+            order: Number.isFinite(task?.lineIndex) ? task.lineIndex : parsePlanOrderValue(task?.sortOrder ?? task?.order) ?? idx
+          }
+        })
+        .filter(Boolean)
+      if (bucket.length > 0) out[dateKey] = (out[dateKey] ?? []).concat(bucket)
       }
       return out
     }
@@ -3269,16 +4776,62 @@ function stripEmptyGroupLines(bodyText) {
         .map((item, idx) => {
           const text = (item.text ?? "").trim()
           if (!text) return null
+          if (hasTaskDuplicate(key, { ...item, text }, targetWindow.title)) return null
           return {
             id: `${key}-${targetWindow.id}-${idx}`,
+            dateKey: key,
             time: item.time || "",
             text,
             color: targetWindow.color,
-            sourceTitle: targetWindow.title
+            sourceTitle: targetWindow.title,
+            order: Number.isFinite(item?.order) ? item.order : idx,
+            isTask: false
           }
         })
         .filter(Boolean)
       out[key] = (out[key] ?? []).concat(bucket)
+    }
+    for (const [dateKey, recurringItems] of Object.entries(recurringDisplayItemsByDate ?? {})) {
+      const bucket = (Array.isArray(recurringItems) ? recurringItems : [])
+        .map((item, idx) => {
+          const text = String(item?.text ?? "").trim()
+          if (!text) return null
+          if (hasTaskDuplicate(dateKey, { ...item, text }, targetWindow.title)) return null
+          return {
+            id: `${dateKey}-rec-${targetWindow.id}-${idx}`,
+            dateKey,
+            ...item,
+            time: item?.time ? String(item.time).trim() : "",
+            text,
+            color: targetWindow.color,
+            sourceTitle: targetWindow.title,
+            sourceType: item?.sourceType ?? "recurring"
+          }
+        })
+        .filter(Boolean)
+      if (bucket.length > 0) out[dateKey] = (out[dateKey] ?? []).concat(bucket)
+    }
+    for (const [dateKey, taskItems] of Object.entries(combinedTaskItemsByDate ?? {})) {
+      const bucket = (Array.isArray(taskItems) ? taskItems : [])
+        .map((task, idx) => {
+          const text = String(task?.text ?? task?.display ?? "").trim()
+          if (!text) return null
+          return {
+            id: `${dateKey}-task-${targetWindow.id}-${idx}`,
+            dateKey,
+            ...task,
+            time: task?.time ? String(task.time).trim() : "",
+            text,
+            color: targetWindow.color,
+            sourceTitle: targetWindow.title,
+            isTask: true,
+            completed: Boolean(task?.completed),
+            sourceType: task?.sourceType ?? "text",
+            order: Number.isFinite(task?.lineIndex) ? task.lineIndex : parsePlanOrderValue(task?.sortOrder ?? task?.order) ?? idx
+          }
+        })
+        .filter(Boolean)
+      if (bucket.length > 0) out[dateKey] = (out[dateKey] ?? []).concat(bucket)
     }
     return out
   }, [
@@ -3291,8 +4844,641 @@ function stripEmptyGroupLines(bodyText) {
     windowTitleRank,
     windowColorByTitle,
     windows,
-    allowedDashboardGroupTitles
+    allowedDashboardGroupTitles,
+    recurringDisplayItemsByDate,
+    combinedTaskItemsByDate
   ])
+
+  function minutesToClockLabel(value) {
+    const minutes = Math.max(0, Math.min(24 * 60, Math.round(Number(value) || 0)))
+    const hour = Math.floor(minutes / 60)
+    const minute = minutes % 60
+    return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`
+  }
+
+  function clockToMinutes(value) {
+    const match = String(value ?? "").trim().match(/^(\d{1,2}):(\d{2})$/)
+    if (!match) return null
+    const hour = Number(match[1])
+    const minute = Number(match[2])
+    if (!Number.isInteger(hour) || !Number.isInteger(minute)) return null
+    if (hour < 0 || hour > 24 || minute < 0 || minute > 59) return null
+    if (hour === 24 && minute !== 0) return null
+    return hour * 60 + minute
+  }
+
+  function parseTimeBlockRange(time, endTime = "") {
+    const raw = String(time ?? "").trim()
+    const rawEnd = String(endTime ?? "").trim()
+    if (!raw && !rawEnd) return { startMinutes: null, endMinutes: null }
+    const match = raw.match(/^(\d{1,2}:\d{2})(?:\s*[~-]\s*(\d{1,2}:\d{2}))?$/)
+    const start = clockToMinutes(match ? match[1] : raw)
+    if (start == null) return { startMinutes: null, endMinutes: null }
+    const parsedEnd = clockToMinutes(rawEnd) ?? clockToMinutes(match?.[2])
+    const end = parsedEnd != null && parsedEnd > start ? parsedEnd : Math.min(24 * 60, start + 60)
+    return { startMinutes: start, endMinutes: end }
+  }
+
+  function buildTimeBlockBodyWithUpdatedTime(bodyText, targetItem, nextTimeLabel) {
+    const normalized = normalizeGroupLineNewlines(String(bodyText ?? ""))
+    const lines = normalized.split("\n")
+    const entries = []
+    let order = 0
+
+    function pushEntry({ time = "", title = "", rawText = "" }) {
+      const text = String(rawText ?? "").trim()
+      if (!text) return
+      entries.push({
+        time: String(time ?? "").trim(),
+        title: normalizeCategoryId(String(title ?? "").trim()),
+        rawText: text,
+        order
+      })
+      order += 1
+    }
+
+    for (const rawLine of lines) {
+      const trimmed = String(rawLine ?? "").trim()
+      if (!trimmed) continue
+
+      const semicolon = parseDashboardSemicolonLine(trimmed, { allowEmptyText: true })
+      if (semicolon) {
+        if (String(semicolon.text ?? "").trim()) {
+          pushEntry({ time: semicolon.time || "", title: semicolon.group || "", rawText: semicolon.text })
+        }
+        continue
+      }
+
+      const groupMatch = trimmed.match(groupLineRegex)
+      if (groupMatch) {
+        const title = normalizeCategoryId(String(groupMatch[1] ?? "").trim())
+        const parts = String(groupMatch[2] ?? "")
+          .split(";")
+          .map((part) => part.trim())
+          .filter(Boolean)
+        for (const part of parts) {
+          const parsed = parseLeadingTimeDashboardLine(part, { allowEmptyText: true })
+          pushEntry({
+            time: parsed?.time || "",
+            title: parsed?.group || title,
+            rawText: parsed ? parsed.text : part
+          })
+        }
+        continue
+      }
+
+      const leadingTime = parseLeadingTimeDashboardLine(trimmed, { allowEmptyText: true })
+      if (leadingTime) {
+        pushEntry({ time: leadingTime.time || "", title: leadingTime.group || "", rawText: leadingTime.text })
+        continue
+      }
+
+      pushEntry({ rawText: trimmed })
+    }
+
+    const targetOrder = Number(targetItem?.order)
+    const targetTitle = normalizeCategoryId(String(targetItem?.sourceTitle ?? targetItem?.title ?? "").trim())
+    const targetText = String(targetItem?.text ?? targetItem?.display ?? "").trim()
+    const targetTime = String(targetItem?.time ?? "").trim()
+    let changed = false
+
+    const nextEntries = entries.map((entry) => {
+      if (changed) return entry
+      const entryText = String(stripTaskSuffix(entry.rawText)?.text ?? entry.rawText ?? "").trim()
+      const orderMatches = Number.isFinite(targetOrder) && entry.order === targetOrder
+      const contentMatches =
+        entryText === targetText &&
+        normalizeCategoryId(entry.title) === targetTitle &&
+        (!targetTime || String(entry.time ?? "").trim() === targetTime)
+      if (!orderMatches && !contentMatches) return entry
+      changed = true
+      return { ...entry, time: nextTimeLabel }
+    })
+
+    if (!changed) return null
+    return nextEntries
+      .map((entry) => {
+        const title = normalizeCategoryId(String(entry.title ?? "").trim())
+        const rawText = String(entry.rawText ?? "").trim()
+        if (!rawText) return ""
+        if (title) return entry.time ? `${entry.time};@${title};${rawText}` : `@${title};${rawText}`
+        return entry.time ? `${entry.time};${rawText}` : rawText
+      })
+      .filter(Boolean)
+      .join("\n")
+      .trimEnd()
+  }
+
+  function buildRecurringRawLineWithTime(item, nextTimeLabel = "") {
+    const parsed = parseRecurringRawLine(item?.rawLine ?? item?.baseRaw ?? item?.text ?? "", item?.title ?? "")
+    const textValue = String(parsed?.text ?? item?.text ?? item?.display ?? "").trim()
+    if (!textValue) return ""
+    const base = nextTimeLabel ? `${nextTimeLabel};${textValue}` : textValue
+    return buildTaskMetaText(base, {
+      completed: parsed?.isTask ? Boolean(parsed.completed) : null
+    })
+  }
+
+  function updateRecurringTimeBlockOverride(item, nextTimeLabel = "") {
+    const ruleId = String(item?.ruleId ?? item?.row?.id ?? "").trim()
+    const dateKey = String(item?.dateKey ?? "").trim()
+    if (!ruleId || !dateKey) return false
+    const rawLine = buildRecurringRawLineWithTime(item, nextTimeLabel)
+    if (!rawLine) return false
+    const familyId = String(item?.familyId ?? ruleId).trim()
+    const nextOverride = {
+      id: genRecurringId("override"),
+      familyId,
+      ruleId,
+      dateKey,
+      mode: "replace",
+      rawLine,
+      updatedAt: new Date().toISOString()
+    }
+    setRecurringOverrides((prev) => {
+      const list = Array.isArray(prev) ? prev : []
+      const filtered = list.filter(
+        (entry) =>
+          !(
+            String(entry?.ruleId ?? "").trim() === ruleId &&
+            String(entry?.dateKey ?? "").trim() === dateKey
+          )
+      )
+      return [...filtered, nextOverride]
+    })
+    return true
+  }
+
+  // ===== 선택된 날짜 =====
+  const [selectedDateKey, setSelectedDateKey] = useState(null)
+  const [lastEditedDateKey, setLastEditedDateKey] = useState(null)
+  const timeBlockDateKey = selectedDateKey || lastEditedDateKey || todayKey
+  const timeBlockItems = useMemo(() => {
+    const dateKey = String(timeBlockDateKey ?? "").trim()
+    if (!dateKey) return []
+    const activeTitle =
+      activeWindowId === "all"
+        ? ""
+        : normalizeCategoryId(String(windows.find((w) => w.id === activeWindowId)?.title ?? "").trim())
+
+    if (hasCloudSession) {
+      return (remotePlans ?? [])
+        .filter((row) => {
+          if (!row || row?.deleted_at) return false
+          if (String(row?.date ?? "").trim() !== dateKey) return false
+          let category = normalizeCategoryId(String(row?.category_id ?? "").trim())
+          if (isGeneralCategoryId(category)) category = ""
+          if (activeWindowId === "all") {
+            if (allowedDashboardGroupTitles && category && !allowedDashboardGroupTitles.has(category)) return false
+            return true
+          }
+          return category === activeTitle
+        })
+        .map((row, index) => {
+          const taskAware = stripTaskSuffix(String(row?.content ?? "").trim())
+          const textValue = String(taskAware?.text ?? "").trim()
+          if (!textValue) return null
+          let category = normalizeCategoryId(String(row?.category_id ?? "").trim())
+          if (isGeneralCategoryId(category)) category = ""
+          const normalizedTime = normalizePlanTimeFields(row)
+          const timeLabel = buildTimeSpanLabel(normalizedTime.time, normalizedTime.end_time)
+          const range = parseTimeBlockRange(normalizedTime.time, normalizedTime.end_time)
+          const recurring = isRecurringPlanRow(row)
+          return {
+            id: `plan-${row.id ?? index}`,
+            rowId: row.id,
+            row,
+            dateKey,
+            time: timeLabel,
+            startMinutes: range.startMinutes,
+            endMinutes: range.endMinutes,
+            text: textValue,
+            color: category ? windowColorByTitle.get(category) || "#64748b" : "#64748b",
+            sourceTitle: category,
+            isTask: taskAware.completed != null,
+            completed: Boolean(taskAware.completed),
+            order: parsePlanOrderValue(row?.sort_order ?? row?.sortOrder ?? row?.order) ?? index,
+            sourceType: recurring ? "recurring" : "text",
+            canEdit: Boolean(row?.id)
+          }
+        })
+        .filter(Boolean)
+        .sort((a, b) => {
+          const startA = Number.isFinite(a.startMinutes) ? a.startMinutes : Number.MAX_SAFE_INTEGER
+          const startB = Number.isFinite(b.startMinutes) ? b.startMinutes : Number.MAX_SAFE_INTEGER
+          if (startA !== startB) return startA - startB
+          return (a.order ?? 0) - (b.order ?? 0)
+        })
+    }
+
+    return (itemsByDate[dateKey] ?? []).map((item, index) => {
+      const range = parseTimeBlockRange(item?.time)
+      return {
+        ...item,
+        id: String(item?.id ?? `text-${dateKey}-${index}`),
+        dateKey,
+        startMinutes: range.startMinutes,
+        endMinutes: range.endMinutes,
+        color:
+          item?.color ||
+          windowColorByTitle.get(normalizeCategoryId(String(item?.sourceTitle ?? item?.title ?? "").trim())) ||
+          "#64748b",
+        sourceTitle: item?.sourceTitle ?? item?.title ?? "",
+        order: Number.isFinite(item?.order) ? item.order : index,
+        canEdit: !isScheduleReadOnly
+      }
+    })
+  }, [
+    activeWindowId,
+    allowedDashboardGroupTitles,
+    hasCloudSession,
+    isScheduleReadOnly,
+    itemsByDate,
+    lastEditedDateKey,
+    remotePlans,
+    selectedDateKey,
+    timeBlockDateKey,
+    todayKey,
+    windowColorByTitle,
+    windows
+  ])
+
+  function selectTimeBlockDate(dateKey) {
+    const key = String(dateKey ?? "").trim()
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(key)) return
+    const { y, m } = keyToYMD(key)
+    if (baseYearRef.current !== y) {
+      baseYearRef.current = y
+      setBaseYear(y)
+    }
+    setView({ year: y, month: m })
+    viewRef.current = { year: y, month: m }
+    setActiveDateKey(key)
+  }
+
+  function shiftTimeBlockDate(amount) {
+    const current = String(timeBlockDateKey ?? todayKey ?? "").trim()
+    const next = addDaysToKey(current, amount)
+    if (next) selectTimeBlockDate(next)
+  }
+
+  function openTimeBlockDate() {
+    const key = String(timeBlockDateKey ?? todayKey ?? "").trim()
+    selectTimeBlockDate(key)
+    openPlanCreateModal(key)
+  }
+
+  async function handleTimeBlockChange(item, startMinutes, endMinutes) {
+    const dateKey = String(item?.dateKey ?? timeBlockDateKey ?? "").trim()
+    if (!dateKey) return
+    const moveToNoTime = startMinutes == null || endMinutes == null
+    const startTime = moveToNoTime ? "" : minutesToClockLabel(startMinutes)
+    const endTime = moveToNoTime ? "" : minutesToClockLabel(endMinutes)
+    const nextTimeLabel = moveToNoTime ? "" : `${startTime}-${endTime}`
+    const isRecurringBlock = Boolean(
+      item?.sourceType === "recurring" ||
+        item?.repeatLabel ||
+        item?.seriesId ||
+        item?.familyId ||
+        item?.row?.series_id ||
+        item?.row?.seriesId
+    )
+
+    if (canUseWebRowPlanEdit && supabase && session?.user?.id && item?.rowId) {
+      const userId = session.user.id
+      const updatedAt = new Date().toISOString()
+      const nextRowPatch = {
+        time: startTime || null,
+        updated_at: updatedAt,
+        client_id: clientIdRef.current
+      }
+      if (endTimeSupportedRef.current) nextRowPatch.end_time = endTime || null
+      if (isRecurringBlock && repeatColumnsSupportedRef.current) {
+        Object.assign(nextRowPatch, {
+          repeat_type: "none",
+          repeat_interval: 1,
+          repeat_days: null,
+          repeat_until: null,
+          series_id: null
+        })
+      }
+
+      suspendRemotePlansLoads()
+      setRemotePlans((prev) =>
+        (prev ?? []).map((row) =>
+          String(row?.id ?? "") === String(item.rowId)
+            ? { ...row, ...nextRowPatch }
+            : row
+        )
+      )
+
+      const payload = { ...nextRowPatch }
+
+      let { error } = await supabase
+        .from("plans")
+        .update(payload)
+        .eq("id", item.rowId)
+        .eq("user_id", userId)
+
+      if (error && isEndTimeColumnError(error)) {
+        endTimeSupportedRef.current = false
+        const retryPayload = { ...payload }
+        delete retryPayload.end_time
+        const retry = await supabase
+          .from("plans")
+          .update(retryPayload)
+          .eq("id", item.rowId)
+          .eq("user_id", userId)
+        error = retry.error
+      }
+
+      if (error && isRepeatColumnError(error)) {
+        markRepeatFallbackNotice()
+        const retryPayload = { ...payload }
+        delete retryPayload.repeat_type
+        delete retryPayload.repeat_interval
+        delete retryPayload.repeat_days
+        delete retryPayload.repeat_until
+        delete retryPayload.series_id
+        if (!endTimeSupportedRef.current) delete retryPayload.end_time
+        const retry = await supabase
+          .from("plans")
+          .update(retryPayload)
+          .eq("id", item.rowId)
+          .eq("user_id", userId)
+        error = retry.error
+      }
+
+      if (error && isEndTimeColumnError(error)) {
+        endTimeSupportedRef.current = false
+        const retryPayload = { ...payload }
+        delete retryPayload.end_time
+        if (!repeatColumnsSupportedRef.current) {
+          delete retryPayload.repeat_type
+          delete retryPayload.repeat_interval
+          delete retryPayload.repeat_days
+          delete retryPayload.repeat_until
+          delete retryPayload.series_id
+        }
+        const retry = await supabase
+          .from("plans")
+          .update(retryPayload)
+          .eq("id", item.rowId)
+          .eq("user_id", userId)
+        error = retry.error
+      }
+
+      if (error) {
+        console.error("time block update", error)
+        await loadRemotePlans(userId, { force: true })
+      }
+      return
+    }
+
+    if (isRecurringBlock) {
+      updateRecurringTimeBlockOverride(item, nextTimeLabel)
+      return
+    }
+
+    const isAll = activeWindowId === "all"
+    const current = isAll ? textRef.current ?? text : tabEditText ?? ""
+    const body = getDateBlockBodyText(current, baseYear, dateKey)
+    const nextBody = buildTimeBlockBodyWithUpdatedTime(body, item, nextTimeLabel)
+    if (nextBody == null || nextBody === body) return
+    if (canUseWebRowPlanEdit) enqueueDayListSync(dateKey, nextBody, activeWindowId)
+    if (isScheduleReadOnly) return
+    const nextText = updateDateBlockBody(current, baseYear, dateKey, nextBody)
+    if (nextText === current) return
+    if (isAll) {
+      updateEditorText(nextText)
+      setWindowMemoTextSync(baseYear, "all", nextText)
+      return
+    }
+    setTabEditText(nextText)
+    setWindowMemoTextSync(baseYear, activeWindowId, nextText)
+    applyTabEditToAllFromText(nextText)
+  }
+
+  function movePlanDraftToText(fields, targetIndex = null) {
+    const rawLine = buildPlanRawLineFromDraftFields(fields)
+    const sourceDateKey = String(fields.sourceItem?.dateKey ?? fields.dateKey ?? "").trim()
+    const targetDateKey = String(fields.dateKey ?? "").trim()
+    if (!sourceDateKey || !targetDateKey || !rawLine) return false
+
+    const isAll = activeWindowId === "all"
+    const current = isAll ? textRef.current ?? text : tabEditText ?? ""
+    const sourceBody = getDateBlockBodyText(current, baseYear, sourceDateKey)
+    const sourceEntries = collectPlanEntriesFromBody(sourceBody)
+    const sourceIndex = sourceEntries.findIndex((entry) => planEntryMatchesItem(entry, fields.sourceItem))
+    if (sourceIndex < 0) return false
+
+    const replacementEntries = collectPlanEntriesFromBody(rawLine)
+    const replacement = replacementEntries[0]
+    if (!replacement) return false
+
+    const requestedIndex = Number.isInteger(targetIndex) ? targetIndex : null
+    let nextText = current
+    let nextSourceBody = sourceBody
+    let nextTargetBody = ""
+
+    if (sourceDateKey === targetDateKey) {
+      const nextEntries = [...sourceEntries]
+      nextEntries.splice(sourceIndex, 1)
+      let insertIndex = requestedIndex == null ? sourceIndex : requestedIndex
+      if (requestedIndex != null && sourceIndex < insertIndex) insertIndex -= 1
+      insertIndex = Math.max(0, Math.min(nextEntries.length, insertIndex))
+      nextEntries.splice(insertIndex, 0, replacement)
+      nextTargetBody = buildBodyFromPlanEntries(nextEntries)
+      nextText = updateDateBlockBody(current, baseYear, sourceDateKey, nextTargetBody)
+      nextSourceBody = nextTargetBody
+    } else {
+      const nextSourceEntries = [...sourceEntries]
+      nextSourceEntries.splice(sourceIndex, 1)
+      nextSourceBody = buildBodyFromPlanEntries(nextSourceEntries)
+      nextText = updateDateBlockBody(current, baseYear, sourceDateKey, nextSourceBody)
+
+      const targetBody = getDateBlockBodyText(nextText, baseYear, targetDateKey)
+      const targetEntries = collectPlanEntriesFromBody(targetBody)
+      const insertIndex = requestedIndex == null ? targetEntries.length : Math.max(0, Math.min(targetEntries.length, requestedIndex))
+      targetEntries.splice(insertIndex, 0, replacement)
+      nextTargetBody = buildBodyFromPlanEntries(targetEntries)
+      nextText = updateDateBlockBody(nextText, baseYear, targetDateKey, nextTargetBody)
+    }
+
+    if (canUseWebRowPlanEdit) {
+      enqueueDayListSync(sourceDateKey, nextSourceBody, activeWindowId)
+      enqueueDayListSync(targetDateKey, nextTargetBody, activeWindowId)
+    }
+    if (isAll) {
+      updateEditorText(nextText)
+      setWindowMemoTextSync(baseYear, "all", nextText)
+    } else {
+      setTabEditText(nextText)
+      setWindowMemoTextSync(baseYear, activeWindowId, nextText)
+      applyTabEditToAllFromText(nextText)
+    }
+    return true
+  }
+
+  async function movePlanRowInCloud(item, targetDateKey, targetIndex = null) {
+    if (!supabase || !session?.user?.id) return false
+    const targetRow = item?.rowId || item?.row?.id ? item?.row ?? { id: item?.rowId } : findMatchingRemotePlanRow(item)
+    const rowId = String(targetRow?.id ?? "").trim()
+    if (!rowId) return false
+    const userId = session.user.id
+    const fullTargetRow = (remotePlans ?? []).find((row) => String(row?.id ?? "") === rowId) ?? targetRow
+    const sourceDateKey = String(fullTargetRow?.date ?? item?.dateKey ?? "").trim()
+    const nextDateKey = String(targetDateKey ?? "").trim()
+    const canSetOrder = Boolean(sortOrderSupportedRef.current)
+    const requestedIndex = Number.isInteger(targetIndex) ? targetIndex : null
+    const updatedAtBase = Date.now()
+
+    if (!canSetOrder) {
+      if (sourceDateKey === nextDateKey) return false
+      const updatedAt = new Date(updatedAtBase).toISOString()
+      suspendRemotePlansLoads()
+      setRemotePlans((prev) =>
+        (prev ?? []).map((row) =>
+          String(row?.id ?? "") === rowId ? { ...row, date: nextDateKey, updated_at: updatedAt, client_id: clientIdRef.current } : row
+        )
+      )
+      const { error } = await supabase
+        .from("plans")
+        .update({ date: nextDateKey, updated_at: updatedAt, client_id: clientIdRef.current })
+        .eq("id", rowId)
+        .eq("user_id", userId)
+      if (error) {
+        console.error("move plan date", error)
+        await loadRemotePlans(userId, { force: true })
+        return false
+      }
+      return true
+    }
+
+    const rowsBefore = (remotePlans ?? [])
+      .filter((row) => {
+        if (!row || row?.deleted_at) return false
+        return String(row?.date ?? "").trim() === nextDateKey
+      })
+      .sort((a, b) => {
+        const orderA = parsePlanOrderValue(a?.sort_order ?? a?.sortOrder ?? a?.order)
+        const orderB = parsePlanOrderValue(b?.sort_order ?? b?.sortOrder ?? b?.order)
+        if (orderA != null || orderB != null) {
+          if (orderA == null) return 1
+          if (orderB == null) return -1
+          if (orderA !== orderB) return orderA - orderB
+        }
+        const timeA = String(a?.time ?? "")
+        const timeB = String(b?.time ?? "")
+        if (timeA && timeB && timeA !== timeB) return timeA.localeCompare(timeB)
+        if (timeA && !timeB) return -1
+        if (!timeA && timeB) return 1
+        return String(a?.content ?? "").localeCompare(String(b?.content ?? ""), "ko")
+      })
+    const currentIndex = rowsBefore.findIndex((row) => String(row?.id ?? "") === rowId)
+    const rows = rowsBefore.filter((row) => String(row?.id ?? "") !== rowId)
+    let insertIndex = requestedIndex == null ? rows.length : requestedIndex
+    if (requestedIndex != null && currentIndex >= 0 && currentIndex < insertIndex) insertIndex -= 1
+    insertIndex = Math.max(0, Math.min(rows.length, insertIndex))
+    rows.splice(insertIndex, 0, { ...fullTargetRow, date: nextDateKey })
+    const orderedRows = enforceTimedPlanOrderInSlots(rows)
+
+    const updates = orderedRows
+      .filter((row) => row?.id)
+      .map((row, index) => ({
+        id: row.id,
+        user_id: userId,
+        date: String(row?.id ?? "") === rowId ? nextDateKey : String(row?.date ?? nextDateKey).trim(),
+        sort_order: index,
+        updated_at: new Date(updatedAtBase + index).toISOString(),
+        client_id: clientIdRef.current
+      }))
+
+    suspendRemotePlansLoads()
+    const updateMap = new Map(updates.map((row) => [String(row.id), row]))
+    setRemotePlans((prev) =>
+      (prev ?? []).map((row) => {
+        const update = updateMap.get(String(row?.id ?? ""))
+        return update ? { ...row, ...update } : row
+      })
+    )
+
+    const { error } = await supabase.from("plans").upsert(updates, { onConflict: "id" })
+    if (error) {
+      if (isSortOrderColumnError(error)) {
+        sortOrderSupportedRef.current = false
+        const updatedAt = new Date().toISOString()
+        const retry = await supabase
+          .from("plans")
+          .update({ date: nextDateKey, updated_at: updatedAt, client_id: clientIdRef.current })
+          .eq("id", rowId)
+          .eq("user_id", userId)
+        if (retry.error) {
+          console.error("move plan date", retry.error)
+          await loadRemotePlans(userId, { force: true })
+          return false
+        }
+        return true
+      }
+      console.error("move plan order", error)
+      await loadRemotePlans(userId, { force: true })
+      return false
+    }
+    return true
+  }
+
+  async function handlePlanMoveDate(item, targetDateKey, targetIndex = null) {
+    const nextDateKey = String(targetDateKey ?? "").trim()
+    const sourceDateKey = String(item?.dateKey ?? "").trim()
+    const hasTargetIndex = Number.isInteger(targetIndex)
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(nextDateKey) || !sourceDateKey) return
+    if (sourceDateKey === nextDateKey && !hasTargetIndex) return
+    const isRecurringMove = Boolean(
+      item?.sourceType === "recurring" ||
+        item?.repeatLabel ||
+        item?.seriesId ||
+        item?.familyId ||
+        item?.row?.series_id
+    )
+    if (isRecurringMove) {
+      const hasTime = Boolean(String(item?.time ?? item?.row?.time ?? "").trim())
+      if (hasTime) {
+        setAuthMessage("시간 있는 반복 일정은 시간순으로 고정돼요.")
+        return
+      }
+      if (sourceDateKey !== nextDateKey) {
+        setAuthMessage("반복 일정은 같은 날짜 안에서만 순서를 바꿀 수 있어요.")
+        return
+      }
+      if (canUseWebRowPlanEdit && supabase && session?.user?.id) {
+        const ok = await movePlanRowInCloud(item, nextDateKey, hasTargetIndex ? targetIndex : null)
+        if (!ok) setAuthMessage("항목 이동에 실패했어요.")
+      }
+      setActiveDateKey(nextDateKey)
+      return
+    }
+    const modalDraft = getPlanModalDraftFromItem(item, sourceDateKey)
+    const fields = normalizePlanModalDraft({
+      ...modalDraft,
+      editMode: "edit",
+      sourceItem: item,
+      dateKey: nextDateKey
+    })
+
+    if (canUseWebRowPlanEdit && supabase && session?.user?.id) {
+      const ok = await movePlanRowInCloud(item, nextDateKey, hasTargetIndex ? targetIndex : null)
+      if (!ok) {
+        setAuthMessage("항목 이동에 실패했어요.")
+        return
+      }
+      setActiveDateKey(nextDateKey)
+      return
+    }
+
+    if (movePlanDraftToText(fields, hasTargetIndex ? targetIndex : null)) {
+      setActiveDateKey(nextDateKey)
+    }
+  }
 
   const collapsedForActive = dashboardCollapsedByWindow[activeWindowId] ?? {}
 
@@ -3349,62 +5535,13 @@ function stripEmptyGroupLines(bodyText) {
   }
 
   function handleReadBlockClick(dateKey) {
-    if (isMainMemoReadOnly) {
-      if (dateKey) {
-        setActiveDateKey(dateKey)
-        openDayList(dateKey, itemsByDate[dateKey] ?? [])
-      }
-      return
-    }
     if (!dateKey) return
-    beginEditSession(dateKey)
     setActiveDateKey(dateKey)
-    setIsEditingLeftMemo(true)
-    requestAnimationFrame(() => {
-      const el = textareaRef.current
-      if (el) el.focus()
-    })
-
-    if (activeWindowId === "all") {
-      const sourceText = textRef.current ?? text
-      const parsedSource = parseBlocksAndItems(sourceText ?? "", baseYear)
-      const block = parsedSource.blocks.find((b) => b.dateKey === dateKey)
-      if (!block) return
-
-      const ensured = ensureBodyLineForBlock(sourceText ?? "", block)
-      if (ensured.newText !== (sourceText ?? "")) {
-        pendingJumpRef.current = {
-          headerPos: block.headerStartPos,
-          caretPos: ensured.caretPos,
-          topOffsetLines: 1
-        }
-        updateEditorText(ensured.newText)
-      } else {
-        scheduleJump(block.headerStartPos, ensured.caretPos, 1)
-      }
-      return
-    }
-
-    const targetWindow = windows.find((w) => w.id === activeWindowId)
-    if (!targetWindow) return
-    const sourceText = tabEditText ?? ""
-    const ensured = ensureTabGroupLineAtDate(sourceText, dateKey, targetWindow.title, baseYear)
-    const headerPos = ensured.headerPos ?? 0
-    const caretPos = ensured.caretPos ?? 0
-    if (ensured.newText !== sourceText) {
-      pendingJumpRef.current = { headerPos, caretPos, topOffsetLines: 1 }
-      setTabEditText(ensured.newText)
-    } else {
-      scheduleJump(headerPos, caretPos, 1)
-    }
+    openPlanCreateModal(dateKey)
   }
 
   const READ_SCROLL_MARGIN_TOP = 16
 
-  // ===== 선택된 날짜 =====
-  const [selectedDateKey, setSelectedDateKey] = useState(null)
-  const [lastEditedDateKey, setLastEditedDateKey] = useState(null)
-  const [hoveredReadDateKey, setHoveredReadDateKey] = useState(null)
   const readScrollContainerRef = useRef(null)
   const lastActiveDateKeyRef = useRef(null)
   const lastCaretDateKeyRef = useRef(null)
@@ -3419,12 +5556,12 @@ function stripEmptyGroupLines(bodyText) {
   const dayListDirtyRef = useRef(false)
   const dayListView = useMemo(() => {
     if (!dayListModal) return null
-    return parseDashboardBlockContent(dayListEditText)
+    return parseDashboardBlockContent(removeTaskLinesFromBody(dayListEditText))
   }, [dayListModal, dayListEditText])
   const dayListReadItems = useMemo(() => {
     if (!dayListView) return null
     const isAll = activeWindowId === "all"
-    const entries = buildOrderedEntriesFromBody(dayListEditText)
+    const entries = buildOrderedEntriesFromBody(removeTaskLinesFromBody(dayListEditText))
     const filtered = isAll && allowedDashboardGroupTitles
       ? entries.filter((entry) => !entry.title || allowedDashboardGroupTitles.has(entry.title))
       : entries
@@ -3533,7 +5670,7 @@ function stripEmptyGroupLines(bodyText) {
     setDayListEditText(body)
     dayListDirtyRef.current = false
     dayListEditGuardRef.current.dirty = false
-    setDayListMode("read")
+    setDayListMode("edit")
   }, [dayListModal ? dayListModal.key : null, baseYear, activeWindowId])
 
   useEffect(() => {
@@ -3630,6 +5767,15 @@ function stripEmptyGroupLines(bodyText) {
     if (canUseWebRowPlanEdit) {
       enqueueDayListSync(dayListModal.key, nextBody, activeWindowId)
     }
+    if (
+      readDateDraft &&
+      readDateDraft.windowId === activeWindowId &&
+      readDateDraft.year === baseYear &&
+      readDateDraft.dateKey === dayListModal.key &&
+      String(nextBody ?? "").trim()
+    ) {
+      setReadDateDraft(null)
+    }
     if (isScheduleReadOnly) return
     const isAll = activeWindowId === "all"
     const current = isAll ? textRef.current ?? text : tabEditText ?? ""
@@ -3645,34 +5791,34 @@ function stripEmptyGroupLines(bodyText) {
     applyTabEditToAllFromText(nextText)
   }
 
-  function openReadDateCreatePicker() {
-    const input = readDateCreateInputRef.current
-    if (!input) return
-    const button = readDateCreateButtonRef.current
-    if (button) {
-      const rect = button.getBoundingClientRect()
-      const pickerWidth = 296
-      const gapY = 4
-      const viewportPadding = 8
-      let left = rect.right - pickerWidth + 90
-      if (typeof window !== "undefined") {
-        left = Math.max(viewportPadding, Math.min(left, window.innerWidth - pickerWidth - viewportPadding))
-      }
-      input.style.left = `${Math.round(left)}px`
-      input.style.top = `${Math.round(rect.bottom + gapY)}px`
-    }
-    input.value = ""
+  function openReadDateCreatePicker(anchorEl = null) {
+    void anchorEl
+    openPlanCreateModal(String(lastActiveDateKeyRef.current || selectedDateKey || lastEditedDateKey || todayKey || "").trim() || todayKey)
+  }
 
-    try {
-      if (typeof input.showPicker === "function") {
-        input.showPicker()
-        return
+  function ensureDateBlockExists(sourceText, year, dateKey) {
+    const current = sourceText ?? ""
+    const parsedNow = parseBlocksAndItems(current, year)
+    const existing = parsedNow.blocks.find((block) => block.dateKey === dateKey)
+    if (existing) return { newText: current, inserted: false }
+
+    const targetTime = keyToTime(dateKey)
+    const sortedBlocks = [...parsedNow.blocks].sort(
+      (a, b) => keyToTime(a.dateKey) - keyToTime(b.dateKey) || a.blockStartPos - b.blockStartPos
+    )
+
+    let insertPos = current.length
+    for (const block of sortedBlocks) {
+      if (keyToTime(block.dateKey) > targetTime) {
+        insertPos = block.blockStartPos
+        break
       }
-    } catch (err) {
-      void err
     }
-    input.focus()
-    input.click()
+
+    const { y, m, d } = keyToYMD(dateKey)
+    const headerLine = buildHeaderLine(y, m, d)
+    const inserted = insertDateBlockAt(current, insertPos, headerLine)
+    return { newText: inserted.newText, inserted: true }
   }
 
   function handleReadDateCreateChange(e) {
@@ -3687,8 +5833,30 @@ function stripEmptyGroupLines(bodyText) {
       baseYearRef.current = y
       setBaseYear(y)
     }
+
+    setReadDateDraft(null)
+
+    if (activeWindowId === "all") {
+      const current = textRef.current ?? text
+      const ensured = ensureDateBlockExists(current, y, key)
+      if (ensured.inserted) {
+        updateEditorText(ensured.newText)
+        setWindowMemoTextSync(y, "all", ensured.newText)
+        setReadDateDraft({ windowId: "all", year: y, dateKey: key })
+      }
+    } else {
+      const current = tabEditText ?? ""
+      const ensured = ensureDateBlockExists(current, y, key)
+      if (ensured.inserted) {
+        setTabEditText(ensured.newText)
+        setWindowMemoTextSync(y, activeWindowId, ensured.newText)
+        setReadDateDraft({ windowId: activeWindowId, year: y, dateKey: key })
+      }
+    }
+
     setActiveDateKey(key)
-    openDayList(key, [])
+    scrollReadDateIntoView(key, "smooth")
+    openPlanCreateModal(key)
   }
 
   // ===== 점프 스케줄 =====
@@ -3882,7 +6050,8 @@ function stripEmptyGroupLines(bodyText) {
     const anchor = getTabMentionAnchor(value, caret)
     if (!anchor) return
 
-    const insert = `@${title}`
+    const nextChar = value[caret] ?? ""
+    const insert = `@${title}${nextChar === ";" ? "" : ";"}`
     const nextText = value.slice(0, anchor.anchorPos) + insert + value.slice(caret)
     const caretPos = anchor.anchorPos + insert.length
 
@@ -4082,82 +6251,22 @@ function stripEmptyGroupLines(bodyText) {
   function handleDayClick(day) {
     const { year, month } = viewRef.current
     const key = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`
-    if (isMainMemoReadOnly) {
-      setActiveDateKey(key)
-      openDayList(key, itemsByDate[key] ?? [])
-      return
-    }
-    if (!isEditingLeftMemo) {
-      beginEditSession(key)
-      setIsEditingLeftMemo(true)
-      requestAnimationFrame(() => {
-        const el = textareaRef.current
-        if (el) el.focus()
-      })
-    }
     setActiveDateKey(key)
+    openPlanCreateModal(key)
+  }
 
-    const isAll = activeWindowId === "all"
-    const sourceText = isAll ? (textareaRef.current ? textareaRef.current.value : text) : tabEditText
-    const sourceBlocks = isAll ? blocks : parseBlocksAndItems(sourceText ?? "", baseYear).blocks
-    const existing = sourceBlocks.find((b) => b.dateKey === key)
-
-    if (existing) {
-      if (isAll) {
-        const { newText, caretPos } = ensureBodyLineForBlock(sourceText ?? "", existing)
-        if (newText !== (sourceText ?? "")) {
-          pendingJumpRef.current = { headerPos: existing.headerStartPos, caretPos, topOffsetLines: 1 }
-          updateEditorText(newText)
-        } else {
-          scheduleJump(existing.headerStartPos, caretPos, 1)
-        }
-      } else {
-        const targetWindow = windows.find((w) => w.id === activeWindowId)
-        if (!targetWindow) return
-        const ensured = ensureTabGroupLineAtDate(sourceText ?? "", key, targetWindow.title, baseYear)
-        if (ensured.newText !== (sourceText ?? "")) {
-          pendingJumpRef.current = {
-            headerPos: ensured.headerPos ?? existing.headerStartPos,
-            caretPos: ensured.caretPos ?? existing.bodyStartPos,
-            topOffsetLines: 1
-          }
-          setTabEditText(ensured.newText)
-        } else {
-          scheduleJump(existing.headerStartPos, ensured.caretPos ?? existing.bodyStartPos, 1)
-        }
-      }
-      return
-    }
-
-    const targetTime = keyToTime(key)
-    const byDate = [...sourceBlocks].sort(
-      (a, b) => keyToTime(a.dateKey) - keyToTime(b.dateKey) || a.blockStartPos - b.blockStartPos
-    )
-
-    let insertPos = (sourceText ?? "").length
-    for (const b of byDate) {
-      if (keyToTime(b.dateKey) > targetTime) {
-        insertPos = b.blockStartPos
-        break
-      }
-    }
-
-    const headerLine = buildHeaderLine(year, month, day)
-    const { newText: insertedText, headerStartPos, bodyStartPos } = insertDateBlockAt(
-      sourceText ?? "",
-      insertPos,
-      headerLine
-    )
-    pendingJumpRef.current = { headerPos: headerStartPos, caretPos: bodyStartPos, topOffsetLines: 1 }
-    if (isAll) {
-      updateEditorText(insertedText)
-    } else {
-      const targetWindow = windows.find((w) => w.id === activeWindowId)
-      if (!targetWindow) return
-      const ensured = ensureTabGroupLineAtDate(insertedText, key, targetWindow.title, baseYear)
-      pendingJumpRef.current.caretPos = ensured.caretPos ?? pendingJumpRef.current.caretPos
-      setTabEditText(ensured.newText)
-    }
+  function handleCalendarDateRangeCreate(startDateKey, endDateKey) {
+    const start = String(startDateKey ?? "").trim()
+    const end = String(endDateKey ?? startDateKey ?? "").trim()
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end)) return
+    const normalizedStart = start <= end ? start : end
+    const normalizedEnd = start <= end ? end : start
+    setActiveDateKey(normalizedStart)
+    openPlanCreateModal(normalizedStart, {
+      endDateKey: normalizedEnd,
+      repeat: "daily",
+      repeatInterval: 1
+    })
   }
 
   // ===== Today 버튼 동작 =====
@@ -4314,13 +6423,6 @@ function stripEmptyGroupLines(bodyText) {
       return next
     })
   }
-  function basePrevYear() {
-    setBaseYear((y) => y - 1)
-  }
-  function baseNextYear() {
-    setBaseYear((y) => y + 1)
-  }
-
   const lastDay = daysInMonth(viewYear, viewMonth)
   const firstWeekday = dayOfWeek(viewYear, viewMonth, 1)
   const weeks = Math.ceil((firstWeekday + lastDay) / 7)
@@ -4362,6 +6464,36 @@ function stripEmptyGroupLines(bodyText) {
   const dragStartXRef = useRef(0)
   const dragStartRatioRef = useRef(0)
 
+  function getOuterSplitBounds(containerW) {
+    const safeW = Math.max(1, Number(containerW) || 1)
+    const availableW = Math.max(0, safeW - OUTER_SPLIT_GAP_PX)
+    const maxMemoPxForCalendar = Math.max(0, availableW - MIN_CALENDAR_PANEL_PX)
+    const minMemoPx = Math.min(MIN_MEMO_PANEL_PX, maxMemoPxForCalendar)
+    const maxMemoPx = Math.max(minMemoPx, maxMemoPxForCalendar)
+    return {
+      minRatio: minMemoPx / safeW,
+      maxRatio: maxMemoPx / safeW
+    }
+  }
+
+  function clampOuterSplitRatio(ratio, containerW) {
+    const bounds = getOuterSplitBounds(containerW)
+    return clamp(ratio, bounds.minRatio, bounds.maxRatio)
+  }
+
+  useEffect(() => {
+    if (outerCollapsed !== "none") return
+    function clampCurrentSplit() {
+      const rect = layoutRef.current?.getBoundingClientRect?.()
+      const width = rect?.width ?? 0
+      if (!width) return
+      setSplitRatio((prev) => clampOuterSplitRatio(prev, width))
+    }
+    clampCurrentSplit()
+    window.addEventListener("resize", clampCurrentSplit)
+    return () => window.removeEventListener("resize", clampCurrentSplit)
+  }, [outerCollapsed, layoutPreset])
+
   function beginDrag(e) {
     if (outerCollapsed !== "none") return
     draggingRef.current = true
@@ -4388,10 +6520,7 @@ function stripEmptyGroupLines(bodyText) {
     const signedDx = isSwapped ? -dx : dx
     const nextMemoPx = dragStartRatioRef.current * containerW + signedDx
 
-    const minRatio = MIN_LEFT_PX / containerW
-    const maxRatio = 1 - MIN_RIGHT_PX / containerW
-
-    const next = clamp(nextMemoPx / containerW, minRatio, maxRatio)
+    const next = clampOuterSplitRatio(nextMemoPx / containerW, containerW)
     setSplitRatio(next)
   }
 
@@ -4455,12 +6584,12 @@ function stripEmptyGroupLines(bodyText) {
   const iconButton = {
     width: 28,
     height: 26,
-    borderRadius: 10,
+    borderRadius: 6,
     border: `1px solid ${ui.border}`,
     background: ui.surface,
     color: ui.text,
     cursor: "pointer",
-    fontWeight: 800,
+    fontWeight: 680,
     lineHeight: 1,
     display: "inline-flex",
     alignItems: "center",
@@ -4499,15 +6628,23 @@ function stripEmptyGroupLines(bodyText) {
     height: 34
   }
 
+  const compactLayoutToggleButton = {
+    ...memoTopRightButton,
+    padding: 0,
+    fontSize: 18,
+    fontWeight: 680,
+    flexShrink: 0
+  }
+
   const controlInput = {
     height: 34,
     padding: "0 10px",
-    borderRadius: 10,
+    borderRadius: 6,
     border: `1px solid ${ui.border}`,
     background: ui.surface,
     color: ui.text,
     fontFamily: "inherit",
-    fontWeight: 800,
+    fontWeight: 680,
     outline: "none"
   }
 
@@ -4515,29 +6652,61 @@ function stripEmptyGroupLines(bodyText) {
     ...controlInput,
     height: 22,
     padding: "0 6px",
-    borderRadius: 8,
+    borderRadius: 6,
     textAlign: "center",
     fontWeight: 600,
     fontSize: 13
   }
 
-  const panelFontFamily = "Pretendard Variable, 'Inter', 'Apple SD Gothic Neo', system-ui, sans-serif"
+  const panelFontFamily = "Pretendard Variable, Pretendard, 'Noto Sans KR', 'Apple SD Gothic Neo', system-ui, sans-serif"
 
   const pillButton = {
     height: 34,
     padding: "0 12px",
-    borderRadius: 10,
+    borderRadius: 6,
     border: `1px solid ${ui.border}`,
     background: ui.surface,
     color: ui.text,
     fontFamily: "inherit",
     cursor: "pointer",
-    fontWeight: 800,
+    fontWeight: 680,
     display: "inline-flex",
     alignItems: "center",
     justifyContent: "center",
     gap: 8,
     whiteSpace: "nowrap"
+  }
+
+  function PlannerLogoMark() {
+    return (
+      <div
+        aria-label="Planner"
+        title="Planner"
+        style={{
+          width: 34,
+          height: 34,
+          borderRadius: 6,
+          border: `1px solid ${ui.border}`,
+          background: theme === "dark" ? ui.surface : "linear-gradient(135deg, #ffffff 0%, #f6fbff 100%)",
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
+          flex: "0 0 auto",
+          boxShadow: theme === "dark" ? "none" : "0 1px 0 rgba(15, 23, 42, 0.04)"
+        }}
+      >
+        <svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <path
+            d="M4 4.8 14.3 2.6 10.8 10.2 20 7.7 8.1 21.4 11.1 13.2 4 4.8Z"
+            fill={ui.accent}
+            opacity="0.96"
+          />
+          <path d="M7.7 7.2 14.3 2.6 10.8 10.2Z" fill="#7dd3fc" opacity="0.92" />
+          <path d="M11.1 13.2 20 7.7 8.1 21.4Z" fill="#34d399" opacity="0.86" />
+          <path d="M4 4.8 11.1 13.2 7.7 7.2Z" fill="#facc15" opacity="0.9" />
+        </svg>
+      </div>
+    )
   }
 
   const memoInputWrap = {
@@ -4572,13 +6741,1880 @@ function stripEmptyGroupLines(bodyText) {
 
 
   function openDayList(key, items) {
-    dayListEditGuardRef.current = { open: true, mode: "read", dirty: false }
+    const sourceText = activeWindowId === "all" ? textRef.current ?? text : tabEditText ?? ""
+    const body = getDateBlockBodyText(sourceText, baseYear, key)
+    setDayListEditText(body)
+    dayListDirtyRef.current = false
+    dayListEditGuardRef.current = { open: true, mode: "edit", dirty: false }
     setDayListModal({ key, items })
-    setDayListMode("read")
+    setDayListMode("edit")
+  }
+
+  const dayListRecurringItems = useMemo(() => {
+    if (!dayListModal?.key) return []
+    return Array.isArray(recurringDisplayItemsByDate?.[dayListModal.key])
+      ? recurringDisplayItemsByDate[dayListModal.key]
+      : []
+  }, [dayListModal?.key, recurringDisplayItemsByDate])
+  const dayListTaskItems = useMemo(() => {
+    if (!dayListModal?.key) return []
+    return Array.isArray(combinedTaskItemsByDate?.[dayListModal.key]) ? combinedTaskItemsByDate[dayListModal.key] : []
+  }, [combinedTaskItemsByDate, dayListModal?.key])
+
+  function openRecurringCreate(dateKey, config = "schedule") {
+    if (!dateKey) return
+    const normalizedConfig =
+      typeof config === "string"
+        ? { kind: config }
+        : {
+            kind: config?.kind,
+            rawLine: config?.rawLine,
+            categoryTitle: config?.categoryTitle ?? config?.sourceTask?.title,
+            sourceTask: config?.sourceTask ?? null,
+            sourceLineIndex: Number.isInteger(config?.sourceLineIndex) ? config.sourceLineIndex : null
+          }
+    setRecurringModalState({
+      mode: "create",
+      dateKey,
+      defaultCategoryTitle: String(normalizedConfig?.categoryTitle ?? activeRecurringCategoryTitle ?? "").trim(),
+      defaultKind: normalizedConfig?.kind === "task" ? "task" : "schedule",
+      defaultRawLine: String(normalizedConfig?.rawLine ?? "").trim(),
+      sourceTask: normalizedConfig?.sourceTask ?? null,
+      sourceLineIndex: normalizedConfig?.sourceLineIndex ?? null
+    })
+  }
+
+  function openRecurringEdit(item) {
+    if (!item) return
+    setDayListModal(null)
+    dayListDirtyRef.current = false
+    dayListEditGuardRef.current = { open: false, mode: "read", dirty: false }
+    setRecurringModalState({
+      mode: "edit",
+      dateKey: item.dateKey,
+      item,
+      defaultCategoryTitle: activeRecurringCategoryTitle || ""
+    })
+  }
+
+  function closeRecurringModal() {
+    setRecurringModalState(null)
+  }
+
+  function toggleTextTask(task) {
+    if (!task?.dateKey || !Number.isInteger(task?.lineIndex)) return
+    const currentText = activeWindowId === "all" ? textRef.current ?? text : tabEditText ?? ""
+    const bodyText = getDateBlockBodyText(currentText, baseYear, task.dateKey)
+    const nextBodyText = updateTaskLineStatusInBody(bodyText, task.lineIndex, !task.completed)
+    if (nextBodyText === bodyText) return
+    const nextText = updateDateBlockBody(currentText, baseYear, task.dateKey, nextBodyText)
+    if (nextText === currentText) return
+
+    if (activeWindowId === "all") {
+      updateEditorText(nextText)
+      setWindowMemoTextSync(baseYear, "all", nextText)
+      return
+    }
+
+    setTabEditText(nextText)
+    setWindowMemoTextSync(baseYear, activeWindowId, nextText)
+    applyTabEditToAllFromText(nextText)
+  }
+
+  function findRemoteTaskPlanRow(task) {
+    const userId = session?.user?.id ?? null
+    if (!userId) return null
+
+    const directRowId = String(task?.rowId ?? task?.row?.id ?? task?.planId ?? task?.ruleId ?? "").trim()
+    if (directRowId) {
+      const directRow = (remotePlans ?? []).find(
+        (row) =>
+          row &&
+          String(row?.id ?? "").trim() === directRowId &&
+          row.user_id === userId &&
+          !row.deleted_at
+      )
+      if (directRow) return directRow
+    }
+
+    const dateKey = String(task?.dateKey ?? "").trim()
+    const taskText = String(task?.text ?? "").trim()
+    if (!dateKey || !taskText) return null
+
+    const scopedTitle =
+      activeWindowId === "all"
+        ? ""
+        : normalizeCategoryId(String(windows.find((w) => w.id === activeWindowId)?.title ?? "").trim())
+
+    let expectedCategory = normalizeCategoryId(String(task?.title ?? "").trim())
+    if (!expectedCategory) expectedCategory = scopedTitle || GENERAL_CATEGORY_ID
+
+    const expectedTime = String(task?.time ?? "").trim()
+
+    const candidates = (remotePlans ?? []).filter((row) => {
+      if (!row || row.user_id !== userId || row.deleted_at) return false
+      if (isRecurringPlanRow(row)) return false
+      if (String(row?.date ?? "").trim() !== dateKey) return false
+
+      const normalizedTime = normalizePlanTimeFields(row)
+      if (String(normalizedTime.time ?? "").trim() !== expectedTime) return false
+
+      let rowCategory = normalizeCategoryId(String(row?.category_id ?? "").trim())
+      if (!rowCategory) rowCategory = GENERAL_CATEGORY_ID
+      if (rowCategory !== expectedCategory) return false
+
+      const parsedTask = stripTaskSuffix(String(row?.content ?? "").trim())
+      if (String(parsedTask?.text ?? "").trim() !== taskText) return false
+      return true
+    })
+
+    if (candidates.length === 0) return null
+
+    candidates.sort((a, b) => {
+      const sortA = Number(a?.sort_order ?? a?.sortOrder ?? Number.NaN)
+      const sortB = Number(b?.sort_order ?? b?.sortOrder ?? Number.NaN)
+      if (Number.isFinite(sortA) && Number.isFinite(sortB) && sortA !== sortB) return sortA - sortB
+
+      const updatedA = Date.parse(String(a?.updated_at ?? a?.updatedAt ?? ""))
+      const updatedB = Date.parse(String(b?.updated_at ?? b?.updatedAt ?? ""))
+      if (Number.isFinite(updatedA) && Number.isFinite(updatedB) && updatedA !== updatedB) return updatedA - updatedB
+
+      return String(a?.id ?? "").localeCompare(String(b?.id ?? ""), "en")
+    })
+
+    return candidates[0]
+  }
+
+  async function persistTextTaskToggle(task) {
+    if (!canUseWebRowPlanEdit || !supabase || !session?.user?.id) return
+
+    const userId = session.user.id
+    const targetRow = findRemoteTaskPlanRow(task)
+    if (!targetRow?.id) {
+      console.warn("toggle task row not found", task)
+      return
+    }
+    const rowId = String(targetRow.id ?? "").trim()
+
+    const parsedTask = stripTaskSuffix(String(targetRow?.content ?? "").trim())
+    const baseText = String(parsedTask?.text ?? task?.text ?? "").trim()
+    if (!baseText) return
+
+    const nextCompleted = !task?.completed
+    const nextContent = buildPlanContentWithMeta(baseText, {
+      completed: nextCompleted
+    })
+    const updatedAt = new Date().toISOString()
+    suspendRemotePlansLoads()
+
+    setRemotePlans((prev) =>
+      (prev ?? []).map((row) =>
+        String(row?.id ?? "").trim() === rowId
+          ? { ...row, content: nextContent, updated_at: updatedAt, client_id: clientIdRef.current }
+          : row
+      )
+    )
+
+    const { error } = await supabase
+      .from("plans")
+      .update({ content: nextContent, updated_at: updatedAt, client_id: clientIdRef.current })
+      .eq("id", rowId)
+      .eq("user_id", userId)
+
+    if (error) {
+      console.error("toggle task", error)
+      await loadRemotePlans(userId, { force: true })
+    }
+  }
+
+  function setTextTaskCompleted(task, nextCompleted) {
+    if (!task?.dateKey) return false
+    const currentText = activeWindowId === "all" ? textRef.current ?? text : tabEditText ?? ""
+    const bodyText = getDateBlockBodyText(currentText, baseYear, task.dateKey)
+    let nextBodyText = ""
+    if (Number.isInteger(task?.lineIndex)) {
+      nextBodyText = updateTaskLineStatusInBody(bodyText, task.lineIndex, Boolean(nextCompleted))
+    } else {
+      const draft = getPlanModalDraftFromItem(task, task.dateKey)
+      const fields = normalizePlanModalDraft({
+        ...draft,
+        isTask: true,
+        completed: Boolean(nextCompleted)
+      })
+      const rawLine = buildPlanRawLineFromDraftFields(fields)
+      nextBodyText = buildBodyWithPlanReplacement(bodyText, task, rawLine) ?? bodyText
+    }
+    if (nextBodyText === bodyText) return false
+    const nextText = updateDateBlockBody(currentText, baseYear, task.dateKey, nextBodyText)
+    if (nextText === currentText) return false
+    if (activeWindowId === "all") {
+      updateEditorText(nextText)
+      setWindowMemoTextSync(baseYear, "all", nextText)
+    } else {
+      setTabEditText(nextText)
+      setWindowMemoTextSync(baseYear, activeWindowId, nextText)
+      applyTabEditToAllFromText(nextText)
+    }
+    return true
+  }
+
+  async function setCloudTaskCompleted(task, nextCompleted) {
+    if (!canUseWebRowPlanEdit || !supabase || !session?.user?.id) return false
+    const userId = session.user.id
+    const targetRow = findRemoteTaskPlanRow(task)
+    if (!targetRow?.id) return false
+    const rowId = String(targetRow.id ?? "").trim()
+    const parsedTask = stripTaskSuffix(String(targetRow?.content ?? "").trim())
+    const baseText = String(parsedTask?.text ?? task?.text ?? "").trim()
+    if (!baseText) return false
+    const nextContent = buildPlanContentWithMeta(baseText, { completed: Boolean(nextCompleted) })
+    const updatedAt = new Date().toISOString()
+    suspendRemotePlansLoads()
+    setRemotePlans((prev) =>
+      (prev ?? []).map((row) =>
+        String(row?.id ?? "").trim() === rowId
+          ? { ...row, content: nextContent, updated_at: updatedAt, client_id: clientIdRef.current }
+          : row
+      )
+    )
+    const { error } = await supabase
+      .from("plans")
+      .update({ content: nextContent, updated_at: updatedAt, client_id: clientIdRef.current })
+      .eq("id", rowId)
+      .eq("user_id", userId)
+    if (error) {
+      console.error("set task completed", error)
+      await loadRemotePlans(userId, { force: true })
+      return false
+    }
+    return true
+  }
+
+  function setTaskCompletedFromModal({ sourceItem, completed }) {
+    if (!sourceItem) return
+    const nextCompleted = Boolean(completed)
+    if (sourceItem?.sourceType === "recurring") return
+    if (canUseWebRowPlanEdit && supabase && session?.user?.id) {
+      void setCloudTaskCompleted(sourceItem, nextCompleted)
+      return
+    }
+    setTextTaskCompleted(sourceItem, nextCompleted)
+  }
+
+  function buildRecurringPlanFieldsFromPayload(payload, fallbackCategoryTitle = "") {
+    const rawLine = String(payload?.rawLine ?? "").trim()
+    const taskAware = stripTaskSuffix(rawLine)
+    const baseRaw = String(taskAware.text ?? "").trim()
+    if (!baseRaw) return null
+
+    const categoryTitle = String(payload?.categoryTitle ?? fallbackCategoryTitle ?? "").trim()
+    let timeToken = ""
+    let content = baseRaw
+
+    const leadingTime = parseLeadingPlanTimeText(baseRaw)
+    if (leadingTime) {
+      timeToken = buildTimeSpanLabel(leadingTime.time, leadingTime.end_time)
+      content = String(leadingTime.content ?? "").trim()
+    }
+
+    if (!content) return null
+    const timeFields = normalizePlanTimeFields({ time: timeToken })
+    let categoryId = normalizeCategoryId(categoryTitle)
+    if (!categoryId) categoryId = GENERAL_CATEGORY_ID
+
+    return {
+      time: timeFields.time,
+      end_time: timeFields.end_time,
+      category_id: categoryId,
+      content: buildPlanContentWithMeta(content, {
+        completed: taskAware.completed
+      })
+    }
+  }
+
+  function buildSingleRecurringPlanPayload(userId, payload, dateKey, { seriesIdOverride = null, repeatTypeOverride = null, sortOrderOverride = null } = {}) {
+    const planFields = buildRecurringPlanFieldsFromPayload(payload, payload?.categoryTitle ?? activeRecurringCategoryTitle ?? "")
+    if (!planFields?.content) return null
+
+    const repeatType = normalizeRepeatType(repeatTypeOverride ?? payload?.repeat)
+    const repeatInterval = repeatType === "none" ? 1 : normalizeRepeatInterval(payload?.repeatInterval)
+    const repeatDays = repeatType === "weekly" ? normalizeRepeatDays(payload?.repeatDays) : null
+    const repeatUntil = repeatType === "none" ? null : String(payload?.untilDateKey ?? payload?.repeatUntil ?? dateKey ?? "").trim() || null
+    const seriesId =
+      repeatType === "none"
+        ? null
+        : String(seriesIdOverride ?? payload?.seriesId ?? "").trim() || null
+    const alarmEnabled = Boolean(planFields.time) && Boolean(payload?.alarmEnabled)
+    const alarmLeadMinutes = alarmEnabled ? normalizeAlarmLeadMinutes(payload?.alarmLeadMinutes ?? 0) : 0
+
+    const row = {
+      user_id: userId,
+      date: String(dateKey ?? "").trim(),
+      time: planFields.time,
+      content: planFields.content,
+      category_id: planFields.category_id,
+      series_id: seriesId,
+      repeat_type: repeatType,
+      repeat_interval: repeatInterval,
+      repeat_days: repeatDays,
+      repeat_until: repeatUntil,
+      client_id: clientIdRef.current,
+      updated_at: new Date().toISOString()
+    }
+    if (endTimeSupportedRef.current) row.end_time = planFields.end_time || null
+    if (alarmColumnsSupportedRef.current) {
+      row.alarm_enabled = alarmEnabled
+      row.alarm_lead_minutes = alarmLeadMinutes
+    }
+    if (sortOrderOverride != null) row.sort_order = sortOrderOverride
+    return row
+  }
+
+  function buildRecurringPlanRows(
+    userId,
+    payload,
+    {
+      seriesIdOverride = null,
+      startDateKeyOverride = null,
+      repeatTypeOverride = null,
+      excludedIds = null,
+      initialSortOrderOverride = null
+    } = {}
+  ) {
+    const repeatType = normalizeRepeatType(repeatTypeOverride ?? payload?.repeat)
+    const startDateKey = String(startDateKeyOverride ?? payload?.startDateKey ?? recurringModalState?.dateKey ?? "").trim()
+    if (!startDateKey) return []
+
+    if (repeatType === "none") {
+      const row = buildSingleRecurringPlanPayload(userId, payload, startDateKey, {
+        seriesIdOverride: null,
+        repeatTypeOverride: "none",
+        sortOrderOverride: initialSortOrderOverride ?? getNextSortOrderForDate(startDateKey, remotePlans, excludedIds)
+      })
+      return row ? [row] : []
+    }
+
+    const rawUntilDateKey = String(payload?.untilDateKey ?? "").trim()
+    const untilDateKey =
+      rawUntilDateKey || addDaysToKey(startDateKey, getOpenEndedRepeatSpanDays(startDateKey))
+    const repeatInterval = normalizeRepeatInterval(payload?.repeatInterval)
+    const repeatDays = repeatType === "weekly" ? normalizeRepeatDays(payload?.repeatDays) : []
+    const dateKeys = buildOccurrenceDateKeys(
+      {
+        startDateKey,
+        untilDateKey,
+        repeat: repeatType,
+        repeatInterval,
+        repeatDays
+      },
+      startDateKey,
+      untilDateKey
+    )
+    const seriesId = String(seriesIdOverride ?? payload?.seriesId ?? genSeriesId()).trim() || genSeriesId()
+    const sortSeeds = new Map()
+
+    return dateKeys
+      .map((dateKey) => {
+        let sortOrderOverride = null
+        if (sortOrderSupportedRef.current) {
+          const existingSeed =
+            dateKey === startDateKey && initialSortOrderOverride != null
+              ? initialSortOrderOverride
+              : sortSeeds.get(dateKey)
+          if (existingSeed != null) {
+            sortOrderOverride = existingSeed
+            sortSeeds.set(dateKey, existingSeed + 1)
+          } else {
+            const seed = getNextSortOrderForDate(dateKey, remotePlans, excludedIds)
+            if (seed != null) {
+              sortOrderOverride = seed
+              sortSeeds.set(dateKey, seed + 1)
+            }
+          }
+        }
+        return buildSingleRecurringPlanPayload(userId, payload, dateKey, {
+          seriesIdOverride: seriesId,
+          repeatTypeOverride: repeatType,
+          sortOrderOverride
+        })
+      })
+      .filter(Boolean)
+  }
+
+  function buildOpenEndedRecurringAppendRows(userId, planRows) {
+    if (!repeatColumnsSupportedRef.current) return []
+    const rows = Array.isArray(planRows) ? planRows.filter((row) => row && !row?.deleted_at) : []
+    if (rows.length === 0) return []
+
+    const horizonKey = getOpenEndedRepeatHorizonDateKey()
+    const horizonMs = keyToTime(horizonKey)
+    const groups = new Map()
+
+    for (const row of rows) {
+      const repeatMeta = normalizeRepeatMeta(row)
+      const seriesId = String(repeatMeta.seriesId ?? "").trim()
+      const dateKey = String(row?.date ?? "").trim()
+      if (!seriesId || !dateKey) continue
+      if (repeatMeta.repeatType === "none" || repeatMeta.repeatUntil) continue
+
+      const current = groups.get(seriesId)
+      if (!current) {
+        groups.set(seriesId, {
+          seriesId,
+          repeatMeta,
+          startDateKey: dateKey,
+          latestDateKey: dateKey,
+          sampleRow: row
+        })
+        continue
+      }
+
+      if (keyToTime(dateKey) < keyToTime(current.startDateKey)) {
+        current.startDateKey = dateKey
+        current.sampleRow = row
+      }
+      if (keyToTime(dateKey) > keyToTime(current.latestDateKey)) {
+        current.latestDateKey = dateKey
+      }
+    }
+
+    const nextRows = []
+    const mergedRows = [...rows]
+
+    for (const group of groups.values()) {
+      const latestMs = keyToTime(group.latestDateKey)
+      if (!Number.isFinite(latestMs) || latestMs >= horizonMs) continue
+
+      const untilDateKey = addDaysToKey(group.startDateKey, getOpenEndedRepeatSpanDays(group.startDateKey))
+      const desiredKeys = buildOccurrenceDateKeys(
+        {
+          startDateKey: group.startDateKey,
+          untilDateKey,
+          repeat: group.repeatMeta.repeatType,
+          repeatInterval: group.repeatMeta.repeatInterval,
+          repeatDays: group.repeatMeta.repeatDays ?? []
+        },
+        group.startDateKey,
+        untilDateKey
+      ).filter((dateKey) => keyToTime(dateKey) > latestMs && keyToTime(dateKey) <= horizonMs)
+
+      for (const dateKey of desiredKeys) {
+        const sortOrderOverride = sortOrderSupportedRef.current ? getNextSortOrderForDate(dateKey, mergedRows) : null
+        const nextRow = buildSingleRecurringPlanPayload(userId, group.sampleRow, dateKey, {
+          seriesIdOverride: group.seriesId,
+          repeatTypeOverride: group.repeatMeta.repeatType,
+          sortOrderOverride
+        })
+        if (!nextRow) continue
+        nextRows.push(nextRow)
+        mergedRows.push(nextRow)
+      }
+    }
+
+    return nextRows
+  }
+
+  async function ensureOpenEndedRecurringCoverage(userId, planRows) {
+    if (!supabase || !userId || openEndedRecurringSyncRef.current) return false
+    const appendRows = buildOpenEndedRecurringAppendRows(userId, planRows)
+    if (appendRows.length === 0) return false
+
+    openEndedRecurringSyncRef.current = true
+    try {
+      suspendRemotePlansLoads()
+      await insertRecurringPlanRows(appendRows)
+      return true
+    } catch (error) {
+      console.error("ensure open-ended recurring coverage", error)
+      return false
+    } finally {
+      openEndedRecurringSyncRef.current = false
+    }
+  }
+
+  async function insertRecurringPlanRows(rows) {
+    const list = Array.isArray(rows) ? rows : []
+    if (list.length === 0) return
+    const chunkSize = 200
+    for (let i = 0; i < list.length; i += chunkSize) {
+      let chunk = list.slice(i, i + chunkSize)
+      chunk = endTimeSupportedRef.current ? chunk : stripEndTimeFromRows(chunk)
+      chunk = alarmColumnsSupportedRef.current ? chunk : stripAlarmFromRows(chunk)
+      chunk = sortOrderSupportedRef.current ? chunk : stripSortOrderFromRows(chunk)
+      let { error } = await supabase.from("plans").insert(chunk)
+      if (error && isRepeatColumnError(error)) {
+        markRepeatFallbackNotice()
+        throw error
+      }
+      if (error && isEndTimeColumnError(error)) {
+        endTimeSupportedRef.current = false
+        chunk = stripEndTimeFromRows(chunk)
+        const retry = await supabase.from("plans").insert(sortOrderSupportedRef.current ? chunk : stripSortOrderFromRows(chunk))
+        error = retry.error
+      }
+      if (error && isAlarmColumnError(error)) {
+        alarmColumnsSupportedRef.current = false
+        chunk = stripAlarmFromRows(chunk)
+        const retry = await supabase.from("plans").insert(sortOrderSupportedRef.current ? chunk : stripSortOrderFromRows(chunk))
+        error = retry.error
+      }
+      if (error && isSortOrderColumnError(error)) {
+        sortOrderSupportedRef.current = false
+        const retry = await supabase.from("plans").insert(stripSortOrderFromRows(chunk))
+        error = retry.error
+      }
+      if (error) throw error
+    }
+  }
+
+  async function updateRecurringPlanRowById(userId, rowId, payload) {
+    let nextPayload = { ...(payload ?? {}) }
+    if (!endTimeSupportedRef.current) nextPayload = stripEndTimeFromRows([nextPayload])[0]
+    if (!alarmColumnsSupportedRef.current) nextPayload = stripAlarmFromRows([nextPayload])[0]
+    if (!sortOrderSupportedRef.current) nextPayload = stripSortOrderFromRows([nextPayload])[0]
+
+    let { error } = await supabase.from("plans").update(nextPayload).eq("id", rowId).eq("user_id", userId)
+    if (error && isRepeatColumnError(error)) {
+      markRepeatFallbackNotice()
+      throw error
+    }
+    if (error && isEndTimeColumnError(error)) {
+      endTimeSupportedRef.current = false
+      const retry = await supabase
+        .from("plans")
+        .update(stripEndTimeFromRows([nextPayload])[0])
+        .eq("id", rowId)
+        .eq("user_id", userId)
+      error = retry.error
+    }
+    if (error && isAlarmColumnError(error)) {
+      alarmColumnsSupportedRef.current = false
+      const retry = await supabase
+        .from("plans")
+        .update(stripAlarmFromRows([nextPayload])[0])
+        .eq("id", rowId)
+        .eq("user_id", userId)
+      error = retry.error
+    }
+    if (error && isSortOrderColumnError(error)) {
+      sortOrderSupportedRef.current = false
+      const retry = await supabase
+        .from("plans")
+        .update(stripSortOrderFromRows([nextPayload])[0])
+        .eq("id", rowId)
+        .eq("user_id", userId)
+      error = retry.error
+    }
+    if (error) throw error
+  }
+
+  async function softDeleteRecurringPlanIds(userId, ids) {
+    const uniqueIds = [...new Set((ids ?? []).map((id) => String(id ?? "").trim()).filter(Boolean))]
+    if (uniqueIds.length === 0) return
+    const deletedAt = new Date().toISOString()
+    const { error } = await supabase
+      .from("plans")
+      .update({ deleted_at: deletedAt, updated_at: deletedAt, client_id: clientIdRef.current })
+      .in("id", uniqueIds)
+      .eq("user_id", userId)
+    if (error) throw error
+  }
+
+  async function createCloudRecurringRule(payload) {
+    if (!canUseWebRowPlanEdit || !supabase || !session?.user?.id) return
+    const userId = session.user.id
+    suspendRemotePlansLoads()
+    try {
+      const sourceTask = recurringModalState?.sourceTask ?? null
+      const sourceLineIndex = recurringModalState?.sourceLineIndex ?? null
+      flushPendingDayListSync()
+      await dayListSyncQueueRef.current.catch(() => {})
+      const sourceRow = sourceTask ? findRemoteTaskPlanRow(sourceTask) : null
+      const sourceSortOrder = parsePlanOrderValue(sourceRow?.sort_order ?? sourceRow?.sortOrder ?? sourceRow?.order)
+      const rows = buildRecurringPlanRows(userId, payload, {
+        seriesIdOverride: genSeriesId(),
+        initialSortOrderOverride: sourceSortOrder
+      })
+      if (rows.length === 0) return
+      const nextCategoryTitles = new Set(
+        rows
+          .map((row) => normalizeCategoryId(String(row?.category_id ?? "").trim()))
+          .filter((title) => title && !isGeneralCategoryId(title))
+      )
+      const sourceDateKey = String(sourceRow?.date ?? "").trim()
+      const sourceRowIndex =
+        sourceRow?.id && sourceDateKey
+          ? rows.findIndex((row) => String(row?.date ?? "").trim() === sourceDateKey)
+          : -1
+
+      if (sourceRow?.id && sourceRowIndex >= 0) {
+        const [sourceOccurrenceRow] = rows.splice(sourceRowIndex, 1)
+        await updateRecurringPlanRowById(userId, sourceRow.id, {
+          ...sourceOccurrenceRow,
+          updated_at: new Date().toISOString(),
+          client_id: clientIdRef.current
+        })
+        await insertRecurringPlanRows(rows)
+      } else {
+        await insertRecurringPlanRows(rows)
+        if (sourceRow?.id) {
+          const deletedAt = new Date().toISOString()
+          await supabase
+            .from("plans")
+            .update({ deleted_at: deletedAt, updated_at: deletedAt, client_id: clientIdRef.current })
+            .eq("user_id", userId)
+            .eq("id", sourceRow.id)
+        }
+        removeSourceTaskFromTextTaskFlow(sourceTask, sourceLineIndex, recurringModalState?.dateKey)
+        flushPendingDayListSync()
+        await dayListSyncQueueRef.current.catch(() => {})
+      }
+      setDayListMode("edit")
+      ensureWindowsForCategories(nextCategoryTitles)
+      await loadRemotePlans(userId, { force: true })
+    } catch (error) {
+      console.error("create recurring rule", error)
+      await loadRemotePlans(userId, { force: true })
+    }
+  }
+
+  async function updateCloudRecurringRuleScoped(payload, scope) {
+    if (!canUseWebRowPlanEdit || !supabase || !session?.user?.id) return
+    setDayListMode("edit")
+    const userId = session.user.id
+    const target = recurringModalState?.item
+    if (!target) return
+    const rowId = String(target?.row?.id ?? target?.planId ?? target?.ruleId ?? "").trim()
+    const anchorDateKey = String(target?.dateKey ?? recurringModalState?.dateKey ?? "").trim()
+    const familyId = String(target?.seriesId ?? target?.familyId ?? target?.row?.series_id ?? "").trim()
+    const familyStartDateKey = String(target?.familyStartDateKey ?? anchorDateKey).trim() || anchorDateKey
+    if (!anchorDateKey) return
+
+    suspendRemotePlansLoads()
+    try {
+      if (scope === "single" || !familyId) {
+        if (!rowId) return
+        const nextRow = buildSingleRecurringPlanPayload(userId, payload, anchorDateKey, {
+          seriesIdOverride: null,
+          repeatTypeOverride: "none"
+        })
+        if (!nextRow) return
+        await updateRecurringPlanRowById(userId, rowId, nextRow)
+        await loadRemotePlans(userId, { force: true })
+        return
+      }
+
+      const familyRows = (remotePlans ?? []).filter((row) => {
+        if (!row || row?.deleted_at) return false
+        return String(row?.series_id ?? "").trim() === familyId
+      })
+      const deleteIds = familyRows
+        .filter((row) => (scope === "future" ? String(row?.date ?? "").trim() >= anchorDateKey : true))
+        .map((row) => row?.id)
+        .filter(Boolean)
+
+      await softDeleteRecurringPlanIds(userId, deleteIds)
+
+      const excludedIds = new Set(deleteIds.map((id) => String(id)))
+      const startDateKey = scope === "future" ? anchorDateKey : String(payload?.startDateKey ?? familyStartDateKey).trim() || familyStartDateKey
+      const nextRows = buildRecurringPlanRows(userId, payload, {
+        seriesIdOverride: genSeriesId(),
+        startDateKeyOverride: startDateKey,
+        excludedIds
+      })
+      await insertRecurringPlanRows(nextRows)
+      ensureWindowsForCategories(
+        new Set(nextRows.map((row) => normalizeCategoryId(String(row?.category_id ?? "").trim())).filter((title) => title && !isGeneralCategoryId(title)))
+      )
+      await loadRemotePlans(userId, { force: true })
+    } catch (error) {
+      console.error("update recurring rule", error)
+      await loadRemotePlans(userId, { force: true })
+    }
+  }
+
+  async function deleteCloudRecurringRuleScoped(scope) {
+    if (!canUseWebRowPlanEdit || !supabase || !session?.user?.id) return
+    setDayListMode("edit")
+    const userId = session.user.id
+    const target = recurringModalState?.item
+    if (!target) return
+    const rowId = String(target?.row?.id ?? target?.planId ?? target?.ruleId ?? "").trim()
+    const anchorDateKey = String(target?.dateKey ?? recurringModalState?.dateKey ?? "").trim()
+    const familyId = String(target?.seriesId ?? target?.familyId ?? target?.row?.series_id ?? "").trim()
+    if (!anchorDateKey && !rowId) return
+
+    suspendRemotePlansLoads()
+    try {
+      let deleteIds = []
+      if (scope === "single" || !familyId) {
+        deleteIds = rowId ? [rowId] : []
+      } else {
+        deleteIds = (remotePlans ?? [])
+          .filter((row) => {
+            if (!row || row?.deleted_at) return false
+            if (String(row?.series_id ?? "").trim() !== familyId) return false
+            if (scope === "future") return String(row?.date ?? "").trim() >= anchorDateKey
+            return true
+          })
+          .map((row) => row?.id)
+          .filter(Boolean)
+      }
+      await softDeleteRecurringPlanIds(userId, deleteIds)
+      await loadRemotePlans(userId, { force: true })
+    } catch (error) {
+      console.error("delete recurring rule", error)
+      await loadRemotePlans(userId, { force: true })
+    }
+  }
+
+  async function toggleCloudRecurringTask(task) {
+    if (!canUseWebRowPlanEdit || !supabase || !session?.user?.id) return
+    const userId = session.user.id
+    const rowId = String(task?.row?.id ?? task?.planId ?? "").trim()
+    if (!rowId) return
+
+    const currentContent = String(task?.row?.content ?? task?.rawLine ?? "").trim()
+    const parsed = stripTaskSuffix(currentContent)
+    const baseText = String(parsed.text ?? "").trim()
+    if (!baseText || parsed.completed == null) return
+
+    const nextContent = buildPlanContentWithMeta(baseText, {
+      completed: parsed.completed !== true
+    })
+    const updatedAt = new Date().toISOString()
+
+    setRemotePlans((prev) =>
+      (prev ?? []).map((row) =>
+        String(row?.id ?? "").trim() === rowId
+          ? { ...row, content: nextContent, updated_at: updatedAt, client_id: clientIdRef.current }
+          : row
+      )
+    )
+
+    const { error } = await supabase
+      .from("plans")
+      .update({ content: nextContent, updated_at: updatedAt, client_id: clientIdRef.current })
+      .eq("id", rowId)
+      .eq("user_id", userId)
+
+    if (error) {
+      console.error("toggle recurring task", error)
+      await loadRemotePlans(userId, { force: true })
+    }
+  }
+
+  function toggleRecurringTask(task) {
+    if (hasCloudSession) {
+      toggleCloudRecurringTask(task)
+      return
+    }
+
+    const ruleId = String(task?.ruleId ?? "").trim()
+    const dateKey = String(task?.dateKey ?? "").trim()
+    if (!ruleId || !dateKey) return
+
+    const baseRule = (Array.isArray(recurringRules) ? recurringRules : []).find(
+      (rule) => String(rule?.id ?? "").trim() === ruleId
+    )
+    if (!baseRule) return
+
+    const parsed = parseRecurringRawLine(task?.rawLine, task?.title ?? "")
+    const baseRaw = String(parsed.baseRaw ?? "").trim()
+    if (!baseRaw) return
+
+    const nextCompleted = !task?.completed
+    const nextRawLine = `${baseRaw};${nextCompleted ? "O" : "X"}`
+    const baseRuleRawLine = String(baseRule?.rawLine ?? "").trim()
+
+    setRecurringOverrides((prev) => {
+      const list = Array.isArray(prev) ? prev : []
+      const filtered = list.filter(
+        (item) =>
+          !(
+            String(item?.ruleId ?? "").trim() === ruleId &&
+            String(item?.dateKey ?? "").trim() === dateKey
+          )
+      )
+
+      if (nextRawLine === baseRuleRawLine) {
+        return filtered
+      }
+
+      return [
+        ...filtered,
+        {
+          id: genRecurringId("override"),
+          familyId: String(task?.familyId ?? baseRule?.familyId ?? ruleId).trim(),
+          ruleId,
+          dateKey,
+          mode: "replace",
+          rawLine: nextRawLine,
+          updatedAt: new Date().toISOString()
+        }
+      ]
+    })
+  }
+
+  async function saveRecurringTaskInline(task, nextBaseRaw) {
+    const baseRaw = String(nextBaseRaw ?? "").trim()
+    if (!baseRaw) return
+
+    const currentContent = String(task?.row?.content ?? task?.rawLine ?? "").trim()
+    const parsedCurrent = stripTaskSuffix(currentContent)
+    const nextContent = buildTaskMetaText(baseRaw, {
+      completed: parsedCurrent.completed ?? Boolean(task?.completed)
+    })
+    if (!nextContent || nextContent === currentContent) return
+
+    if (hasCloudSession && supabase && session?.user?.id) {
+      const userId = session.user.id
+      const rowId = String(task?.row?.id ?? task?.planId ?? "").trim()
+      if (!rowId) return
+      const updatedAt = new Date().toISOString()
+
+      setRemotePlans((prev) =>
+        (prev ?? []).map((row) =>
+          String(row?.id ?? "").trim() === rowId
+            ? { ...row, content: nextContent, updated_at: updatedAt, client_id: clientIdRef.current }
+            : row
+        )
+      )
+
+      const { error } = await supabase
+        .from("plans")
+        .update({ content: nextContent, updated_at: updatedAt, client_id: clientIdRef.current })
+        .eq("id", rowId)
+        .eq("user_id", userId)
+
+      if (error) {
+        console.error("save recurring task inline", error)
+        await loadRemotePlans(userId, { force: true })
+      }
+      return
+    }
+
+    const ruleId = String(task?.ruleId ?? "").trim()
+    const dateKey = String(task?.dateKey ?? "").trim()
+    if (!ruleId || !dateKey) return
+    const baseRule = (Array.isArray(recurringRules) ? recurringRules : []).find(
+      (rule) => String(rule?.id ?? "").trim() === ruleId
+    )
+    if (!baseRule) return
+
+    const baseRuleRawLine = String(baseRule?.rawLine ?? "").trim()
+    setRecurringOverrides((prev) => {
+      const list = Array.isArray(prev) ? prev : []
+      const filtered = list.filter(
+        (item) =>
+          !(
+            String(item?.ruleId ?? "").trim() === ruleId &&
+            String(item?.dateKey ?? "").trim() === dateKey
+          )
+      )
+
+      if (nextContent === baseRuleRawLine) {
+        return filtered
+      }
+
+      return [
+        ...filtered,
+        {
+          id: genRecurringId("override"),
+          familyId: String(task?.familyId ?? baseRule?.familyId ?? ruleId).trim(),
+          ruleId,
+          dateKey,
+          mode: "replace",
+          rawLine: nextContent,
+          updatedAt: new Date().toISOString()
+        }
+      ]
+    })
+  }
+
+  function openTextTask(task) {
+    openPlanEditModal(task, task?.dateKey ?? "")
+  }
+
+  function closeQuickCreateModal() {
+    setQuickCreateModalState(null)
+  }
+
+  function getDefaultPlanCategoryTitle() {
+    return activeRecurringCategoryTitle || ""
+  }
+
+  function openPlanCreateModal(dateKey = "", options = {}) {
+    if (isScheduleReadOnly && !canUseWebRowPlanEdit) {
+      setAuthMessage("웹에서 바로 추가하려면 편집 가능한 일정 모드여야 합니다.")
+      return
+    }
+
+    const initialDateKey = String(dateKey || lastActiveDateKeyRef.current || todayKey || "").trim() || todayKey
+    if (/^\d{4}-\d{2}-\d{2}$/.test(initialDateKey)) setActiveDateKey(initialDateKey)
+    setQuickCreateModalState({
+      editMode: "create",
+      mode: "task",
+      initialDateKey,
+      initialEndDateKey: String(options?.endDateKey ?? initialDateKey).trim() || initialDateKey,
+      initialTime: String(options?.time ?? "").trim(),
+      initialRepeat: String(options?.repeat ?? "none").trim() || "none",
+      initialRepeatInterval: options?.repeatInterval ?? 1,
+      initialRepeatDays: normalizeRepeatDays(options?.repeatDays),
+      initialRepeatOpenEnded: Boolean(options?.repeatOpenEnded ?? options?.openEndedRepeat ?? false),
+      initialAlarmEnabled: options?.alarmEnabled ?? true,
+      initialAlarmLeadMinutes: normalizeAlarmLeadMinutes(options?.alarmLeadMinutes ?? 0),
+      defaultCategoryTitle: String(options?.categoryTitle ?? getDefaultPlanCategoryTitle()).trim(),
+      initialContent: String(options?.content ?? "").trim(),
+      initialIsTask: options?.isTask ?? true,
+      initialCompleted: false,
+      showCategory: true
+    })
+  }
+
+  function getPlanModalDraftFromItem(item, dateKeyOverride = "") {
+    const row = item?.row ?? null
+    const rowTask = row ? stripTaskSuffix(String(row?.content ?? "").trim()) : null
+    const itemTask = stripTaskSuffix(String(item?.rawLine ?? item?.baseRaw ?? item?.text ?? item?.display ?? "").trim())
+    const rawContent = row
+      ? String(rowTask?.text ?? "").trim()
+      : String(item?.text ?? item?.display ?? itemTask?.text ?? "").trim()
+    let categoryTitle = ""
+    if (row) {
+      const rowCategory = normalizeCategoryId(String(row?.category_id ?? "").trim())
+      categoryTitle = isGeneralCategoryId(rowCategory) ? "" : rowCategory
+    } else {
+      categoryTitle = String(item?.sourceTitle ?? item?.title ?? getDefaultPlanCategoryTitle()).trim()
+    }
+    const normalizedTime = row ? normalizePlanTimeFields(row) : normalizePlanTimeFields({ time: item?.time ?? "" })
+    const timeLabel = buildTimeSpanLabel(normalizedTime.time, normalizedTime.end_time)
+    const completedValue = row ? rowTask?.completed : itemTask?.completed ?? item?.completed
+    const repeatMeta = row ? normalizeRepeatMeta(row) : null
+    const repeatOpenEnded = Boolean(repeatMeta && repeatMeta.repeatType !== "none" && !repeatMeta.repeatUntil)
+    return {
+      sourceItem: item,
+      editMode: "edit",
+      mode: "task",
+      initialDateKey: String(row?.date ?? item?.dateKey ?? dateKeyOverride ?? todayKey ?? "").trim(),
+      initialEndDateKey: repeatOpenEnded
+        ? ""
+        : String(row?.repeat_until ?? row?.repeatUntil ?? row?.date ?? item?.dateKey ?? dateKeyOverride ?? todayKey ?? "").trim(),
+      initialTime: timeLabel,
+      initialRepeat: repeatMeta ? repeatMeta.repeatType : "none",
+      initialRepeatInterval: repeatMeta ? repeatMeta.repeatInterval : 1,
+      initialRepeatDays: repeatMeta ? repeatMeta.repeatDays : [],
+      initialRepeatOpenEnded: repeatOpenEnded,
+      initialAlarmEnabled: row?.alarm_enabled == null ? true : Boolean(row?.alarm_enabled),
+      initialAlarmLeadMinutes: normalizeAlarmLeadMinutes(row?.alarm_lead_minutes ?? row?.alarmLeadMinutes ?? 0),
+      defaultCategoryTitle: categoryTitle,
+      initialContent: rawContent,
+      initialIsTask: row ? rowTask?.completed != null : Boolean(item?.isTask || itemTask?.completed != null),
+      initialCompleted: Boolean(completedValue),
+      showCategory: true
+    }
+  }
+
+  function openPlanEditModal(item, dateKeyOverride = "") {
+    if (!item) {
+      openPlanCreateModal(dateKeyOverride)
+      return
+    }
+    if (item?.sourceType === "recurring" || item?.repeatLabel || item?.seriesId || item?.familyId || item?.row?.series_id) {
+      openRecurringEdit(item)
+      return
+    }
+    if (isScheduleReadOnly && !canUseWebRowPlanEdit) {
+      setAuthMessage("웹에서 바로 수정하려면 편집 가능한 일정 모드여야 합니다.")
+      return
+    }
+    setDayListModal(null)
+    setQuickCreateModalState(getPlanModalDraftFromItem(item, dateKeyOverride))
+  }
+
+  function appendRawLineToDateBlock(dateKey, rawLine) {
+    const targetDateKey = String(dateKey ?? "").trim()
+    const normalizedRawLine = String(rawLine ?? "").trim()
+    if (!targetDateKey || !normalizedRawLine) return false
+
+    const isAll = activeWindowId === "all"
+    const currentText = isAll ? textRef.current ?? text : tabEditText ?? ""
+    const currentBody = getDateBlockBodyText(currentText, baseYear, targetDateKey)
+    const nextBody = [String(currentBody ?? "").trimEnd(), normalizedRawLine].filter(Boolean).join("\n").trimEnd()
+    if (canUseWebRowPlanEdit) {
+      enqueueDayListSync(targetDateKey, nextBody, activeWindowId)
+    }
+    const nextText = updateDateBlockBody(currentText, baseYear, targetDateKey, nextBody)
+    if (isAll) {
+      updateEditorText(nextText)
+      setWindowMemoTextSync(baseYear, "all", nextText)
+    } else {
+      setTabEditText(nextText)
+      setWindowMemoTextSync(baseYear, activeWindowId, nextText)
+      applyTabEditToAllFromText(nextText)
+    }
+    setActiveDateKey(targetDateKey)
+    return true
+  }
+
+  function normalizePlanModalDraft(draft) {
+    const dateKey = String(draft?.startDateKey ?? draft?.dateKey ?? "").trim()
+    const repeatOpenEnded = Boolean(draft?.repeatOpenEnded ?? draft?.openEndedRepeat ?? draft?.isOpenEndedRepeat)
+    const rawUntilDateKey = String(draft?.untilDateKey ?? draft?.endDateKey ?? "").trim()
+    const untilDateKey = repeatOpenEnded ? "" : rawUntilDateKey || dateKey
+    const repeat = normalizeRepeatType(draft?.repeat)
+    const repeatInterval = normalizeRepeatInterval(draft?.repeatInterval)
+    const startTime = normalizeClockTime(draft?.startTime) || String(draft?.startTime ?? "").trim()
+    const endTime = normalizeClockTime(draft?.endTime) || String(draft?.endTime ?? "").trim()
+    let time = startTime ? buildTimeSpanLabel(startTime, endTime) : String(draft?.time ?? "").trim()
+    let content = String(draft?.content ?? "").trim()
+    const leadingTime = parseLeadingPlanTimeText(content)
+    if (leadingTime) {
+      content = leadingTime.content
+      time = buildTimeSpanLabel(leadingTime.time, leadingTime.end_time)
+    }
+    const timeFields = normalizePlanTimeFields({ time })
+    const categoryId = normalizeCategoryId(String(draft?.categoryTitle ?? "").trim()) || GENERAL_CATEGORY_ID
+    const isTask = Boolean(draft?.isTask)
+    const normalizedRepeatDays = normalizeRepeatDays(draft?.repeatDays)
+    const repeatDays =
+      repeat === "weekly"
+        ? normalizedRepeatDays.length > 0
+          ? normalizedRepeatDays
+          : getDefaultWeeklyDaysForDate(dateKey)
+        : []
+    const alarmEnabled = Boolean(timeFields.time) && Boolean(draft?.alarmEnabled)
+    const alarmLeadMinutes = alarmEnabled ? normalizeAlarmLeadMinutes(draft?.alarmLeadMinutes ?? 0) : 0
+    return {
+      dateKey,
+      time: timeFields.time,
+      end_time: timeFields.end_time,
+      timeLabel: buildTimeSpanLabel(timeFields.time, timeFields.end_time),
+      category_id: categoryId,
+      content,
+      isTask,
+      completed: isTask ? Boolean(draft?.completed) : null,
+      repeat,
+      repeatInterval,
+      repeatOpenEnded: repeat !== "none" && repeatOpenEnded,
+      untilDateKey: repeat === "none" ? "" : repeatOpenEnded ? "" : untilDateKey || dateKey,
+      repeatDays,
+      alarmEnabled,
+      alarmLeadMinutes,
+      sourceItem: draft?.sourceItem ?? null,
+      editMode: String(draft?.editMode ?? "").trim() === "edit" ? "edit" : "create"
+    }
+  }
+
+  function buildPlanRawLineFromDraftFields(fields) {
+    const parts = []
+    if (fields.timeLabel) parts.push(fields.timeLabel)
+    if (!isGeneralCategoryId(fields.category_id)) parts.push(`@${fields.category_id}`)
+    parts.push(String(fields.content ?? "").trim())
+    return buildTaskMetaText(parts.join(";"), {
+      completed: fields.isTask ? Boolean(fields.completed) : null
+    })
+  }
+
+  function buildRecurringPayloadFromPlanFields(fields) {
+    return {
+      startDateKey: fields.dateKey,
+      untilDateKey: fields.repeatOpenEnded ? "" : fields.untilDateKey || fields.dateKey,
+      repeat: fields.repeat,
+      repeatInterval: fields.repeatInterval,
+      repeatDays: fields.repeat === "weekly" ? fields.repeatDays : [],
+      alarmEnabled: fields.alarmEnabled,
+      alarmLeadMinutes: fields.alarmLeadMinutes,
+      rawLine: buildPlanRawLineFromDraftFields(fields),
+      categoryTitle: isGeneralCategoryId(fields.category_id) ? "" : fields.category_id
+    }
+  }
+
+  function getComparablePlanParts(rowOrItem) {
+    const row = rowOrItem?.row ? rowOrItem.row : rowOrItem
+    const taskAware = stripTaskSuffix(String(row?.content ?? rowOrItem?.rawLine ?? rowOrItem?.baseRaw ?? rowOrItem?.text ?? rowOrItem?.display ?? "").trim())
+    const normalizedTime = normalizePlanTimeFields(row?.content != null ? row : { time: rowOrItem?.time ?? "" })
+    let category = normalizeCategoryId(String(row?.category_id ?? rowOrItem?.sourceTitle ?? rowOrItem?.title ?? "").trim())
+    if (isGeneralCategoryId(category)) category = GENERAL_CATEGORY_ID
+    return {
+      date: String(row?.date ?? rowOrItem?.dateKey ?? "").trim(),
+      time: String(normalizedTime.time ?? "").trim(),
+      end_time: String(normalizedTime.end_time ?? "").trim(),
+      category_id: category,
+      content: String(taskAware.text ?? "").trim()
+    }
+  }
+
+  function findMatchingRemotePlanRow(item) {
+    const target = getComparablePlanParts(item)
+    if (!target.date || !target.content) return null
+    const targetOrder = parsePlanOrderValue(item?.sortOrder ?? item?.order)
+    const rows = (remotePlans ?? []).filter((row) => {
+      if (!row || row?.deleted_at || isRecurringPlanRow(row)) return false
+      const current = getComparablePlanParts(row)
+      if (current.date !== target.date) return false
+      if (current.content !== target.content) return false
+      if (current.category_id !== target.category_id) return false
+      if (target.time && current.time !== target.time) return false
+      if (target.end_time && current.end_time !== target.end_time) return false
+      return true
+    })
+    if (rows.length <= 1 || targetOrder == null) return rows[0] ?? null
+    return rows.find((row) => parsePlanOrderValue(row?.sort_order ?? row?.sortOrder ?? row?.order) === targetOrder) ?? rows[0] ?? null
+  }
+
+  function collectPlanEntriesFromBody(bodyText) {
+    const entries = []
+    const normalized = normalizeGroupLineNewlines(String(bodyText ?? ""))
+    const lines = normalized.split("\n")
+    let order = 0
+    const pushEntry = ({ time = "", title = "", rawText = "" } = {}) => {
+      const textValue = String(rawText ?? "").trim()
+      if (!textValue) return
+      entries.push({
+        time: String(time ?? "").trim(),
+        title: normalizeCategoryId(String(title ?? "").trim()),
+        rawText: textValue,
+        order
+      })
+      order += 1
+    }
+
+    for (const rawLine of lines) {
+      const trimmed = String(rawLine ?? "").trim()
+      if (!trimmed) continue
+      const semicolon = parseDashboardSemicolonLine(trimmed, { allowEmptyText: true })
+      if (semicolon) {
+        if (String(semicolon.text ?? "").trim()) {
+          pushEntry({ time: semicolon.time || "", title: semicolon.group || "", rawText: semicolon.text })
+        }
+        continue
+      }
+      const groupMatch = trimmed.match(groupLineRegex)
+      if (groupMatch) {
+        const title = normalizeCategoryId(String(groupMatch[1] ?? "").trim())
+        const parts = String(groupMatch[2] ?? "")
+          .split(";")
+          .map((part) => part.trim())
+          .filter(Boolean)
+        for (const part of parts) {
+          const parsed = parseLeadingTimeDashboardLine(part, { allowEmptyText: true })
+          pushEntry({ time: parsed?.time || "", title: parsed?.group || title, rawText: parsed ? parsed.text : part })
+        }
+        continue
+      }
+      const leading = parseLeadingTimeDashboardLine(trimmed, { allowEmptyText: true })
+      if (leading) {
+        pushEntry({ time: leading.time || "", title: leading.group || "", rawText: leading.text })
+        continue
+      }
+      pushEntry({ rawText: trimmed })
+    }
+    return entries
+  }
+
+  function buildBodyFromPlanEntries(entries) {
+    return (entries ?? [])
+      .map((entry) => {
+        const rawText = String(entry?.rawText ?? "").trim()
+        if (!rawText) return ""
+        const title = normalizeCategoryId(String(entry?.title ?? "").trim())
+        const time = String(entry?.time ?? "").trim()
+        if (title) return time ? `${time};@${title};${rawText}` : `@${title};${rawText}`
+        return time ? `${time};${rawText}` : rawText
+      })
+      .filter(Boolean)
+      .join("\n")
+      .trimEnd()
+  }
+
+  function planEntryMatchesItem(entry, item) {
+    if (!entry || !item) return false
+    const targetOrder = parsePlanOrderValue(item?.order ?? item?.lineIndex)
+    if (targetOrder != null && entry.order === targetOrder) return true
+    const entryText = String(stripTaskSuffix(entry.rawText)?.text ?? entry.rawText ?? "").trim()
+    const targetText = String(item?.text ?? item?.display ?? "").trim()
+    const entryTitle = normalizeCategoryId(String(entry.title ?? "").trim()) || GENERAL_CATEGORY_ID
+    const targetTitle = normalizeCategoryId(String(item?.sourceTitle ?? item?.title ?? "").trim()) || GENERAL_CATEGORY_ID
+    const entryTime = normalizePlanTimeFields({ time: entry.time })
+    const targetTime = normalizePlanTimeFields({ time: item?.time ?? "" })
+    return (
+      entryText === targetText &&
+      entryTitle === targetTitle &&
+      (!targetTime.time || entryTime.time === targetTime.time) &&
+      (!targetTime.end_time || entryTime.end_time === targetTime.end_time)
+    )
+  }
+
+  function buildBodyWithPlanReplacement(bodyText, targetItem, replacementRawLine = null) {
+    let changed = false
+    const entries = collectPlanEntriesFromBody(bodyText)
+    const nextEntries = []
+    for (const entry of entries) {
+      if (!changed && planEntryMatchesItem(entry, targetItem)) {
+        changed = true
+        if (replacementRawLine) nextEntries.push(...collectPlanEntriesFromBody(replacementRawLine))
+        continue
+      }
+      nextEntries.push(entry)
+    }
+    if (!changed) return null
+    return buildBodyFromPlanEntries(nextEntries)
+  }
+
+  async function insertPlanDraftToCloud(fields) {
+    if (!supabase || !session?.user?.id) return false
+    const userId = session.user.id
+    const updatedAt = new Date().toISOString()
+    const row = {
+      user_id: userId,
+      date: fields.dateKey,
+      time: fields.time,
+      content: buildPlanContentWithMeta(fields.content, {
+        completed: fields.isTask ? Boolean(fields.completed) : null
+      }),
+      category_id: fields.category_id,
+      client_id: clientIdRef.current,
+      updated_at: updatedAt
+    }
+    if (endTimeSupportedRef.current) row.end_time = fields.end_time || null
+    if (alarmColumnsSupportedRef.current) {
+      row.alarm_enabled = Boolean(fields.time) && Boolean(fields.alarmEnabled)
+      row.alarm_lead_minutes = fields.time && fields.alarmEnabled ? normalizeAlarmLeadMinutes(fields.alarmLeadMinutes) : 0
+    }
+    const sortPlan = sortOrderSupportedRef.current ? buildDefaultInsertSortPlan(fields.dateKey, remotePlans, row) : null
+    if (sortOrderSupportedRef.current) row.sort_order = sortPlan?.sortOrder ?? getNextSortOrderForDate(fields.dateKey, remotePlans)
+
+    suspendRemotePlansLoads()
+    let { data, error } = await supabase.from("plans").insert(row).select()
+    if (error && isEndTimeColumnError(error)) {
+      endTimeSupportedRef.current = false
+      const retryRow = { ...row }
+      delete retryRow.end_time
+      const retry = await supabase.from("plans").insert(retryRow).select()
+      data = retry.data
+      error = retry.error
+    }
+    if (error && isAlarmColumnError(error)) {
+      alarmColumnsSupportedRef.current = false
+      const retryRow = stripAlarmFromRows([endTimeSupportedRef.current ? row : stripEndTimeFromRows([row])[0]])[0]
+      const retryPayload = sortOrderSupportedRef.current ? retryRow : stripSortOrderFromRows([retryRow])[0]
+      const retry = await supabase.from("plans").insert(retryPayload).select()
+      data = retry.data
+      error = retry.error
+    }
+    if (error && isSortOrderColumnError(error)) {
+      sortOrderSupportedRef.current = false
+      const retryRow = endTimeSupportedRef.current ? { ...row } : stripEndTimeFromRows([row])[0]
+      const alarmSafeRow = alarmColumnsSupportedRef.current ? retryRow : stripAlarmFromRows([retryRow])[0]
+      delete alarmSafeRow.sort_order
+      const retry = await supabase.from("plans").insert(alarmSafeRow).select()
+      data = retry.data
+      error = retry.error
+    }
+    if (error) {
+      console.error("insert plan", error)
+      setAuthMessage("항목 추가에 실패했어요.")
+      return false
+    }
+    if (sortPlan?.updates?.length && sortOrderSupportedRef.current) {
+      const baseMs = Date.now()
+      const payloads = sortPlan.updates.map((item, idx) => ({
+        id: item.id,
+        user_id: userId,
+        sort_order: item.order,
+        updated_at: new Date(baseMs + idx).toISOString(),
+        client_id: clientIdRef.current
+      }))
+      const { error: orderError } = await supabase.from("plans").upsert(payloads, { onConflict: "id" })
+      if (orderError && isSortOrderColumnError(orderError)) {
+        sortOrderSupportedRef.current = false
+      } else if (orderError) {
+        console.error("insert plan order", orderError)
+      }
+    }
+    const orderMap = new Map((sortPlan?.updates ?? []).map((item) => [String(item.id), item.order]))
+    setRemotePlans((prev) => [
+      ...(prev ?? []).map((existing) => {
+        const order = orderMap.get(String(existing?.id ?? ""))
+        return order == null ? existing : { ...existing, sort_order: order }
+      }),
+      ...((data ?? []).length ? data : [row])
+    ])
+    return true
+  }
+
+  async function updatePlanDraftInCloud(fields) {
+    if (!supabase || !session?.user?.id) return false
+    const source = fields.sourceItem
+    const targetRow = source?.rowId || source?.row?.id ? source?.row ?? { id: source?.rowId } : findMatchingRemotePlanRow(source)
+    const rowId = String(targetRow?.id ?? "").trim()
+    if (!rowId) return false
+    const userId = session.user.id
+    const updatedAt = new Date().toISOString()
+    const payload = {
+      date: fields.dateKey,
+      time: fields.time,
+      content: buildPlanContentWithMeta(fields.content, {
+        completed: fields.isTask ? Boolean(fields.completed) : null
+      }),
+      category_id: fields.category_id,
+      updated_at: updatedAt,
+      client_id: clientIdRef.current
+    }
+    if (endTimeSupportedRef.current) payload.end_time = fields.end_time || null
+    if (alarmColumnsSupportedRef.current) {
+      payload.alarm_enabled = Boolean(fields.time) && Boolean(fields.alarmEnabled)
+      payload.alarm_lead_minutes = fields.time && fields.alarmEnabled ? normalizeAlarmLeadMinutes(fields.alarmLeadMinutes) : 0
+    }
+
+    suspendRemotePlansLoads()
+    setRemotePlans((prev) =>
+      (prev ?? []).map((row) => (String(row?.id ?? "") === rowId ? { ...row, ...payload } : row))
+    )
+
+    let { error } = await supabase.from("plans").update(payload).eq("id", rowId).eq("user_id", userId)
+    if (error && isEndTimeColumnError(error)) {
+      endTimeSupportedRef.current = false
+      const retryPayload = { ...payload }
+      delete retryPayload.end_time
+      const retry = await supabase.from("plans").update(retryPayload).eq("id", rowId).eq("user_id", userId)
+      error = retry.error
+    }
+    if (error && isAlarmColumnError(error)) {
+      alarmColumnsSupportedRef.current = false
+      const retryPayload = stripAlarmFromRows([endTimeSupportedRef.current ? payload : stripEndTimeFromRows([payload])[0]])[0]
+      const retry = await supabase.from("plans").update(retryPayload).eq("id", rowId).eq("user_id", userId)
+      error = retry.error
+    }
+    if (error) {
+      console.error("update plan", error)
+      await loadRemotePlans(userId, { force: true })
+      setAuthMessage("항목 수정에 실패했어요.")
+      return false
+    }
+    return true
+  }
+
+  async function removeQuickSourcePlan(sourceItem) {
+    if (!sourceItem) return true
+    if (canUseWebRowPlanEdit && supabase && session?.user?.id) {
+      const targetRow =
+        sourceItem?.rowId || sourceItem?.row?.id
+          ? sourceItem?.row ?? { id: sourceItem?.rowId }
+          : findMatchingRemotePlanRow(sourceItem)
+      const rowId = String(targetRow?.id ?? "").trim()
+      if (!rowId) return true
+      const userId = session.user.id
+      const deletedAt = new Date().toISOString()
+      suspendRemotePlansLoads()
+      setRemotePlans((prev) => (prev ?? []).filter((row) => String(row?.id ?? "") !== rowId))
+      const { error } = await supabase
+        .from("plans")
+        .update({ deleted_at: deletedAt, updated_at: deletedAt, client_id: clientIdRef.current })
+        .eq("id", rowId)
+        .eq("user_id", userId)
+      if (error) {
+        console.error("delete source plan", error)
+        await loadRemotePlans(userId, { force: true })
+        return false
+      }
+      return true
+    }
+
+    const sourceDateKey = String(sourceItem?.dateKey ?? "").trim()
+    if (!sourceDateKey) return true
+    const isAll = activeWindowId === "all"
+    const current = isAll ? textRef.current ?? text : tabEditText ?? ""
+    const sourceBody = getDateBlockBodyText(current, baseYear, sourceDateKey)
+    const nextBody = buildBodyWithPlanReplacement(sourceBody, sourceItem, null)
+    if (nextBody == null) return false
+    const nextText = updateDateBlockBody(current, baseYear, sourceDateKey, nextBody)
+    if (isAll) {
+      updateEditorText(nextText)
+      setWindowMemoTextSync(baseYear, "all", nextText)
+    } else {
+      setTabEditText(nextText)
+      setWindowMemoTextSync(baseYear, activeWindowId, nextText)
+      applyTabEditToAllFromText(nextText)
+    }
+    return true
+  }
+
+  async function saveQuickRecurringDraft(fields) {
+    const payload = buildRecurringPayloadFromPlanFields(fields)
+    if (!payload.rawLine) return false
+
+    if (hasCloudSession && canUseWebRowPlanEdit && supabase && session?.user?.id) {
+      const userId = session.user.id
+      try {
+        suspendRemotePlansLoads()
+        const rows = buildRecurringPlanRows(userId, payload, { seriesIdOverride: genSeriesId() })
+        if (rows.length === 0) return false
+        await insertRecurringPlanRows(rows)
+        if (fields.editMode === "edit" && fields.sourceItem) {
+          const removed = await removeQuickSourcePlan(fields.sourceItem)
+          if (!removed) return false
+        }
+        ensureWindowsForCategories(
+          new Set(
+            rows
+              .map((row) => normalizeCategoryId(String(row?.category_id ?? "").trim()))
+              .filter((title) => title && !isGeneralCategoryId(title))
+          )
+        )
+        await loadRemotePlans(userId, { force: true })
+        return true
+      } catch (error) {
+        console.error("quick recurring save", error)
+        await loadRemotePlans(userId, { force: true })
+        setAuthMessage("반복 일정 저장에 실패했어요.")
+        return false
+      }
+    }
+
+    const nextRule = buildRecurringRuleFromPayload(payload, fields.dateKey)
+    setRecurringRules((prev) => [...(prev ?? []), nextRule])
+    if (fields.editMode === "edit" && fields.sourceItem) {
+      const removed = await removeQuickSourcePlan(fields.sourceItem)
+      if (!removed) return false
+    }
+    setDayListMode("edit")
+    return true
+  }
+
+  function savePlanDraftToText(fields) {
+    const rawLine = buildPlanRawLineFromDraftFields(fields)
+    if (fields.editMode !== "edit" || !fields.sourceItem) {
+      return appendRawLineToDateBlock(fields.dateKey, rawLine)
+    }
+
+    const sourceDateKey = String(fields.sourceItem?.dateKey ?? fields.dateKey ?? "").trim()
+    const isAll = activeWindowId === "all"
+    const current = isAll ? textRef.current ?? text : tabEditText ?? ""
+    const sourceBody = getDateBlockBodyText(current, baseYear, sourceDateKey)
+    const removedBody = buildBodyWithPlanReplacement(sourceBody, fields.sourceItem, null)
+    if (removedBody == null) return false
+
+    let nextText = updateDateBlockBody(current, baseYear, sourceDateKey, removedBody)
+    const targetBody = getDateBlockBodyText(nextText, baseYear, fields.dateKey)
+    const nextTargetBody =
+      sourceDateKey === fields.dateKey
+        ? buildBodyWithPlanReplacement(sourceBody, fields.sourceItem, rawLine)
+        : [String(targetBody ?? "").trimEnd(), rawLine].filter(Boolean).join("\n").trimEnd()
+    nextText =
+      sourceDateKey === fields.dateKey
+        ? updateDateBlockBody(current, baseYear, sourceDateKey, nextTargetBody)
+        : updateDateBlockBody(nextText, baseYear, fields.dateKey, nextTargetBody)
+
+    if (canUseWebRowPlanEdit) {
+      if (sourceDateKey !== fields.dateKey) enqueueDayListSync(sourceDateKey, removedBody, activeWindowId)
+      enqueueDayListSync(fields.dateKey, nextTargetBody, activeWindowId)
+    }
+    if (isAll) {
+      updateEditorText(nextText)
+      setWindowMemoTextSync(baseYear, "all", nextText)
+    } else {
+      setTabEditText(nextText)
+      setWindowMemoTextSync(baseYear, activeWindowId, nextText)
+      applyTabEditToAllFromText(nextText)
+    }
+    return true
+  }
+
+  async function handleQuickCreate(draft) {
+    const fields = normalizePlanModalDraft(draft)
+    if (!fields.content) {
+      setAuthMessage("내용을 입력해 주세요.")
+      return
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fields.dateKey)) {
+      setAuthMessage("날짜 형식은 YYYY-MM-DD 이어야 합니다.")
+      return
+    }
+    if (!fields.dateKey.startsWith(`${baseYear}-`) && !canUseWebRowPlanEdit) {
+      setAuthMessage(`웹 추가는 현재 보고 있는 연도(${baseYear}) 안에서 먼저 지원합니다.`)
+      return
+    }
+    if (fields.repeat !== "none" && fields.untilDateKey && fields.untilDateKey < fields.dateKey) {
+      setAuthMessage("마감일은 시작일보다 빠를 수 없습니다.")
+      return
+    }
+
+    if (fields.repeat !== "none") {
+      const ok = await saveQuickRecurringDraft(fields)
+      if (!ok) return
+      setAuthMessage(fields.editMode === "edit" ? "반복 일정으로 저장했어요." : "반복 일정을 추가했어요.")
+      setActiveDateKey(fields.dateKey)
+      closeQuickCreateModal()
+      return
+    }
+
+    const usingCloudRows = canUseWebRowPlanEdit && supabase && session?.user?.id
+    if (usingCloudRows) {
+      const savePromise =
+        fields.editMode === "edit"
+          ? updatePlanDraftInCloud(fields)
+          : insertPlanDraftToCloud(fields)
+      setAuthMessage(fields.editMode === "edit" ? "항목을 저장했어요." : "항목을 추가했어요.")
+      setActiveDateKey(fields.dateKey)
+      closeQuickCreateModal()
+      await savePromise
+      return
+    }
+
+    const ok = savePlanDraftToText(fields)
+    if (!ok) return
+
+    setAuthMessage(fields.editMode === "edit" ? "항목을 저장했어요." : "항목을 추가했어요.")
+    setActiveDateKey(fields.dateKey)
+    closeQuickCreateModal()
+  }
+
+  async function handleQuickDelete({ sourceItem } = {}) {
+    if (!sourceItem) return
+    if (canUseWebRowPlanEdit && supabase && session?.user?.id) {
+      const targetRow = sourceItem?.rowId || sourceItem?.row?.id ? sourceItem?.row ?? { id: sourceItem?.rowId } : findMatchingRemotePlanRow(sourceItem)
+      const rowId = String(targetRow?.id ?? "").trim()
+      if (!rowId) return
+      const userId = session.user.id
+      const deletedAt = new Date().toISOString()
+      suspendRemotePlansLoads()
+      setRemotePlans((prev) => (prev ?? []).filter((row) => String(row?.id ?? "") !== rowId))
+      const { error } = await supabase
+        .from("plans")
+        .update({ deleted_at: deletedAt, updated_at: deletedAt, client_id: clientIdRef.current })
+        .eq("id", rowId)
+        .eq("user_id", userId)
+      if (error) {
+        console.error("delete plan", error)
+        await loadRemotePlans(userId, { force: true })
+        setAuthMessage("항목 삭제에 실패했어요.")
+        return
+      }
+      setAuthMessage("항목을 삭제했어요.")
+      closeQuickCreateModal()
+      return
+    }
+
+    const sourceDateKey = String(sourceItem?.dateKey ?? "").trim()
+    if (!sourceDateKey) return
+    const isAll = activeWindowId === "all"
+    const current = isAll ? textRef.current ?? text : tabEditText ?? ""
+    const sourceBody = getDateBlockBodyText(current, baseYear, sourceDateKey)
+    const nextBody = buildBodyWithPlanReplacement(sourceBody, sourceItem, null)
+    if (nextBody == null) return
+    const nextText = updateDateBlockBody(current, baseYear, sourceDateKey, nextBody)
+    if (isAll) {
+      updateEditorText(nextText)
+      setWindowMemoTextSync(baseYear, "all", nextText)
+    } else {
+      setTabEditText(nextText)
+      setWindowMemoTextSync(baseYear, activeWindowId, nextText)
+      applyTabEditToAllFromText(nextText)
+    }
+    setAuthMessage("항목을 삭제했어요.")
+    closeQuickCreateModal()
+  }
+
+  function toggleAnyTask(task) {
+    if (task?.sourceType === "recurring") {
+      toggleRecurringTask(task)
+      return
+    }
+    if (canUseWebRowPlanEdit && supabase && session?.user?.id) {
+      void persistTextTaskToggle(task)
+      return
+    }
+    toggleTextTask(task)
+  }
+
+  function openAnyTask(task) {
+    if (task?.sourceType === "recurring") {
+      openRecurringEdit(task)
+      return
+    }
+    openTextTask(task)
+  }
+
+  function buildRecurringRuleFromPayload(payload, fallbackDateKey, familyId = null) {
+    const startDateKey = String(payload?.startDateKey ?? fallbackDateKey ?? "").trim()
+    const untilDateKey = String(payload?.untilDateKey ?? "").trim()
+    return {
+      id: genRecurringId("rule"),
+      familyId: familyId || genRecurringId("family"),
+      startDateKey,
+      untilDateKey,
+      repeat: normalizeRepeatType(payload?.repeat),
+      repeatInterval: normalizeRepeatInterval(payload?.repeatInterval),
+      repeatDays:
+        normalizeRepeatType(payload?.repeat) === "weekly"
+          ? normalizeRepeatDays(payload?.repeatDays)
+          : [],
+      rawLine: String(payload?.rawLine ?? "").trim(),
+      categoryTitle: String(payload?.categoryTitle ?? activeRecurringCategoryTitle ?? "").trim(),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    }
+  }
+
+  function removeSourceTaskFromTextTaskFlow(sourceTask = null, sourceLineIndex = null, dateKeyOverride = "") {
+    const dateKey = String(sourceTask?.dateKey ?? dateKeyOverride ?? recurringModalState?.dateKey ?? "").trim()
+    const lineIndex = Number.isInteger(sourceTask?.lineIndex)
+      ? sourceTask.lineIndex
+      : Number.isInteger(sourceLineIndex)
+        ? sourceLineIndex
+        : null
+    if (!dateKey || !Number.isInteger(lineIndex)) return
+
+    const currentText = activeWindowId === "all" ? textRef.current ?? text : tabEditText ?? ""
+    const bodyText = getDateBlockBodyText(currentText, baseYear, dateKey)
+    const nextBodyText = removeTaskLineFromBody(bodyText, lineIndex)
+    if (nextBodyText === bodyText) return
+
+    if (canUseWebRowPlanEdit) {
+      enqueueDayListSync(dateKey, nextBodyText, activeWindowId)
+    }
+
+    const nextText = updateDateBlockBody(currentText, baseYear, dateKey, nextBodyText)
+    if (nextText === currentText) return
+
+    if (activeWindowId === "all") {
+      updateEditorText(nextText)
+      setWindowMemoTextSync(baseYear, "all", nextText)
+    } else {
+      setTabEditText(nextText)
+      setWindowMemoTextSync(baseYear, activeWindowId, nextText)
+      applyTabEditToAllFromText(nextText)
+    }
+
+    if (dayListModal?.key === dateKey) {
+      setDayListEditText(nextBodyText)
+      setDayListMode("edit")
+    }
+  }
+
+  function createRecurringRule(payload) {
+    if (hasCloudSession) {
+      createCloudRecurringRule(payload)
+      return
+    }
+    const nextRule = buildRecurringRuleFromPayload(payload, recurringModalState?.dateKey)
+    setRecurringRules((prev) => [...(prev ?? []), nextRule])
+    removeSourceTaskFromTextTaskFlow(
+      recurringModalState?.sourceTask ?? null,
+      recurringModalState?.sourceLineIndex ?? null,
+      recurringModalState?.dateKey
+    )
+    setDayListMode("edit")
+  }
+
+  function updateRecurringRuleScoped(payload, scope) {
+    if (hasCloudSession) {
+      updateCloudRecurringRuleScoped(payload, scope)
+      return
+    }
+    setDayListMode("edit")
+    const target = recurringModalState?.item
+    if (!target) return
+    const familyId = String(target.familyId ?? target.ruleId ?? "").trim()
+    const anchorDateKey = String(target.dateKey ?? "").trim()
+    if (!familyId || !anchorDateKey) return
+
+    const familyRules = (recurringRules ?? [])
+      .filter((rule) => String(rule?.familyId ?? rule?.id ?? "").trim() === familyId)
+      .sort((a, b) => keyToTime(String(a?.startDateKey ?? "")) - keyToTime(String(b?.startDateKey ?? "")))
+    if (familyRules.length === 0) return
+    const familyStartDateKey = familyRules[0]?.startDateKey
+    const normalizedPayload = buildRecurringRuleFromPayload(payload, anchorDateKey, familyId)
+    const nowIso = new Date().toISOString()
+
+    if (scope === "single") {
+      const nextOverride = {
+        id: genRecurringId("override"),
+        familyId,
+        ruleId: String(target.ruleId ?? "").trim(),
+        dateKey: anchorDateKey,
+        mode: "replace",
+        rawLine: normalizedPayload.rawLine,
+        updatedAt: nowIso
+      }
+      setRecurringOverrides((prev) => {
+        const list = Array.isArray(prev) ? prev : []
+        const filtered = list.filter(
+          (item) =>
+            !(
+              String(item?.ruleId ?? "").trim() === nextOverride.ruleId &&
+              String(item?.dateKey ?? "").trim() === anchorDateKey
+            )
+        )
+        return [...filtered, nextOverride]
+      })
+      return
+    }
+
+    if (scope === "future") {
+      const prevDateKey = getPreviousDateKey(anchorDateKey)
+      setRecurringRules((prev) => {
+        const list = Array.isArray(prev) ? prev : []
+        const kept = []
+        for (const rule of list) {
+          const currentFamilyId = String(rule?.familyId ?? rule?.id ?? "").trim()
+          if (currentFamilyId !== familyId) {
+            kept.push(rule)
+            continue
+          }
+          const ruleStart = String(rule?.startDateKey ?? "").trim()
+          const ruleUntil = String(rule?.untilDateKey || ruleStart).trim()
+          if (keyToTime(ruleUntil) < keyToTime(anchorDateKey)) {
+            kept.push(rule)
+            continue
+          }
+          if (keyToTime(ruleStart) < keyToTime(anchorDateKey) && keyToTime(prevDateKey) >= keyToTime(ruleStart)) {
+            kept.push({ ...rule, untilDateKey: prevDateKey, updatedAt: nowIso })
+          }
+        }
+        kept.push({
+          ...normalizedPayload,
+          id: genRecurringId("rule"),
+          familyId,
+          startDateKey: anchorDateKey,
+          untilDateKey: normalizedPayload.untilDateKey,
+          createdAt: nowIso,
+          updatedAt: nowIso
+        })
+        return kept
+      })
+      setRecurringOverrides((prev) =>
+        (Array.isArray(prev) ? prev : []).filter(
+          (item) =>
+            String(item?.familyId ?? "").trim() !== familyId || keyToTime(String(item?.dateKey ?? "")) < keyToTime(anchorDateKey)
+        )
+      )
+      return
+    }
+
+    setRecurringRules((prev) => {
+      const list = Array.isArray(prev) ? prev : []
+      const kept = list.filter((rule) => String(rule?.familyId ?? rule?.id ?? "").trim() !== familyId)
+      kept.push({
+        ...normalizedPayload,
+        id: genRecurringId("rule"),
+        familyId,
+        startDateKey: familyStartDateKey,
+        untilDateKey: normalizedPayload.untilDateKey,
+        createdAt: nowIso,
+        updatedAt: nowIso
+      })
+      return kept
+    })
+    setRecurringOverrides((prev) =>
+      (Array.isArray(prev) ? prev : []).filter((item) => String(item?.familyId ?? "").trim() !== familyId)
+    )
+  }
+
+  function deleteRecurringRuleScoped(scope) {
+    if (hasCloudSession) {
+      deleteCloudRecurringRuleScoped(scope)
+      return
+    }
+    setDayListMode("edit")
+    const target = recurringModalState?.item
+    if (!target) return
+    const familyId = String(target.familyId ?? target.ruleId ?? "").trim()
+    const anchorDateKey = String(target.dateKey ?? "").trim()
+    if (!familyId || !anchorDateKey) return
+
+    if (scope === "single") {
+      const nextOverride = {
+        id: genRecurringId("override"),
+        familyId,
+        ruleId: String(target.ruleId ?? "").trim(),
+        dateKey: anchorDateKey,
+        mode: "skip",
+        rawLine: "",
+        updatedAt: new Date().toISOString()
+      }
+      setRecurringOverrides((prev) => {
+        const list = Array.isArray(prev) ? prev : []
+        const filtered = list.filter(
+          (item) =>
+            !(
+              String(item?.ruleId ?? "").trim() === nextOverride.ruleId &&
+              String(item?.dateKey ?? "").trim() === anchorDateKey
+            )
+        )
+        return [...filtered, nextOverride]
+      })
+      return
+    }
+
+    if (scope === "future") {
+      const prevDateKey = getPreviousDateKey(anchorDateKey)
+      setRecurringRules((prev) => {
+        const list = Array.isArray(prev) ? prev : []
+        const kept = []
+        for (const rule of list) {
+          const currentFamilyId = String(rule?.familyId ?? rule?.id ?? "").trim()
+          if (currentFamilyId !== familyId) {
+            kept.push(rule)
+            continue
+          }
+          const ruleStart = String(rule?.startDateKey ?? "").trim()
+          const ruleUntil = String(rule?.untilDateKey || ruleStart).trim()
+          if (keyToTime(ruleUntil) < keyToTime(anchorDateKey)) {
+            kept.push(rule)
+            continue
+          }
+          if (keyToTime(ruleStart) < keyToTime(anchorDateKey) && keyToTime(prevDateKey) >= keyToTime(ruleStart)) {
+            kept.push({ ...rule, untilDateKey: prevDateKey, updatedAt: new Date().toISOString() })
+          }
+        }
+        return kept
+      })
+      setRecurringOverrides((prev) =>
+        (Array.isArray(prev) ? prev : []).filter(
+          (item) =>
+            String(item?.familyId ?? "").trim() !== familyId || keyToTime(String(item?.dateKey ?? "")) < keyToTime(anchorDateKey)
+        )
+      )
+      return
+    }
+
+    setRecurringRules((prev) =>
+      (Array.isArray(prev) ? prev : []).filter((rule) => String(rule?.familyId ?? rule?.id ?? "").trim() !== familyId)
+    )
+    setRecurringOverrides((prev) =>
+      (Array.isArray(prev) ? prev : []).filter((item) => String(item?.familyId ?? "").trim() !== familyId)
+    )
   }
 
   function closeDayListModal() {
     flushPendingDayListSync()
+    if (
+      readDateDraft &&
+      dayListModal &&
+      readDateDraft.windowId === activeWindowId &&
+      readDateDraft.year === baseYear &&
+      readDateDraft.dateKey === dayListModal.key &&
+      !String(dayListEditText ?? "").trim()
+    ) {
+      if (activeWindowId === "all") {
+        const current = textRef.current ?? text
+        const removeResult = removeEmptyBlockByDateKey(current, baseYear, dayListModal.key)
+        if (removeResult.changed) {
+          updateEditorText(removeResult.newText)
+          setWindowMemoTextSync(baseYear, "all", removeResult.newText)
+        }
+      } else {
+        const current = tabEditText ?? ""
+        const removeResult = removeEmptyBlockByDateKey(current, baseYear, dayListModal.key)
+        if (removeResult.changed) {
+          setTabEditText(removeResult.newText)
+          setWindowMemoTextSync(baseYear, activeWindowId, removeResult.newText)
+        }
+      }
+    }
+    setReadDateDraft(null)
     setDayListModal(null)
     dayListDirtyRef.current = false
     dayListEditGuardRef.current = { open: false, mode: "read", dirty: false }
@@ -4590,20 +8626,10 @@ function stripEmptyGroupLines(bodyText) {
     }
   }
 
-  function toggleLeftMemo() {
-    setMemoInnerCollapsed((prev) => {
-      const next = prev === "right" ? "none" : "right"
-      setMemoCollapsedByWindow((map) => ({ ...map, [activeWindowId]: next }))
-      return next
-    })
-  }
-
-  function toggleRightMemo() {
-    setMemoInnerCollapsed((prev) => {
-      const next = prev === "left" ? "none" : "left"
-      setMemoCollapsedByWindow((map) => ({ ...map, [activeWindowId]: next }))
-      return next
-    })
+  function setMemoInnerMode(mode) {
+    const next = mode === "left" ? "left" : "right"
+    setMemoInnerCollapsed(next)
+    setMemoCollapsedByWindow((map) => ({ ...map, [activeWindowId]: next }))
   }
 
   const memoTextareaStyle = {
@@ -4636,7 +8662,7 @@ function stripEmptyGroupLines(bodyText) {
     color: ui.text2,
     fontSize: 15,
     letterSpacing: "0.01em",
-    width: 70,
+    width: 82,
     textAlign: "left",
     paddingLeft: 2
   }
@@ -4651,9 +8677,7 @@ function stripEmptyGroupLines(bodyText) {
 
   const isLeftCollapsed = memoInnerCollapsed === "left"
   const isRightCollapsed = memoInnerCollapsed === "right"
-  const leftButtonOpacity = isLeftCollapsed ? 0.4 : 1
-  const rightButtonOpacity = isRightCollapsed ? 0.4 : 1
-  const leftMemoFlex = isLeftCollapsed ? "0 0 0px" : isRightCollapsed ? "1 1 0" : `0 0 ${memoInnerSplit * 100}%`
+  const leftMemoFlex = isLeftCollapsed ? "0 0 0px" : "1 1 0"
   const rightMemoFlex = isRightCollapsed ? "0 0 0px" : "1 1 0"
 
   // ? "설정 창 밖 클릭" 처리: 패널/버튼 밖이면 닫기
@@ -4689,6 +8713,15 @@ function stripEmptyGroupLines(bodyText) {
 
   const showMemoPanel = layoutPreset === "memo-left" ? outerCollapsed !== "left" : outerCollapsed !== "right"
   const showCalendarPanel = layoutPreset === "memo-left" ? outerCollapsed !== "right" : outerCollapsed !== "left"
+  const showListPane = showMemoPanel && !isLeftCollapsed
+  const showMemoMonthControls = showMemoPanel && !showCalendarPanel && !isLeftCollapsed
+  const showMemoTopActions = showMemoPanel && !showCalendarPanel && !isLeftCollapsed
+  const showLogoInMemoPanel = showMemoPanel && (!showCalendarPanel || layoutPreset === "memo-left")
+  const showLogoInCalendarPanel = showCalendarPanel && (!showMemoPanel || layoutPreset === "calendar-left")
+  const showSwapButtonInMemoPanel =
+    showMemoPanel && (!showCalendarPanel || layoutPreset === "memo-left")
+  const showSwapButtonInCalendarPanel =
+    showCalendarPanel && (!showMemoPanel || layoutPreset === "calendar-left")
   const canScrollTabsLeft = tabScrollState.left
   const canScrollTabsRight = tabScrollState.right
 
@@ -4719,95 +8752,55 @@ function stripEmptyGroupLines(bodyText) {
             gap: 10,
             minWidth: 0,
             position: "relative"
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-            <button
-              onClick={basePrevYear}
-              className="arrow-button"
-              style={arrowButton}
-              title="이전 연도"
-              aria-label="이전 연도"
-            >
-              ◀
-            </button>
-            <div style={{ fontWeight: 900 }}>{baseYear}</div>
-            <button
-              onClick={baseNextYear}
-              className="arrow-button"
-              style={arrowButton}
-              title="다음 연도"
-              aria-label="다음 연도"
-            >
-              ▶
-            </button>
-            <div
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                height: 32,
-                borderRadius: 10,
-                border: `1px solid ${ui.border}`,
-                background: ui.surface,
-                overflow: "hidden"
-              }}
-            >
-              <button
-                onClick={toggleLeftMemo}
-                className="no-hover-outline memo-toggle-button is-left"
-                style={{
-                  width: 30,
-                  height: 32,
-                  border: "none",
-                  background: "transparent",
-                  color: ui.text,
-                  cursor: "pointer",
-                  fontWeight: 800,
-                  lineHeight: 1,
-                  display: "inline-flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  opacity: leftButtonOpacity
-                }}
-                title={isRightCollapsed ? "오른쪽 메모 펼치기" : "오른쪽 메모 접기"}
-                aria-label={isRightCollapsed ? "오른쪽 메모 펼치기" : "오른쪽 메모 접기"}
-              >
-                L
-              </button>
-            <div style={{ width: 1, height: 32, background: ui.border2 }} />
-              <button
-                onClick={toggleRightMemo}
-                className="no-hover-outline memo-toggle-button is-right"
-                style={{
-                  width: 30,
-                  height: 32,
-                  border: "none",
-                  background: "transparent",
-                  color: ui.text,
-                  cursor: "pointer",
-                  fontWeight: 800,
-                  lineHeight: 1,
-                  display: "inline-flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  opacity: rightButtonOpacity
-                }}
-                title={isLeftCollapsed ? "왼쪽 메모 펼치기" : "왼쪽 메모 접기"}
-                aria-label={isLeftCollapsed ? "왼쪽 메모 펼치기" : "왼쪽 메모 접기"}
-              >
-                R
-              </button>
-            </div>
-            {!isLeftCollapsed ? (
+        }}
+      >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              flex: "1 1 auto",
+              minWidth: 0
+            }}
+          >
+            {showLogoInMemoPanel ? <PlannerLogoMark /> : null}
+            {showMemoMonthControls ? (
+              <MonthNavigator
+                ymYear={ymYear}
+                setYmYear={setYmYear}
+                ymMonth={ymMonth}
+                setYmMonth={setYmMonth}
+                goPrevMonth={goPrevMonth}
+                goNextMonth={goNextMonth}
+                ui={ui}
+                labelPrefix="리스트"
+              />
+            ) : null}
+            {showMemoTopActions ? (
               <>
                 <button
-                  ref={readDateCreateButtonRef}
-                  onClick={openReadDateCreatePicker}
+                  type="button"
+                  onClick={goToday}
                   style={{
                     ...pillButton,
                     height: 32,
                     padding: "0 12px",
-                    borderRadius: 10,
+                    borderRadius: 6,
+                    lineHeight: "normal"
+                  }}
+                  title="오늘로 이동"
+                  aria-label="오늘로 이동"
+                >
+                  Today
+                </button>
+                <button
+                  ref={readDateCreateButtonRef}
+                  onClick={(e) => openReadDateCreatePicker(e.currentTarget)}
+                  style={{
+                    ...pillButton,
+                    height: 32,
+                    padding: "0 12px",
+                    borderRadius: 6,
                     lineHeight: "normal",
                     display: "inline-flex",
                     alignItems: "center",
@@ -4842,37 +8835,81 @@ function stripEmptyGroupLines(bodyText) {
             ) : null}
           </div>
 
-        <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
-          {activeWindowId === "all" && (
-            <div style={{ position: "relative" }}>
-              <button
-                ref={filterBtnRef}
-                onClick={() => setFilterOpen((v) => !v)}
-              style={{
-                ...memoTopRightButton,
-                padding: 0,
-                fontSize: 26,
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center"
-              }}
-                title="통합 필터"
-                aria-label="통합 필터"
-              >
-                <span style={{ display: "inline-block", transform: "translateY(-1.5px)" }}>≡</span>
-              </button>
-              {filterOpen && (
-                <FilterPanel
-                  filterPanelRef={filterPanelRef}
-                  editableWindows={editableWindows}
-                  integratedFilters={integratedFilters}
-                  setIntegratedFilters={setIntegratedFilters}
-                  ui={ui}
-                  panelFontFamily={panelFontFamily}
-                />
-              )}
-            </div>
-          )}
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "flex-end",
+            gap: 8,
+            flexShrink: 0,
+            marginLeft: "auto"
+          }}
+        >
+          <div
+            role="group"
+            aria-label="리스트와 메모 보기 전환"
+            style={{
+              height: 34,
+              borderRadius: 6,
+              border: `1px solid ${ui.border}`,
+              background: ui.surface,
+              display: "inline-flex",
+              alignItems: "stretch",
+              overflow: "hidden",
+              flexShrink: 0,
+              boxShadow: theme === "dark" ? "none" : "0 1px 0 rgba(15, 23, 42, 0.04)"
+            }}
+          >
+            {[
+              { key: "right", icon: "☰", label: "리스트만 보기" },
+              { key: "left", icon: "✎", label: "메모만 보기" }
+            ].map((option, index) => {
+              const active = memoInnerCollapsed === option.key
+              return (
+                <button
+                  key={option.key}
+                  type="button"
+                  onClick={() => setMemoInnerMode(option.key)}
+                  title={option.label}
+                  aria-label={option.label}
+                  aria-pressed={active}
+                  style={{
+                    width: 34,
+                    height: "100%",
+                    boxSizing: "border-box",
+                    border: 0,
+                    borderLeft: index === 0 ? "none" : `1px solid ${ui.border}`,
+                    background: active ? ui.accentSoft : "transparent",
+                    color: active ? ui.accent : ui.text2,
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    padding: 0,
+                    cursor: "pointer",
+                    fontFamily: "inherit",
+                    fontSize: option.key === "right" ? 20 : 18,
+                    fontWeight: 820,
+                    lineHeight: 1,
+                    outline: "none",
+                    transform: "none"
+                  }}
+                >
+                  <span
+                    aria-hidden="true"
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      lineHeight: 1,
+                      transform: option.key === "left" ? "translateY(-0.5px)" : "none"
+                    }}
+                  >
+                    {option.icon}
+                  </span>
+                </button>
+              )
+            })}
+          </div>
           <button
             ref={settingsBtnRef}
             onClick={() => setSettingsOpen((v) => !v)}
@@ -4900,6 +8937,33 @@ function stripEmptyGroupLines(bodyText) {
               />
             </svg>
           </button>
+          {showSwapButtonInMemoPanel ? (
+            <button
+              onClick={() => setLayoutPreset((p) => (p === "memo-left" ? "calendar-left" : "memo-left"))}
+              style={compactLayoutToggleButton}
+              title="메모/달력 위치 변경"
+              aria-label="메모/달력 위치 변경"
+            >
+              <svg width="18" height="18" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+                <path
+                  d="M4 6h10M11 3l3 3-3 3"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.9"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+                <path
+                  d="M16 14H6M9 11l-3 3 3 3"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.9"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </button>
+          ) : null}
           {!session && (
             <>
               <button
@@ -4909,32 +8973,12 @@ function stripEmptyGroupLines(bodyText) {
                 }}
                 title="로그인"
                 aria-label="로그인"
-                style={{ ...memoTopRightButton, fontSize: 12, fontWeight: 900, minWidth: 74 }}
+                style={{ ...memoTopRightButton, fontSize: 12, fontWeight: 760, minWidth: 74 }}
               >
                 로그인
               </button>
               <span style={{ fontSize: 11, color: ui.text2 }}>오프라인 모드</span>
             </>
-          )}
-          {layoutPreset === "memo-left" && (
-            <button
-              onClick={() => setLayoutPreset((p) => (p === "memo-left" ? "calendar-left" : "memo-left"))}
-              style={{ ...memoTopRightButton, fontSize: 12, fontWeight: 900 }}
-              title="메모/달력 위치 변경"
-              aria-label="메모/달력 위치 변경"
-            >
-              ⇆
-            </button>
-          )}
-          {outerCollapsed === "left" && (
-            <button
-              onClick={() => setLayoutPreset((p) => (p === "memo-left" ? "calendar-left" : "memo-left"))}
-              style={{ ...memoTopRightButton, fontSize: 12, fontWeight: 900 }}
-              title="메모/달력 위치 변경"
-              aria-label="메모/달력 위치 변경"
-            >
-              ⇆
-            </button>
           )}
         </div>
 
@@ -4960,6 +9004,14 @@ function stripEmptyGroupLines(bodyText) {
             setMemoFontInput={setMemoFontInput}
             memoFontPx={memoFontPx}
             setMemoFontPx={setMemoFontPx}
+            memoTabFontInput={memoTabFontInput}
+            setMemoTabFontInput={setMemoTabFontInput}
+            memoTabFontPx={memoTabFontPx}
+            setMemoTabFontPx={setMemoTabFontPx}
+            memoBodyFontInput={memoBodyFontInput}
+            setMemoBodyFontInput={setMemoBodyFontInput}
+            memoBodyFontPx={memoBodyFontPx}
+            setMemoBodyFontPx={setMemoBodyFontPx}
             calendarFontInput={calendarFontInput}
             setCalendarFontInput={setCalendarFontInput}
             calendarFontPx={calendarFontPx}
@@ -4969,6 +9021,11 @@ function stripEmptyGroupLines(bodyText) {
               setSettingsOpen(false)
               void handleSignOut()
             }}
+            onDeleteAccount={session ? () => {
+              setSettingsOpen(false)
+              void handleDeleteAccount()
+            } : null}
+            deleteAccountLoading={deleteAccountLoading}
             onClose={() => setSettingsOpen(false)}
           />
         )}
@@ -5003,7 +9060,7 @@ function stripEmptyGroupLines(bodyText) {
           style={{
             position: "relative",
             display: "flex",
-            gap: memoInnerCollapsed === "none" ? MEMO_INNER_GAP : 0,
+            gap: 0,
             flex: "1 1 auto",
             height: "100%",
             minHeight: 0
@@ -5126,13 +9183,11 @@ function stripEmptyGroupLines(bodyText) {
                   }}
                 >
                   <MemoReadView
-                    blocks={activeWindowId === "all" ? dashboardBlocks : tabReadBlocks}
+                    blocks={activeWindowId === "all" ? visibleDashboardBlocks : visibleTabReadBlocks}
                     isAll={activeWindowId === "all"}
                     ui={ui}
                     highlightTokens={highlightTokens}
                     todayKey={todayKey}
-                    hoveredReadDateKey={hoveredReadDateKey}
-                    setHoveredReadDateKey={setHoveredReadDateKey}
                     collapsedForActive={collapsedForActive}
                     toggleDashboardCollapse={toggleDashboardCollapse}
                     keyToYMD={keyToYMD}
@@ -5141,6 +9196,17 @@ function stripEmptyGroupLines(bodyText) {
                     setReadBlockRef={setReadBlockRef}
                     handleReadBlockClick={handleReadBlockClick}
                     readScrollMarginTop={READ_SCROLL_MARGIN_TOP}
+                    memoFontPx={memoFontPx}
+                    windowColorByTitle={windowColorByTitle}
+                    showCategoryBadges={activeWindowId === "all"}
+                    recurringItemsByDate={recurringDisplayItemsByDate}
+                    taskItemsByDate={combinedTaskItemsByDate}
+                    onTaskToggle={toggleAnyTask}
+                    onTaskOpen={openAnyTask}
+                    onTaskMove={(item, dateKey, targetIndex) => {
+                      void handlePlanMoveDate(item, dateKey, targetIndex)
+                    }}
+                    onRecurringOpen={openRecurringEdit}
                   />
 
                 </div>
@@ -5168,27 +9234,30 @@ function stripEmptyGroupLines(bodyText) {
                 activeWindowId={activeWindowId}
                 syncCombinedRightText={syncCombinedRightText}
                 ensureRightMemoSectionHeaders={ensureRightMemoSectionHeaders}
+                allMemoGroups={allRightMemoGroups}
+                integratedSelection={integratedRightMemoSelection}
+                onIntegratedSelectionChange={updateIntegratedRightMemoSelection}
+                onOpenMemoDoc={openRightMemoDocFromAll}
+                onSaveMemoDoc={saveRightMemoDocFromAll}
+                onSaveMemoState={saveRightMemoStateFromAll}
+                preferredDocTarget={rightMemoJumpTarget}
+                onPreferredDocHandled={() => setRightMemoJumpTarget(null)}
                 onFocus={() => {
                   setSelectedDateKey(null)
                   lastActiveDateKeyRef.current = null
                 }}
                 onScroll={(e) => syncOverlayScroll(e.currentTarget, rightOverlayInnerRef.current)}
+                ui={{
+                  ...ui,
+                  memoFontPx: memoBodyFontPx,
+                  memoTabFontPx,
+                  memoBodyFontPx,
+                  memoLineHeight: memoTextareaStyle.lineHeight ?? 1.55
+                }}
                 placeholder={
                   activeWindowId === "all"
-                    ? [
-                        "[자유 메모장]",
-                        "통합 탭에서는 모든 메모장들의 메모를 합쳐서 보여줍니다.",
-                        "",
-                        "맨 위(섹션 제목 없이)는 공통 메모로 사용하세요.",
-                        "",
-                        "ex)",
-                        "오늘도 화이팅",
-                        "[대학]",
-                        "권교수님 피드백 다시 한 번 생각하기",
-                        "[연애]",
-                        "100일 이벤트 준비하기"
-                      ].join("\n")
-                    : ["[자유 메모]", "", "해당 메모장에 쓰고 싶은 글을 자유롭게 입력하세요."].join("\n")
+                    ? ""
+                    : "이 메모장에 쓰고 싶은 글을 자유롭게 입력하세요."
                 }
               />
             </div>
@@ -5214,7 +9283,7 @@ function stripEmptyGroupLines(bodyText) {
               userSelect: "none",
               touchAction: "none",
               zIndex: 10,
-              display: memoInnerCollapsed === "none" ? "block" : "none"
+              display: "none"
             }}
           >
             <div
@@ -5251,8 +9320,9 @@ function stripEmptyGroupLines(bodyText) {
       outerCollapsed={outerCollapsed}
       setLayoutPreset={setLayoutPreset}
       pillButton={pillButton}
-      controlInput={controlInput}
-      arrowButton={arrowButton}
+      memoTopRightButton={memoTopRightButton}
+      showSwapButton={showSwapButtonInCalendarPanel}
+      brandLogo={showLogoInCalendarPanel ? <PlannerLogoMark /> : null}
       ui={ui}
       calendarCellH={calendarCellH}
       calendarFontPx={calendarFontPx}
@@ -5268,8 +9338,32 @@ function stripEmptyGroupLines(bodyText) {
       viewMonth={viewMonth}
       openDayList={openDayList}
       handleDayClick={handleDayClick}
+      onItemClick={(item) => openPlanEditModal(item, item?.dateKey ?? "")}
+      onDateAdd={(dateKey) => openPlanCreateModal(dateKey)}
+      onDateRangeAdd={handleCalendarDateRangeCreate}
+      onItemMove={(item, dateKey, targetIndex) => {
+        void handlePlanMoveDate(item, dateKey, targetIndex)
+      }}
+      onTaskToggle={toggleAnyTask}
       calendarInteractingRef={calendarInteractingRef}
       goToday={goToday}
+      onOpenAddPicker={openReadDateCreatePicker}
+      settingsButtonRef={settingsBtnRef}
+      onSettingsToggle={() => setSettingsOpen((v) => !v)}
+      showSettingsButton={!showMemoPanel}
+      showTopActions={showCalendarPanel}
+      calendarViewMode={calendarViewMode}
+      setCalendarViewMode={setCalendarViewMode}
+      timeBlockDateKey={timeBlockDateKey}
+      timeBlockItems={timeBlockItems}
+      onTimeBlockPrevDay={() => shiftTimeBlockDate(-1)}
+      onTimeBlockNextDay={() => shiftTimeBlockDate(1)}
+      onTimeBlockToday={() => selectTimeBlockDate(todayKey)}
+      onTimeBlockAdd={openTimeBlockDate}
+      onTimeBlockOpen={(item) => openPlanEditModal(item, item?.dateKey ?? timeBlockDateKey)}
+      onTimeBlockChange={(item, start, end) => {
+        void handleTimeBlockChange(item, start, end)
+      }}
     />
   )
 
@@ -5301,7 +9395,8 @@ function stripEmptyGroupLines(bodyText) {
           <div style={{ fontWeight: 900, fontSize: 18, marginBottom: 8 }}>Supabase 연결 필요</div>
           <div style={{ color: ui.text2, lineHeight: 1.5 }}>
             Vite 환경변수에 Supabase URL/Key가 설정되어 있지 않습니다. 루트에 `.env` 파일을 만들고
-            `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`를 넣어주세요.
+            `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY`
+            (또는 `VITE_SUPABASE_ANON_KEY`)를 넣어주세요.
           </div>
         </div>
       </div>
@@ -5311,17 +9406,18 @@ function stripEmptyGroupLines(bodyText) {
   const dividerLeft =
     outerCollapsed === "left"
       ? `${OUTER_EDGE_PAD / 2}px`
-      : outerCollapsed === "right"
-        ? `calc(100% - ${OUTER_EDGE_PAD / 2}px)`
-        : isSwapped
-          ? `calc(${(1 - splitRatio) * 100}% - 6px)`
-          : `calc(${splitRatio * 100}% + 6px)`
+        : outerCollapsed === "right"
+          ? `calc(100% - ${OUTER_EDGE_PAD / 2}px)`
+          : isSwapped
+          ? `calc(${(1 - splitRatio) * 100}% - ${OUTER_SPLIT_GAP_PX / 2}px)`
+          : `calc(${splitRatio * 100}% + ${OUTER_SPLIT_GAP_PX / 2}px)`
   const dayListTitle = dayListModal
     ? (() => {
         const { y, m, d } = keyToYMD(dayListModal.key)
         return buildHeaderLine(y, m, d)
       })()
     : ""
+  const dayListIsToday = dayListModal?.key === todayKey
   return (
     <div
       style={{
@@ -5361,7 +9457,7 @@ function stripEmptyGroupLines(bodyText) {
           height: "100%",
           width: "100%",
           minHeight: 0,
-          gap: 12,
+          gap: OUTER_SPLIT_GAP_PX,
           paddingLeft: outerCollapsed === "left" ? OUTER_EDGE_PAD : 0,
           paddingRight: outerCollapsed === "right" ? OUTER_EDGE_PAD : 0
         }}
@@ -5377,6 +9473,54 @@ function stripEmptyGroupLines(bodyText) {
             {showMemoPanel ? memoPanel : null}
           </>
         )}
+
+        {settingsOpen && !showMemoPanel ? (
+          <SettingsPanel
+            settingsPanelRef={settingsPanelRef}
+            ui={ui}
+            panelFontFamily={panelFontFamily}
+            settingsRowStyle={settingsRowStyle}
+            settingsLabelTextStyle={settingsLabelTextStyle}
+            settingsNumberInput={settingsNumberInput}
+            theme={theme}
+            setTheme={setTheme}
+            FONT_MIN={FONT_MIN}
+            FONT_MAX={FONT_MAX}
+            CALENDAR_FONT_MIN={CALENDAR_FONT_MIN}
+            CALENDAR_FONT_MAX={CALENDAR_FONT_MAX}
+            tabFontInput={tabFontInput}
+            setTabFontInput={setTabFontInput}
+            tabFontPx={tabFontPx}
+            setTabFontPx={setTabFontPx}
+            memoFontInput={memoFontInput}
+            setMemoFontInput={setMemoFontInput}
+            memoFontPx={memoFontPx}
+            setMemoFontPx={setMemoFontPx}
+            memoTabFontInput={memoTabFontInput}
+            setMemoTabFontInput={setMemoTabFontInput}
+            memoTabFontPx={memoTabFontPx}
+            setMemoTabFontPx={setMemoTabFontPx}
+            memoBodyFontInput={memoBodyFontInput}
+            setMemoBodyFontInput={setMemoBodyFontInput}
+            memoBodyFontPx={memoBodyFontPx}
+            setMemoBodyFontPx={setMemoBodyFontPx}
+            calendarFontInput={calendarFontInput}
+            setCalendarFontInput={setCalendarFontInput}
+            calendarFontPx={calendarFontPx}
+            setCalendarFontPx={setCalendarFontPx}
+            showLogout={Boolean(session)}
+            onSignOut={() => {
+              setSettingsOpen(false)
+              void handleSignOut()
+            }}
+            onDeleteAccount={session ? () => {
+              setSettingsOpen(false)
+              void handleDeleteAccount()
+            } : null}
+            deleteAccountLoading={deleteAccountLoading}
+            onClose={() => setSettingsOpen(false)}
+          />
+        ) : null}
 
         {/* 바깥 divider (메모/달력) */}
         <div
@@ -5523,12 +9667,42 @@ function stripEmptyGroupLines(bodyText) {
         </div>
       </div>
 
-      <DayListModal
+      <QuickCreateModal
+        open={Boolean(quickCreateModalState)}
+        ui={ui}
+        mode={quickCreateModalState?.mode ?? "task"}
+        editMode={quickCreateModalState?.editMode ?? "create"}
+        sourceItem={quickCreateModalState?.sourceItem ?? null}
+        initialDateKey={quickCreateModalState?.initialDateKey ?? todayKey}
+        initialEndDateKey={quickCreateModalState?.initialEndDateKey ?? quickCreateModalState?.initialDateKey ?? todayKey}
+        initialTime={quickCreateModalState?.initialTime ?? ""}
+        initialRepeat={quickCreateModalState?.initialRepeat ?? "none"}
+        initialRepeatInterval={quickCreateModalState?.initialRepeatInterval ?? 1}
+        initialRepeatDays={quickCreateModalState?.initialRepeatDays ?? []}
+        initialRepeatOpenEnded={Boolean(quickCreateModalState?.initialRepeatOpenEnded)}
+        initialAlarmEnabled={quickCreateModalState?.initialAlarmEnabled ?? true}
+        initialAlarmLeadMinutes={quickCreateModalState?.initialAlarmLeadMinutes ?? 0}
+        defaultCategoryTitle={quickCreateModalState?.defaultCategoryTitle ?? ""}
+        initialContent={quickCreateModalState?.initialContent ?? ""}
+        initialIsTask={quickCreateModalState?.initialIsTask ?? true}
+        initialCompleted={Boolean(quickCreateModalState?.initialCompleted)}
+        showCategory={Boolean(quickCreateModalState?.showCategory)}
+        categoryOptions={planCategoryOptions}
+        onClose={closeQuickCreateModal}
+        onCreate={handleQuickCreate}
+        onDelete={handleQuickDelete}
+        onCompletedChange={setTaskCompletedFromModal}
+      />
+
+        <DayListModal
         open={Boolean(dayListModal)}
         onClose={closeDayListModal}
         readOnly={isScheduleReadOnly}
         ui={ui}
+        highlightTokens={highlightTokens}
+        dayListKey={dayListModal?.key ?? ""}
         dayListTitle={dayListTitle}
+        isToday={dayListIsToday}
         dayListMode={dayListMode}
         setDayListMode={setDayListMode}
         dayListEditText={dayListEditText}
@@ -5537,7 +9711,33 @@ function stripEmptyGroupLines(bodyText) {
         dayListReadItems={dayListReadItems}
         memoFontPx={memoFontPx}
         editableWindows={editableWindows}
+        windowColorByTitle={windowColorByTitle}
+        scopedCategoryTitle={activeWindowId === "all" ? "" : activeRecurringCategoryTitle || ""}
+        recurringItems={dayListRecurringItems}
+        taskItems={dayListTaskItems}
+        onTaskToggle={toggleAnyTask}
+        onTaskOpen={openAnyTask}
+        onRecurringCreate={(kind) => openRecurringCreate(dayListModal?.key, kind)}
+        onRecurringSelect={openRecurringEdit}
+        onRecurringInlineSave={saveRecurringTaskInline}
       />
+
+      {recurringModalState ? (
+        <RecurringRuleModal
+          open
+          ui={ui}
+          editingOccurrence={recurringModalState.mode === "edit" ? recurringModalState.item ?? null : null}
+          initialDateKey={recurringModalState.dateKey ?? ""}
+          defaultCategoryTitle={recurringModalState.defaultCategoryTitle ?? ""}
+          defaultKind={recurringModalState.defaultKind ?? "schedule"}
+          defaultRawLine={recurringModalState.defaultRawLine ?? ""}
+          editableWindows={editableWindows}
+          onClose={closeRecurringModal}
+          onCreate={createRecurringRule}
+          onSave={updateRecurringRuleScoped}
+          onDelete={deleteRecurringRuleScoped}
+        />
+      ) : null}
 
       <DeleteConfirmModal
         deleteConfirm={deleteConfirm}
@@ -5574,117 +9774,264 @@ function stripEmptyGroupLines(bodyText) {
                 ×
               </button>
             </div>
-            <input
-              value={authEmail}
-              onChange={(e) => {
-                const next = e.target.value
-                setAuthEmail(next)
-                if (rememberCredentials && authMode === "signIn") persistCredentials(next, authPassword)
+            <form
+              onSubmit={(e) => {
+                e.preventDefault()
+                handleAuthSubmit()
               }}
-              placeholder="이메일"
-              style={authInputStyle}
-              className="login-modal-input"
-              autoComplete="username"
-            />
-            <input
-              type="password"
-              value={authPassword}
-              onChange={(e) => {
-                const next = e.target.value
-                setAuthPassword(next)
-                if (rememberCredentials && authMode === "signIn") persistCredentials(authEmail, next)
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  e.preventDefault()
+                  closeLoginModal()
+                }
               }}
-              placeholder="비밀번호"
-              style={authInputStyle}
-              className="login-modal-input"
-              autoComplete="current-password"
-            />
-            {authMode === "signIn" && (
-              <label
-                style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: 6,
-                  fontSize: 13,
-                  color: ui.text2,
-                  cursor: "pointer"
+              style={{ display: "flex", flexDirection: "column", gap: 12 }}
+            >
+              <input
+                value={authEmail}
+                onChange={(e) => {
+                  const next = e.target.value
+                  setAuthEmail(next)
+                  if (rememberCredentials && authMode === "signIn") persistCredentials(next)
                 }}
-              >
+                placeholder="아이디 또는 이메일"
+                style={authInputStyle}
+                className="login-modal-input"
+                autoComplete="username"
+              />
+              <input
+                type="password"
+                value={authPassword}
+                onChange={(e) => {
+                  setAuthPassword(e.target.value)
+                }}
+                placeholder={authMode === "signIn" ? "비밀번호" : `비밀번호 (${AUTH_MIN_PASSWORD_LENGTH}자 이상)`}
+                style={authInputStyle}
+                className="login-modal-input"
+                autoComplete={authMode === "signIn" ? "current-password" : "new-password"}
+              />
+              {authMode === "signUp" ? (
                 <input
-                  type="checkbox"
-                  checked={rememberCredentials}
-                  onChange={(e) => {
-                    const next = e.target.checked
-                    setRememberCredentials(next)
-                    if (next) persistCredentials(authEmail, authPassword)
-                    else clearPersistedCredentials()
-                  }}
-                  style={{ width: 14, height: 14 }}
+                  type="password"
+                  value={authPasswordConfirm}
+                  onChange={(e) => setAuthPasswordConfirm(e.target.value)}
+                  placeholder="비밀번호 확인"
+                  style={authInputStyle}
+                  className="login-modal-input"
+                  autoComplete="new-password"
                 />
-                <span>아이디/비번 기억</span>
-              </label>
-            )}
-            <div
-              className="login-mode-tabs"
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 4,
-                padding: 1
-              }}
-            >
-              <button
-                type="button"
-                onClick={() => setAuthMode("signUp")}
-                className="login-mode-tab"
+              ) : null}
+              {authMode === "signUp" ? (
+                <div
+                  style={{
+                    border: `1px solid ${ui.border}`,
+                    background: ui.surface2,
+                    borderRadius: 14,
+                    padding: "12px 12px 10px",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 10
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+                    <div>
+                      <div style={{ fontSize: 13, fontWeight: 900, color: ui.text }}>가입 전 확인</div>
+                      <div style={{ marginTop: 4, fontSize: 12, color: ui.text2, lineHeight: 1.45 }}>
+                        로그인과 일정 동기화를 위해 아이디/이메일과 비밀번호를 사용합니다.
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setSignupDetailsOpen((prev) => !prev)}
+                      style={{
+                        height: 30,
+                        padding: "0 10px",
+                        borderRadius: 10,
+                        border: `1px solid ${ui.border}`,
+                        background: ui.surface,
+                        color: ui.text,
+                        fontWeight: 800,
+                        cursor: "pointer"
+                      }}
+                    >
+                      {signupDetailsOpen ? "닫기" : "자세히"}
+                    </button>
+                  </div>
+                  {signupDetailsOpen ? (
+                    <div
+                      style={{
+                        fontSize: 12,
+                        color: ui.text2,
+                        lineHeight: 1.6,
+                        padding: "10px 12px",
+                        borderRadius: 12,
+                        background: ui.surface
+                      }}
+                    >
+                      수집 항목: 아이디 또는 이메일, 비밀번호
+                      <br />
+                      이용 목적: 로그인, 계정 식별, 일정/메모 동기화
+                      <br />
+                      보관 기간: 회원 탈퇴 시까지
+                      <br />
+                      거부 시 영향: 회원가입 및 동기화 기능을 사용할 수 없습니다.
+                    </div>
+                  ) : null}
+                  <label
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: 8,
+                      fontSize: 13,
+                      color: ui.text,
+                      cursor: "pointer"
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={signupTermsAgreed}
+                      onChange={(e) => setSignupTermsAgreed(e.target.checked)}
+                      style={{ width: 14, height: 14 }}
+                    />
+                    <span>[필수] 이용약관 동의</span>
+                  </label>
+                  <label
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: 8,
+                      fontSize: 13,
+                      color: ui.text,
+                      cursor: "pointer"
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={signupPrivacyAgreed}
+                      onChange={(e) => setSignupPrivacyAgreed(e.target.checked)}
+                      style={{ width: 14, height: 14 }}
+                    />
+                    <span>[필수] 개인정보 수집·이용 동의</span>
+                  </label>
+                  <label
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: 8,
+                      fontSize: 13,
+                      color: ui.text2,
+                      cursor: "pointer"
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={signupUpdatesAgreed}
+                      onChange={(e) => setSignupUpdatesAgreed(e.target.checked)}
+                      style={{ width: 14, height: 14 }}
+                    />
+                    <span>[선택] 업데이트/알림 안내 수신</span>
+                  </label>
+                </div>
+              ) : null}
+              {authMode === "signIn" && (
+                <label
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 6,
+                    fontSize: 13,
+                    color: ui.text2,
+                    cursor: "pointer"
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={rememberCredentials}
+                    onChange={(e) => {
+                      const next = e.target.checked
+                      setRememberCredentials(next)
+                      if (next) persistCredentials(authEmail)
+                      else clearPersistedCredentials()
+                    }}
+                    style={{ width: 14, height: 14 }}
+                  />
+                  <span>아이디 기억</span>
+                </label>
+              )}
+              <div
+                className="login-mode-tabs"
                 style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 4,
+                  padding: 1
+                }}
+              >
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthMode("signUp")
+                    setSignupDetailsOpen(true)
+                  }}
+                  className="login-mode-tab"
+                  style={{
+                    border: "none",
+                    background: "transparent",
+                    color: authMode === "signUp" ? ui.text : ui.text2,
+                    opacity: authMode === "signUp" ? 1 : 0.45,
+                    fontWeight: 700,
+                    cursor: "pointer"
+                  }}
+                >
+                  가입
+                </button>
+                <div style={{ width: 1, height: 18, background: ui.border2, opacity: 0.7 }} />
+                <button
+                  type="button"
+                  onClick={() => setAuthMode("signIn")}
+                  className="login-mode-tab"
+                  style={{
+                    border: "none",
+                    background: "transparent",
+                    color: authMode === "signIn" ? ui.text : ui.text2,
+                    opacity: authMode === "signIn" ? 1 : 0.45,
+                    fontWeight: 700,
+                    cursor: "pointer"
+                  }}
+                >
+                  로그인
+                </button>
+              </div>
+              {authMode === "signUp" ? (
+                <div style={{ color: ui.text2, fontSize: 12, lineHeight: 1.45 }}>
+                  비밀번호는 6자 이상으로 맞춰주세요. 로그인 유지 기능은 비밀번호 저장이 아니라 세션 유지로 동작합니다.
+                </div>
+              ) : null}
+              <button
+                type="submit"
+                disabled={
+                  authLoading ||
+                  !String(authEmail ?? "").trim() ||
+                  !authPassword ||
+                  (authMode === "signUp" && !authPasswordConfirm)
+                }
+                className="login-modal-submit"
+                style={{
+                  height: 44,
+                  borderRadius: 12,
                   border: "none",
-                  background: "transparent",
-                  color: authMode === "signUp" ? ui.text : ui.text2,
-                  opacity: authMode === "signUp" ? 1 : 0.45,
+                  background: ui.accent,
+                  color: "#0b0f16",
                   fontWeight: 800,
                   cursor: "pointer"
                 }}
               >
-                가입
+                {authLoading ? "..." : authMode === "signIn" ? "로그인" : "가입"}
               </button>
-              <div style={{ width: 1, height: 18, background: ui.border2, opacity: 0.7 }} />
-              <button
-                type="button"
-                onClick={() => setAuthMode("signIn")}
-                className="login-mode-tab"
-                style={{
-                  border: "none",
-                  background: "transparent",
-                  color: authMode === "signIn" ? ui.text : ui.text2,
-                  opacity: authMode === "signIn" ? 1 : 0.45,
-                  fontWeight: 800,
-                  cursor: "pointer"
-                }}
-              >
-                로그인
-              </button>
-            </div>
-            <button
-              type="button"
-              onClick={handleAuthSubmit}
-              disabled={authLoading}
-              className="login-modal-submit"
-              style={{
-                height: 44,
-                borderRadius: 12,
-                border: "none",
-                background: ui.accent,
-                color: "#0b0f16",
-                fontWeight: 900,
-                cursor: "pointer"
-              }}
-            >
-              {authLoading ? "..." : authMode === "signIn" ? "로그인" : "가입"}
-            </button>
-            {authMessage ? (
-              <div style={{ color: ui.text2, fontSize: 13 }}>{authMessage}</div>
-            ) : null}
+              {authMessage ? (
+                <div style={{ color: ui.text2, fontSize: 13 }}>{authMessage}</div>
+              ) : null}
+            </form>
           </div>
         </div>
       )}
@@ -5720,10 +10067,10 @@ function stripEmptyGroupLines(bodyText) {
           border-radius: 0;
         }
         .memo-toggle-button.is-left {
-          border-radius: 10px 0 0 10px;
+          border-radius: 6px 0 0 6px;
         }
         .memo-toggle-button.is-right {
-          border-radius: 0 10px 10px 0;
+          border-radius: 0 6px 6px 0;
         }
         .memo-toggle-button.is-left:hover:not(:disabled) {
           box-shadow: inset 0 0 0 2px ${ui.accent};
@@ -5747,9 +10094,84 @@ function stripEmptyGroupLines(bodyText) {
         .calendar-ym-control:hover {
           box-shadow: 0 0 0 1px ${ui.accent}, 0 0 0 3px ${ui.accentSoft};
         }
+        .month-nav-center {
+          transition: border-color 140ms ease, box-shadow 140ms ease, background 140ms ease;
+        }
+        .month-nav-center:hover {
+          border-color: ${ui.border2} !important;
+          box-shadow: 0 1px 0 rgba(15, 23, 42, 0.04), 0 0 0 2px ${theme === "dark" ? "rgba(148, 163, 184, 0.11)" : "rgba(148, 163, 184, 0.13)"} !important;
+        }
+        .month-nav-center:focus-within {
+          border-color: ${ui.accent} !important;
+          box-shadow: 0 1px 0 rgba(15, 23, 42, 0.04), 0 0 0 2px ${ui.accentSoft} !important;
+        }
+        .month-nav-button:hover:not(:disabled) {
+          transform: translateY(-1px);
+          border-color: ${ui.border2} !important;
+          background: ${theme === "dark" ? "rgba(255,255,255,0.05)" : "rgba(15, 23, 42, 0.04)"} !important;
+          color: ${ui.accent} !important;
+          box-shadow: 0 1px 0 rgba(15, 23, 42, 0.04), 0 0 0 2px ${ui.accentSoft} !important;
+        }
+        .month-nav-button:active:not(:disabled) {
+          transform: translateY(0);
+        }
+        .month-nav-year-unit-text,
+        .month-nav-year-arrows {
+          transition: opacity 120ms ease, color 120ms ease;
+        }
+        .month-nav-year-segment:hover .month-nav-year-unit-text,
+        .month-nav-year-segment:focus-within .month-nav-year-unit-text {
+          opacity: 0;
+        }
+        .month-nav-year-segment:hover .month-nav-year-arrows,
+        .month-nav-year-segment:focus-within .month-nav-year-arrows {
+          opacity: 1 !important;
+          pointer-events: auto !important;
+        }
+        .month-nav-year-arrow:hover {
+          color: ${ui.accent} !important;
+        }
+        .month-nav-month-unit-text,
+        .month-nav-month-arrow {
+          transition: opacity 120ms ease, color 120ms ease;
+        }
+        .month-nav-month-segment:hover .month-nav-month-unit-text,
+        .month-nav-month-segment:focus-within .month-nav-month-unit-text {
+          opacity: 0;
+        }
+        .month-nav-month-segment:hover .month-nav-month-arrow,
+        .month-nav-month-segment:focus-within .month-nav-month-arrow {
+          opacity: 1 !important;
+          color: ${ui.text2} !important;
+        }
+        .month-nav-field:focus,
+        .month-nav-select:focus {
+          border-color: transparent !important;
+          box-shadow: none !important;
+        }
+        .month-nav-field:hover,
+        .month-nav-field:focus {
+          color: ${ui.accent} !important;
+        }
+        .month-nav-select,
+        .month-nav-select:hover,
+        .month-nav-select:focus {
+          color: ${ui.text} !important;
+        }
+        .month-nav-select option {
+          color: ${theme === "dark" ? "#e5e7eb" : "#0f172a"};
+          background: ${theme === "dark" ? "#111827" : "#ffffff"};
+        }
+        .month-nav-field::selection {
+          background: ${ui.accentSoft};
+        }
         .memo-input {
           color: transparent;
           caret-color: ${ui.text};
+        }
+        .memo-input:focus {
+          border-color: transparent !important;
+          box-shadow: none !important;
         }
         .memo-input::placeholder {
           color: ${ui.text2};
@@ -5768,8 +10190,12 @@ function stripEmptyGroupLines(bodyText) {
         .tab-pill {
           transition: transform 120ms ease, box-shadow 120ms ease;
         }
-        .tab-pill:hover {
+        .tab-pill:not(.is-active):hover {
           transform: translateY(-0.5px);
+          box-shadow: inset 0 0 0 2px ${ui.accentSoft};
+        }
+        .tab-pill.is-active:hover {
+          transform: none;
           box-shadow: inset 0 0 0 2px ${ui.accentSoft};
         }
         .arrow-button {
@@ -5824,8 +10250,25 @@ function stripEmptyGroupLines(bodyText) {
           pointer-events: auto;
         }
         .calendar-day-cell:hover {
-          outline: 2px solid ${theme === "dark" ? "rgba(148, 197, 255, 0.7)" : "rgba(37, 99, 235, 0.35)"};
-          outline-offset: -2px;
+          outline: none;
+          background: ${theme === "dark" ? "rgba(96, 165, 250, 0.08)" : "linear-gradient(180deg, rgba(239, 246, 255, 0.78), rgba(255, 255, 255, 0.86))"} !important;
+          box-shadow: inset 0 0 0 1px ${theme === "dark" ? "rgba(147, 197, 253, 0.30)" : "rgba(59, 130, 246, 0.18)"}, 0 8px 20px ${theme === "dark" ? "rgba(0, 0, 0, 0.14)" : "rgba(15, 23, 42, 0.05)"} !important;
+        }
+        .calendar-task-item {
+          transition: background 120ms ease, box-shadow 120ms ease, opacity 120ms ease;
+        }
+        .calendar-task-item:hover:not(:disabled) {
+          background: ${theme === "dark" ? "rgba(255, 255, 255, 0.06)" : "rgba(59, 130, 246, 0.07)"} !important;
+          box-shadow: inset 2px 0 0 ${theme === "dark" ? "rgba(147, 197, 253, 0.65)" : "rgba(37, 99, 235, 0.38)"};
+          transform: none;
+          filter: none;
+        }
+        .calendar-add-chip:hover:not(:disabled) {
+          background: ${ui.surface2} !important;
+          border-color: ${ui.border2} !important;
+          box-shadow: 0 0 0 2px ${ui.accentSoft};
+          transform: none;
+          filter: none;
         }
         .outer-divider__buttons {
           position: absolute;
@@ -5926,4 +10369,3 @@ function stripEmptyGroupLines(bodyText) {
 }
 
 export default App
-
