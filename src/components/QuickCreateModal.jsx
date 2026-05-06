@@ -11,6 +11,7 @@ const ALARM_LEAD_OPTIONS = [
   { key: 10, label: "10분 전" },
   { key: 30, label: "30분 전" }
 ]
+const TIME_MINUTE_STEP = 5
 
 function parseHexColor(value) {
   const raw = String(value ?? "").trim().replace("#", "")
@@ -169,6 +170,16 @@ function SelectChevron({ ui }) {
   )
 }
 
+function CalendarIcon({ ui }) {
+  return (
+    <svg width="17" height="17" viewBox="0 0 20 20" aria-hidden="true" focusable="false" style={{ color: ui.text2, flexShrink: 0 }}>
+      <rect x="4.2" y="4.7" width="11.6" height="11" rx="1.8" fill="none" stroke="currentColor" strokeWidth="1.55" />
+      <path d="M6.8 3.7v2.2M13.2 3.7v2.2M4.7 8h10.6" fill="none" stroke="currentColor" strokeWidth="1.55" strokeLinecap="round" />
+      <path d="M7.1 10.3h1.1M9.45 10.3h1.1M11.8 10.3h1.1M7.1 12.7h1.1M9.45 12.7h1.1" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+    </svg>
+  )
+}
+
 function buildSelectFieldStyle(fieldStyle, extra = {}) {
   return {
     ...fieldStyle,
@@ -199,10 +210,15 @@ function buildTimeFromParts(currentValue, patch = {}) {
   const current = parseTimeParts(currentValue)
   const nextPeriod = patch.period ?? current.period
   const nextHour12 = Math.max(1, Math.min(12, Number(patch.hour12 ?? current.hour12) || current.hour12))
-  const nextMinute = Math.max(0, Math.min(59, Number(patch.minute ?? current.minute) || 0))
+  const nextMinute = snapMinuteToStep(patch.minute ?? current.minute)
   let hour24 = nextHour12 % 12
   if (nextPeriod === "pm") hour24 += 12
   return `${String(hour24).padStart(2, "0")}:${String(nextMinute).padStart(2, "0")}`
+}
+
+function snapMinuteToStep(value) {
+  const minute = Math.max(0, Math.min(59, Number(value) || 0))
+  return Math.min(55, Math.round(minute / TIME_MINUTE_STEP) * TIME_MINUTE_STEP)
 }
 
 function formatModalTimeLabel(value) {
@@ -316,7 +332,28 @@ function TimePickerPanel({ value, defaultValue, ui, palette, onClose, onChange, 
   const pickerValue = normalizedValue || normalizeTimeInput(defaultValue) || "09:00"
   const current = parseTimeParts(pickerValue)
   const hourOptions = useMemo(() => Array.from({ length: 12 }, (_, index) => index + 1), [])
-  const minuteOptions = useMemo(() => Array.from({ length: 60 }, (_, index) => index), [])
+  const minuteOptions = useMemo(() => Array.from({ length: 12 }, (_, index) => index * TIME_MINUTE_STEP), [])
+  const selectedMinute = snapMinuteToStep(current.minute)
+  const hourListRef = useRef(null)
+  const minuteListRef = useRef(null)
+  const hourActiveRef = useRef(null)
+  const minuteActiveRef = useRef(null)
+
+  useEffect(() => {
+    const centerActiveOption = (list, option) => {
+      if (!list || !option) return
+      const listRect = list.getBoundingClientRect()
+      const optionRect = option.getBoundingClientRect()
+      const optionTop = optionRect.top - listRect.top + list.scrollTop
+      list.scrollTop = optionTop - (list.clientHeight - optionRect.height) / 2
+    }
+
+    const frame = window.requestAnimationFrame(() => {
+      centerActiveOption(hourListRef.current, hourActiveRef.current)
+      centerActiveOption(minuteListRef.current, minuteActiveRef.current)
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [current.hour12, selectedMinute])
 
   function applyTimePatch(patch) {
     const next = buildTimeFromParts(pickerValue, patch)
@@ -328,74 +365,103 @@ function TimePickerPanel({ value, defaultValue, ui, palette, onClose, onChange, 
       className="plan-time-picker-panel"
       onClick={(event) => event.stopPropagation()}
       style={{
-        borderRadius: 14,
+        borderRadius: 16,
         border: `1px solid ${ui.border}`,
         background: palette.optionBg,
-        boxShadow: palette.dark ? "0 14px 32px rgba(0,0,0,0.30)" : "0 12px 28px rgba(15,23,42,0.12)",
-        padding: 8
+        boxShadow: palette.dark ? "0 16px 34px rgba(0,0,0,0.32)" : "0 14px 30px rgba(15,23,42,0.12)",
+        padding: 12
       }}
     >
+      <div
+        className="plan-time-period-segment"
+        style={{
+          display: "grid",
+          gridTemplateColumns: "1fr 1fr",
+          gap: 3,
+          width: 168,
+          height: 38,
+          padding: 3,
+          borderRadius: 12,
+          border: `1px solid ${ui.border}`,
+          background: palette.chipBg,
+          boxSizing: "border-box",
+          marginBottom: 11
+        }}
+      >
+        {[
+          ["am", "오전"],
+          ["pm", "오후"]
+        ].map(([period, text]) => {
+          const active = current.period === period
+          return (
+            <button
+              key={`period-${period}`}
+              type="button"
+              className={`plan-time-option plan-time-period-tab ${active ? "is-active" : ""}`}
+              onClick={() => applyTimePatch({ period })}
+              onMouseDown={(event) => event.preventDefault()}
+              style={{
+                height: 30,
+                borderRadius: 9,
+                border: "1px solid transparent",
+                background: active ? ui.accent : "transparent",
+                color: active ? getReadableTextOnColor(ui.accent) : ui.text2,
+                outline: "none",
+                fontFamily: "inherit",
+                fontSize: 13,
+                fontWeight: 780,
+                cursor: "pointer"
+              }}
+            >
+              {text}
+            </button>
+          )
+        })}
+      </div>
+
             <div
               className="plan-time-picker-grid"
               style={{
                 display: "grid",
-                gridTemplateColumns: "72px minmax(0, 1fr) minmax(0, 1fr)",
-                gap: 7,
+                gridTemplateColumns: "minmax(0, 1fr) 22px minmax(0, 1fr)",
+                gap: 8,
                 alignItems: "stretch"
               }}
             >
-              <div style={{ display: "flex", flexDirection: "column", gap: 5, alignSelf: "start", paddingTop: 20 }}>
-                {[
-                  ["am", "오전"],
-                  ["pm", "오후"]
-                ].map(([period, text]) => {
-                  const active = current.period === period
-                  return (
-                    <button
-                      key={`period-${period}`}
-                      type="button"
-                      className={`plan-time-option plan-time-period-option ${active ? "is-active" : ""}`}
-                      onClick={() => applyTimePatch({ period })}
-                      style={{
-                        height: 34,
-                          borderRadius: 9,
-                          border: `1px solid ${active ? ui.accent : ui.border}`,
-                          background: active ? ui.accentSoft : palette.chipBg,
-                        color: active ? ui.accent : ui.text2,
-                        outline: "none",
-                        fontFamily: "inherit",
-                        fontSize: 13,
-                        fontWeight: 780,
-                        cursor: "pointer"
-                      }}
-                    >
-                      {text}
-                    </button>
-                  )
-                })}
-              </div>
-
               <div>
-                <div style={{ marginBottom: 4, fontSize: 11, fontWeight: 780, color: ui.text2 }}>시</div>
-                <div className="plan-time-scroll-list" style={{ maxHeight: 148, overflowY: "auto", paddingRight: 3 }}>
-                  <div style={{ display: "grid", gap: 5 }}>
+                <div style={{ marginBottom: 5, textAlign: "center", fontSize: 11, fontWeight: 780, color: ui.text2 }}>시</div>
+                <div
+                  className="plan-time-scroll-list"
+                  ref={hourListRef}
+                  style={{
+                    maxHeight: 136,
+                    overflowY: "auto",
+                    padding: "0 4px",
+                    borderRadius: 14,
+                    border: `1px solid ${ui.border}`,
+                    background: palette.dark ? "rgba(255, 255, 255, 0.035)" : "rgba(248, 250, 252, 0.58)"
+                  }}
+                >
+                  <div style={{ display: "grid", gap: 4, padding: "52px 0" }}>
                   {hourOptions.map((hour) => {
                     const active = current.hour12 === hour
                     return (
                       <button
                         key={`hour-${hour}`}
+                        ref={active ? hourActiveRef : null}
                         type="button"
-                        className={`plan-time-option ${active ? "is-active" : ""}`}
+                        className={`plan-time-option plan-time-wheel-option ${active ? "is-active" : ""}`}
                         onClick={() => applyTimePatch({ hour12: hour })}
+                        onMouseDown={(event) => event.preventDefault()}
                         style={{
-                          height: 29,
-                          borderRadius: 8,
-                          border: `1px solid ${active ? ui.accent : ui.border}`,
-                          background: active ? ui.accent : palette.chipBg,
+                          height: 31,
+                          borderRadius: 10,
+                          border: "1px solid transparent",
+                          background: active ? ui.accent : "transparent",
                           color: active ? getReadableTextOnColor(ui.accent) : ui.text,
                           outline: "none",
                           fontFamily: "inherit",
-                          fontSize: 13,
+                          fontSize: 14,
                           fontWeight: 780,
                           cursor: "pointer"
                         }}
@@ -408,27 +474,54 @@ function TimePickerPanel({ value, defaultValue, ui, palette, onClose, onChange, 
                 </div>
               </div>
 
+              <div
+                aria-hidden="true"
+                style={{
+                  paddingTop: 72,
+                  textAlign: "center",
+                  color: ui.text2,
+                  fontSize: 18,
+                  fontWeight: 820,
+                  lineHeight: 1
+                }}
+              >
+                :
+              </div>
+
               <div>
-                <div style={{ marginBottom: 4, fontSize: 11, fontWeight: 780, color: ui.text2 }}>분</div>
-                <div className="plan-time-scroll-list" style={{ maxHeight: 148, overflowY: "auto", paddingRight: 3 }}>
-                  <div style={{ display: "grid", gap: 5 }}>
+                <div style={{ marginBottom: 5, textAlign: "center", fontSize: 11, fontWeight: 780, color: ui.text2 }}>분</div>
+                <div
+                  className="plan-time-scroll-list"
+                  ref={minuteListRef}
+                  style={{
+                    maxHeight: 136,
+                    overflowY: "auto",
+                    padding: "0 4px",
+                    borderRadius: 14,
+                    border: `1px solid ${ui.border}`,
+                    background: palette.dark ? "rgba(255, 255, 255, 0.035)" : "rgba(248, 250, 252, 0.58)"
+                  }}
+                >
+                  <div style={{ display: "grid", gap: 4, padding: "52px 0" }}>
                   {minuteOptions.map((minute) => {
-                    const active = current.minute === minute
+                    const active = selectedMinute === minute
                     return (
                       <button
                         key={`minute-${minute}`}
+                        ref={active ? minuteActiveRef : null}
                         type="button"
-                        className={`plan-time-option ${active ? "is-active" : ""}`}
+                        className={`plan-time-option plan-time-wheel-option ${active ? "is-active" : ""}`}
                         onClick={() => applyTimePatch({ minute })}
+                        onMouseDown={(event) => event.preventDefault()}
                         style={{
-                          height: 29,
-                          borderRadius: 8,
-                          border: `1px solid ${active ? ui.accent : ui.border}`,
-                          background: active ? ui.accent : palette.chipBg,
+                          height: 31,
+                          borderRadius: 10,
+                          border: "1px solid transparent",
+                          background: active ? ui.accent : "transparent",
                           color: active ? getReadableTextOnColor(ui.accent) : ui.text,
                           outline: "none",
                           fontFamily: "inherit",
-                          fontSize: 13,
+                          fontSize: 14,
                           fontWeight: 780,
                           cursor: "pointer"
                         }}
@@ -515,6 +608,9 @@ function QuickCreateModalBody({
   onDelete
 }) {
   const contentInputRef = useRef(null)
+  const startDateInputRef = useRef(null)
+  const endDateInputRef = useRef(null)
+  const categoryMenuRef = useRef(null)
   const initialDateValue = String(initialDateKey ?? "").trim()
   const initialRepeatValue = String(initialRepeat ?? "none").trim() || "none"
   const initialEndDateValue = String(initialEndDateKey ?? "").trim()
@@ -542,6 +638,7 @@ function QuickCreateModalBody({
   const [alarmLeadMinutes, setAlarmLeadMinutes] = useState(normalizeAlarmLeadMinutes(initialAlarmLeadMinutes))
   const [error, setError] = useState("")
   const [openTimePicker, setOpenTimePicker] = useState(null)
+  const [openCategoryMenu, setOpenCategoryMenu] = useState(false)
 
   useEffect(() => {
     const timeoutId = window.setTimeout(() => {
@@ -572,10 +669,22 @@ function QuickCreateModalBody({
   const isEditing = editMode === "edit"
   const selectedCategoryOption = options.find((option) => option.value === categoryTitle)
   const selectedCategoryColor = String(selectedCategoryOption?.color ?? "").trim()
+  const selectedCategoryLabel = String(selectedCategoryOption?.title ?? "없음").trim() || "없음"
+  const selectedCategoryDotColor = selectedCategoryColor || (palette.dark ? "rgba(148, 163, 184, 0.78)" : "#94a3b8")
   const isRepeatNone = repeat === "none"
   const hasStartTime = Boolean(normalizeTimeInput(startTime))
   const hasEndDate = Boolean(String(endDateKey ?? "").trim())
   const hasRepeatSettings = endDateOpenEnded || hasEndDate
+
+  useEffect(() => {
+    if (!openCategoryMenu) return undefined
+    const handlePointerDown = (event) => {
+      if (categoryMenuRef.current?.contains?.(event.target)) return
+      setOpenCategoryMenu(false)
+    }
+    document.addEventListener("pointerdown", handlePointerDown)
+    return () => document.removeEventListener("pointerdown", handlePointerDown)
+  }, [openCategoryMenu])
 
   useEffect(() => {
     if (repeat === "none") return
@@ -603,6 +712,19 @@ function QuickCreateModalBody({
       }
       return normalizeRepeatDays([...current, dayIndex])
     })
+  }
+
+  function openDatePicker(inputRef) {
+    const input = inputRef?.current
+    if (!input) return
+    input.focus?.({ preventScroll: true })
+    try {
+      if (typeof input.showPicker === "function") {
+        input.showPicker()
+      }
+    } catch {
+      // Some browsers only allow showPicker during direct user gestures.
+    }
   }
 
   function handleSubmit() {
@@ -753,19 +875,35 @@ function QuickCreateModalBody({
           color: ${ui.accent} !important;
           box-shadow: none;
         }
+        .plan-settings-modal .plan-time-period-tab:hover:not(.is-active),
+        .plan-settings-modal .plan-time-wheel-option:hover:not(.is-active) {
+          border-color: transparent !important;
+          background: ${palette.dark ? "rgba(255, 255, 255, 0.075)" : "rgba(226, 232, 240, 0.64)"} !important;
+          color: ${ui.text} !important;
+          box-shadow: none !important;
+          transform: none !important;
+        }
+        .plan-settings-modal .plan-time-period-tab.is-active,
+        .plan-settings-modal .plan-time-period-tab.is-active:hover {
+          border-color: transparent !important;
+          background: ${ui.accent} !important;
+          color: ${getReadableTextOnColor(ui.accent)} !important;
+          box-shadow: ${palette.dark ? "0 5px 12px rgba(0, 0, 0, 0.24)" : "0 5px 12px rgba(37, 99, 235, 0.16)"} !important;
+          transform: none !important;
+        }
+        .plan-settings-modal .plan-time-wheel-option.is-active,
+        .plan-settings-modal .plan-time-wheel-option.is-active:hover {
+          border-color: transparent !important;
+          background: ${ui.accent} !important;
+          color: ${getReadableTextOnColor(ui.accent)} !important;
+          box-shadow: ${palette.dark ? "0 7px 14px rgba(0, 0, 0, 0.26)" : "0 7px 14px rgba(37, 99, 235, 0.18)"} !important;
+          transform: none !important;
+        }
         .plan-settings-modal .plan-time-scroll-list {
-          scrollbar-width: thin;
-          scrollbar-color: ${palette.dark ? "rgba(148, 163, 184, 0.52)" : "rgba(100, 116, 139, 0.38)"} transparent;
+          scrollbar-width: none;
         }
         .plan-settings-modal .plan-time-scroll-list::-webkit-scrollbar {
-          width: 6px;
-        }
-        .plan-settings-modal .plan-time-scroll-list::-webkit-scrollbar-track {
-          background: transparent;
-        }
-        .plan-settings-modal .plan-time-scroll-list::-webkit-scrollbar-thumb {
-          background: ${palette.dark ? "rgba(148, 163, 184, 0.52)" : "rgba(100, 116, 139, 0.38)"};
-          border-radius: 999px;
+          display: none;
         }
         @media (max-width: 560px) {
           .plan-settings-modal .plan-time-fields-grid {
@@ -800,49 +938,115 @@ function QuickCreateModalBody({
       >
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
           {showCategory ? (
-            <div style={{ position: "relative", flex: "1 1 auto", maxWidth: 300 }}>
-              {selectedCategoryColor ? (
+            <div ref={categoryMenuRef} style={{ position: "relative", flex: "0 0 auto", maxWidth: "calc(100vw - 116px)" }}>
+              <button
+                type="button"
+                onClick={() => setOpenCategoryMenu((prev) => !prev)}
+                style={{
+                  height: 34,
+                  maxWidth: 176,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 8,
+                  border: "none",
+                  background: "transparent",
+                  color: ui.text,
+                  padding: "0 6px",
+                  borderRadius: 8,
+                  fontFamily: "inherit",
+                  cursor: "pointer",
+                  outline: "none"
+                }}
+                aria-haspopup="listbox"
+                aria-expanded={openCategoryMenu}
+                aria-label="탭 선택"
+              >
                 <span
                   aria-hidden="true"
                   style={{
-                    position: "absolute",
-                    left: 12,
-                    top: "50%",
-                    transform: "translateY(-50%)",
                     width: 9,
                     height: 9,
                     borderRadius: 999,
-                    background: selectedCategoryColor,
-                    zIndex: 1,
-                    pointerEvents: "none"
+                    background: selectedCategoryDotColor,
+                    flexShrink: 0
                   }}
                 />
-              ) : null}
-              <select
-                className="plan-setting-field"
-                value={categoryTitle}
-                onChange={(event) => setCategoryTitle(String(event.target.value ?? "").trim())}
-                style={buildSelectFieldStyle(
-                  {
-                    ...fieldStyle,
-                    minHeight: 42,
-                    height: 42,
-                    borderRadius: 11,
-                    background: palette.controlBg,
+                <span
+                  style={{
+                    minWidth: 0,
+                    maxWidth: 112,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
                     fontSize: 16,
                     fontWeight: 760
-                  },
-                  { paddingLeft: selectedCategoryColor ? 30 : 13 }
-                )}
-                aria-label="탭 선택"
-              >
-                {options.map((option) => (
-                  <option key={option.id} value={option.value}>
-                    {option.title}
-                  </option>
-                ))}
-              </select>
-              <SelectChevron ui={ui} />
+                  }}
+                >
+                  {selectedCategoryLabel}
+                </span>
+                <span aria-hidden="true" style={{ color: ui.text2, fontSize: 11, fontWeight: 780, lineHeight: 1 }}>
+                  ▼
+                </span>
+              </button>
+              {openCategoryMenu ? (
+                <div
+                  role="listbox"
+                  style={{
+                    position: "absolute",
+                    left: 0,
+                    top: 38,
+                    zIndex: 20,
+                    width: 168,
+                    maxHeight: 242,
+                    overflowY: "auto",
+                    padding: 6,
+                    borderRadius: 12,
+                    border: `1px solid ${ui.border}`,
+                    background: palette.optionBg,
+                    boxShadow: palette.dark ? "0 16px 32px rgba(0, 0, 0, 0.36)" : "0 16px 32px rgba(15, 23, 42, 0.14)"
+                  }}
+                >
+                  {options.map((option) => {
+                    const active = option.value === categoryTitle
+                    const optionColor = String(option?.color ?? "").trim() || (palette.dark ? "rgba(148, 163, 184, 0.78)" : "#94a3b8")
+                    return (
+                      <button
+                        key={option.id}
+                        type="button"
+                        role="option"
+                        aria-selected={active}
+                        onClick={() => {
+                          setCategoryTitle(String(option.value ?? "").trim())
+                          setOpenCategoryMenu(false)
+                        }}
+                        style={{
+                          width: "100%",
+                          height: 34,
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 8,
+                          border: "none",
+                          borderRadius: 9,
+                          background: active ? ui.accentSoft : "transparent",
+                          color: active ? ui.accent : ui.text,
+                          padding: "0 9px",
+                          fontFamily: "inherit",
+                          fontSize: 14,
+                          fontWeight: 760,
+                          textAlign: "left",
+                          cursor: "pointer"
+                        }}
+                      >
+                        <span aria-hidden="true" style={{ width: 8, height: 8, borderRadius: 999, background: optionColor, flexShrink: 0 }} />
+                        <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>
+                          {option.title}
+                        </span>
+                        {active ? <span aria-hidden="true" style={{ fontSize: 13, fontWeight: 900 }}>✓</span> : null}
+                      </button>
+                    )
+                  })}
+                </div>
+              ) : null}
             </div>
           ) : (
             <div style={{ fontSize: 20, lineHeight: 1.2, fontWeight: 760, letterSpacing: 0 }}>계획 설정</div>
@@ -872,7 +1076,6 @@ function QuickCreateModalBody({
         </div>
 
         <label style={{ order: 1, display: "flex", flexDirection: "column", gap: 8 }}>
-          <span style={labelStyle}>내용</span>
           <textarea
             className="plan-setting-field"
             ref={contentInputRef}
@@ -881,23 +1084,23 @@ function QuickCreateModalBody({
             placeholder="무엇을 할까요?"
             style={{
               ...fieldStyle,
-              minHeight: 112,
-              padding: "14px 16px",
+              minHeight: 156,
+              padding: "16px 18px",
               resize: "vertical",
               lineHeight: 1.5,
-              fontSize: 17,
+              fontSize: 19,
               fontWeight: 640
             }}
           />
         </label>
 
         <div style={{ order: 2, display: "flex", flexDirection: "column", gap: 8 }}>
-          <span style={labelStyle}>일정</span>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 10 }}>
-            <input
-              className="plan-setting-field"
-              type="date"
-              value={dateKey}
+            <div style={{ position: "relative" }}>
+              <input
+                ref={startDateInputRef}
+                type="date"
+                value={dateKey}
                 onChange={(event) => {
                   const next = String(event.target.value ?? "").trim()
                   setDateKey(next)
@@ -907,12 +1110,41 @@ function QuickCreateModalBody({
                     return !current || current < next ? next : current
                   })
                 }}
-              style={fieldStyle}
-              aria-label="시작일"
-            />
+                tabIndex={-1}
+                aria-hidden="true"
+                style={{
+                  position: "absolute",
+                  inset: 0,
+                  width: "100%",
+                  height: "100%",
+                  opacity: 0,
+                  pointerEvents: "none"
+                }}
+              />
+              <button
+                type="button"
+                className="plan-setting-field plan-date-display-field"
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => openDatePicker(startDateInputRef)}
+                style={{
+                  ...fieldStyle,
+                  minHeight: 58,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 10,
+                  textAlign: "left",
+                  cursor: "pointer"
+                }}
+                aria-label="시작일"
+              >
+                <span>{dateKey || "날짜 선택"}</span>
+                <CalendarIcon ui={ui} />
+              </button>
+            </div>
             <div style={{ position: "relative" }}>
               <input
-                className="plan-setting-field"
+                ref={endDateInputRef}
                 type="date"
                 value={endDateOpenEnded ? "" : endDateKey}
                 min={dateKey || undefined}
@@ -930,93 +1162,108 @@ function QuickCreateModalBody({
                     setRepeatInterval(1)
                   }
                 }}
+                tabIndex={-1}
+                aria-hidden="true"
+                style={{
+                  position: "absolute",
+                  inset: 0,
+                  width: "100%",
+                  height: "100%",
+                  opacity: 0,
+                  pointerEvents: "none"
+                }}
+              />
+              <button
+                type="button"
+                className="plan-setting-field plan-date-display-field"
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => openDatePicker(endDateInputRef)}
                 style={{
                   ...fieldStyle,
                   width: "100%",
-                  paddingRight: 126,
-                  color: endDateOpenEnded ? "transparent" : hasEndDate ? ui.text : palette.fieldDisabledText
-                }}
-                aria-label="마감일"
-              />
-              {endDateOpenEnded ? (
-                <span
-                  aria-hidden="true"
-                  style={{
-                    position: "absolute",
-                    left: 13,
-                    top: "50%",
-                    transform: "translateY(-50%)",
-                    color: ui.text,
-                    fontSize: 15,
-                    fontWeight: 700,
-                    pointerEvents: "none"
-                  }}
-                >
-                  계속 반복
-                </span>
-              ) : null}
-              <button
-                type="button"
-                onClick={() => {
-                  setEndDateOpenEnded(true)
-                  setEndDateKey("")
-                  if (repeat === "none") {
-                    setRepeat("daily")
-                    setRepeatInterval(1)
-                  }
-                }}
-                style={{
-                  position: "absolute",
-                  right: 65,
-                  top: "50%",
-                  transform: "translateY(-50%)",
-                  height: 28,
-                  padding: "0 11px",
-                  borderRadius: 999,
-                  border: `1px solid ${endDateOpenEnded ? ui.accent : ui.border}`,
-                  background: endDateOpenEnded ? ui.accentSoft : palette.chipBg,
-                  color: endDateOpenEnded ? ui.accent : ui.text2,
-                  fontFamily: "inherit",
-                  fontSize: 12,
-                  fontWeight: 720,
+                  minHeight: 58,
+                  paddingRight: 132,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 10,
+                  color: endDateOpenEnded || hasEndDate ? ui.text : palette.fieldDisabledText,
+                  textAlign: "left",
                   cursor: "pointer"
                 }}
+                aria-label="마감일"
               >
-                계속
+                <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {endDateOpenEnded ? "계속 반복" : hasEndDate ? endDateKey : "종료일 없음"}
+                </span>
+                <CalendarIcon ui={ui} />
               </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setEndDateOpenEnded(false)
-                  setEndDateKey("")
-                  setRepeat("none")
-                  setRepeatInterval(1)
-                }}
+              <div
                 style={{
                   position: "absolute",
-                  right: 9,
+                  right: 10,
                   top: "50%",
                   transform: "translateY(-50%)",
-                  height: 28,
-                  padding: "0 11px",
-                  borderRadius: 999,
-                  border: `1px solid ${ui.border}`,
-                  background: palette.chipBg,
-                  color: hasRepeatSettings ? ui.text2 : palette.fieldDisabledText,
-                  fontFamily: "inherit",
-                  fontSize: 12,
-                  fontWeight: 720,
-                  cursor: hasRepeatSettings ? "pointer" : "default"
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 7,
+                  zIndex: 2
                 }}
               >
-                없음
-              </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEndDateOpenEnded(true)
+                    setEndDateKey("")
+                    if (repeat === "none") {
+                      setRepeat("daily")
+                      setRepeatInterval(1)
+                    }
+                  }}
+                  style={{
+                    height: 28,
+                    padding: "0 11px",
+                    borderRadius: 999,
+                    border: `1px solid ${endDateOpenEnded ? ui.accent : ui.border}`,
+                    background: endDateOpenEnded ? ui.accentSoft : palette.chipBg,
+                    color: endDateOpenEnded ? ui.accent : ui.text2,
+                    fontFamily: "inherit",
+                    fontSize: 12,
+                    fontWeight: 720,
+                    cursor: "pointer"
+                  }}
+                >
+                  계속
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEndDateOpenEnded(false)
+                    setEndDateKey("")
+                    setRepeat("none")
+                    setRepeatInterval(1)
+                  }}
+                  style={{
+                    height: 28,
+                    padding: "0 11px",
+                    borderRadius: 999,
+                    border: `1px solid ${ui.border}`,
+                    background: palette.chipBg,
+                    color: hasRepeatSettings ? ui.text2 : palette.fieldDisabledText,
+                    fontFamily: "inherit",
+                    fontSize: 12,
+                    fontWeight: 720,
+                    cursor: hasRepeatSettings ? "pointer" : "default"
+                  }}
+                >
+                  없음
+                </button>
+              </div>
             </div>
           </div>
         </div>
 
         <div style={{ order: 4, display: "flex", flexDirection: "column", gap: 10 }}>
-          <span style={labelStyle}>시간</span>
           {hasStartTime ? (
             <div
               className="plan-time-fields-grid"
@@ -1120,7 +1367,6 @@ function QuickCreateModalBody({
 
         {hasStartTime ? (
         <div style={{ order: 5, display: "flex", flexDirection: "column", gap: 8 }}>
-          <span style={labelStyle}>알림</span>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8, opacity: hasStartTime ? 1 : 0.58 }}>
             <button
               type="button"

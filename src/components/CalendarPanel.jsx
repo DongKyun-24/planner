@@ -1,6 +1,6 @@
 ﻿import { dayOfWeek } from "../utils/dateUtils"
 import { getHolidayName } from "../utils/holiday"
-import { useEffect, useRef, useState } from "react"
+import { Fragment, useEffect, useRef, useState } from "react"
 import MonthNavigator from "./MonthNavigator"
 
 const TASK_RING_BLUE = "#3b82f6"
@@ -136,6 +136,73 @@ function getPlannerMoveBlockedMessage(item) {
   return "이 항목은 드래그로 이동할 수 없어요."
 }
 
+function getPlannerItemDragKey(item) {
+  return String(item?.id ?? item?.rowId ?? item?.row?.id ?? item?.rawLine ?? "").trim()
+}
+
+function CalendarDropIndicator({ color, dark }) {
+  const dotColor = colorWithAlpha(color, dark ? 0.95 : 0.86)
+  const lineColor = colorWithAlpha(color, dark ? 0.82 : 0.72)
+  const lineEndColor = colorWithAlpha(color, dark ? 0.34 : 0.22)
+  return (
+    <div
+      aria-hidden="true"
+      style={{
+        height: 10,
+        display: "flex",
+        alignItems: "center",
+        padding: "0 4px 0 1px",
+        pointerEvents: "none"
+      }}
+    >
+      <div
+        style={{
+          width: "100%",
+          display: "flex",
+          alignItems: "center",
+          gap: 4
+        }}
+      >
+        <span
+          style={{
+            width: 6,
+            height: 6,
+            borderRadius: 999,
+            background: dotColor,
+            boxShadow: dark ? "0 0 0 2px rgba(96, 165, 250, 0.14)" : "0 0 0 2px rgba(37, 99, 235, 0.10)",
+            flexShrink: 0
+          }}
+        />
+        <span
+          style={{
+            flex: 1,
+            height: 2,
+            borderRadius: 999,
+            background: `linear-gradient(90deg, ${lineColor} 0%, ${lineColor} 58%, ${lineEndColor} 100%)`,
+            boxShadow: dark ? "0 0 8px rgba(96, 165, 250, 0.18)" : "0 0 8px rgba(37, 99, 235, 0.12)"
+          }}
+        />
+      </div>
+    </div>
+  )
+}
+
+function getDropIndexFromCellEvent(event, itemCount) {
+  const count = Math.max(0, Number(itemCount) || 0)
+  if (count <= 0) return null
+  const cell = event.currentTarget
+  const nodes = Array.from(cell?.querySelectorAll?.('[data-calendar-task-item="true"]') ?? [])
+  if (nodes.length === 0) return null
+  const y = Number(event.clientY)
+  if (!Number.isFinite(y)) return null
+  for (let index = 0; index < nodes.length; index += 1) {
+    const rect = nodes[index]?.getBoundingClientRect?.()
+    if (!rect) continue
+    if (y < rect.top + rect.height / 2) return index
+  }
+  return Math.min(count, nodes.length)
+}
+
 export default function CalendarPanel({
   calendarPanelRef,
   calendarTopRef,
@@ -180,6 +247,7 @@ export default function CalendarPanel({
 }) {
   const [draggedItem, setDraggedItem] = useState(null)
   const [dateRangeDrag, setDateRangeDrag] = useState(null)
+  const [dropHint, setDropHint] = useState(null)
   const blockedMoveTimerRef = useRef(null)
   const blockedMoveNoticeShownRef = useRef(false)
   const suppressNextCellClickRef = useRef(false)
@@ -200,6 +268,24 @@ export default function CalendarPanel({
   }
 
   useEffect(() => () => clearBlockedMoveNoticeTimer(), [])
+
+  function clearDropHint() {
+    setDropHint(null)
+  }
+
+  function setDropHintTarget(dateKey, index) {
+    setDropHint((prev) => {
+      if (prev?.dateKey === dateKey && prev?.index === index) return prev
+      return { dateKey, index }
+    })
+  }
+
+  function getDropIndexFromEvent(event, targetIndex) {
+    const rect = event.currentTarget?.getBoundingClientRect?.()
+    if (!rect) return targetIndex
+    const afterTarget = event.clientY > rect.top + rect.height / 2
+    return targetIndex + (afterTarget ? 1 : 0)
+  }
 
   function shouldIgnoreDateRangePointer(event) {
     if (event.button != null && event.button !== 0) return true
@@ -557,14 +643,22 @@ export default function CalendarPanel({
                     if (!hasDrag) return
                     e.preventDefault()
                     e.dataTransfer.dropEffect = "move"
+                    const dropIndex = getDropIndexFromCellEvent(e, items.length)
+                    if (dropIndex == null) {
+                      clearDropHint()
+                      return
+                    }
+                    setDropHintTarget(key, dropIndex)
                   }}
                   onDrop={(e) => {
                     const item = readDraggedPlannerItem(e, draggedItem)
                     if (!item) return
                     e.preventDefault()
                     e.stopPropagation()
+                    const dropIndex = getDropIndexFromCellEvent(e, items.length)
                     setDraggedItem(null)
-                    onItemMove?.(item, key, items.length)
+                    clearDropHint()
+                    onItemMove?.(item, key, dropIndex == null ? items.length : dropIndex)
                   }}
                   onPointerDown={(e) => {
                     beginDateRangeDrag(e, key)
@@ -680,7 +774,10 @@ export default function CalendarPanel({
                       gap: itemGroupGapPx
                     }}
                   >
-                    {items.map((it) => {
+                    {items.length > 0 && dropHint?.dateKey === key && dropHint?.index === 0 ? (
+                      <CalendarDropIndicator color={ui.accent} dark={theme === "dark"} />
+                    ) : null}
+                    {items.map((it, index) => {
                       const timeInfo = splitTimeLabel(it.time)
                       const isTask = Boolean(it?.isTask)
                       const canDragItem = isMovablePlannerItem(it)
@@ -688,9 +785,9 @@ export default function CalendarPanel({
                       const taskPalette = getCalendarTaskMarkerPalette(taskAccent, theme === "dark", Boolean(it?.completed), ui.surface)
                       const showTimeMark = isTask && !it.completed && plannerItemHasTime(it)
                       return (
+                        <Fragment key={it.id}>
                         <button
                           type="button"
-                          key={it.id}
                           className="calendar-task-item no-hover-outline"
                           draggable={canDragItem}
                           onPointerDown={(e) => {
@@ -715,15 +812,25 @@ export default function CalendarPanel({
                             e.stopPropagation()
                             const item = { ...it, dateKey: it.dateKey || key }
                             setDraggedItem(item)
+                            clearDropHint()
                             e.dataTransfer.effectAllowed = "move"
                             writeDraggedPlannerItem(e, item)
                           }}
-                          onDragEnd={() => setDraggedItem(null)}
+                          onDragEnd={() => {
+                            setDraggedItem(null)
+                            clearDropHint()
+                          }}
                           onDragOver={(e) => {
                             const hasDrag = Boolean(draggedItem) || Array.from(e.dataTransfer.types ?? []).includes(PLANNER_DND_MIME)
                             if (!hasDrag) return
                             e.preventDefault()
                             e.dataTransfer.dropEffect = "move"
+                            const dragged = readDraggedPlannerItem(e, draggedItem)
+                            if (!dragged || getPlannerItemDragKey(dragged) === getPlannerItemDragKey(it)) {
+                              clearDropHint()
+                              return
+                            }
+                            setDropHintTarget(key, getDropIndexFromEvent(e, index))
                           }}
                           onDrop={(e) => {
                             const dragged = readDraggedPlannerItem(e, draggedItem)
@@ -731,8 +838,10 @@ export default function CalendarPanel({
                             e.preventDefault()
                             e.stopPropagation()
                             setDraggedItem(null)
+                            clearDropHint()
                             const targetIndex = items.findIndex((candidate) => candidate.id === it.id)
-                            onItemMove?.(dragged, key, targetIndex < 0 ? items.length : targetIndex)
+                            const dropIndex = targetIndex < 0 ? items.length : getDropIndexFromEvent(e, targetIndex)
+                            onItemMove?.(dragged, key, dropIndex)
                           }}
                           onClick={(e) => {
                             e.stopPropagation()
@@ -759,6 +868,7 @@ export default function CalendarPanel({
                             opacity: draggedItem?.id === it.id ? 0.55 : isTask && it.completed ? 0.62 : 1
                           }}
                           title={canDragItem ? "드래그로 이동" : getPlannerMoveBlockedMessage(it)}
+                          data-calendar-task-item="true"
                         >
                           {isTask || it.color ? (
                             <span
@@ -859,6 +969,10 @@ export default function CalendarPanel({
                             {it.text}
                           </span>
                         </button>
+                        {dropHint?.dateKey === key && dropHint?.index === index + 1 ? (
+                          <CalendarDropIndicator color={ui.accent} dark={theme === "dark"} />
+                        ) : null}
+                        </Fragment>
                       )
                     })}
                   </div>

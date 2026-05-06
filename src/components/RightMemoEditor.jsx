@@ -23,6 +23,7 @@ const FALLBACK_MEMO_UI = {
     brandSoft: "rgba(37, 99, 235, 0.10)"
   }
 };
+const TAB_SCROLL_EDGE_EPS = 4;
 
 function buildPaletteFromFlatUi(ui) {
   return {
@@ -259,9 +260,12 @@ function TabsChrome({
     if (!viewport) return;
     const viewportWidth = viewport.clientWidth || 0;
     const max = Math.max(0, (viewport.scrollWidth || 0) - viewportWidth);
+    let left = Math.max(0, Math.min(max, viewport.scrollLeft || 0));
+    if (left <= TAB_SCROLL_EDGE_EPS) left = 0;
+    if (max - left <= TAB_SCROLL_EDGE_EPS) left = max;
     setScrollState((prev) => {
       const next = {
-        left: viewport.scrollLeft || 0,
+        left,
         max,
         viewportWidth
       };
@@ -325,9 +329,20 @@ function TabsChrome({
     return () => cancelAnimationFrame(rafId);
   }, [activeDocId, docs, renameDocId, renameDraft, updateScrollState]);
 
-  const canMoveLeft = scrollState.left > 1;
-  const canMoveRight = scrollState.left < scrollState.max - 1;
+  const canMoveLeft = scrollState.left > TAB_SCROLL_EDGE_EPS;
+  const canMoveRight = scrollState.max - scrollState.left > TAB_SCROLL_EDGE_EPS;
   const shiftAmount = Math.max(120, Math.floor(scrollState.viewportWidth * 0.75));
+
+  function scrollTabsBy(delta) {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const max = Math.max(0, (viewport.scrollWidth || 0) - (viewport.clientWidth || 0));
+    const target = Math.max(0, Math.min(max, (viewport.scrollLeft || 0) + delta));
+    viewport.scrollTo({ left: target, behavior: "smooth" });
+    requestAnimationFrame(updateScrollState);
+    window.setTimeout(updateScrollState, 180);
+    window.setTimeout(updateScrollState, 360);
+  }
 
   return (
     <div
@@ -362,7 +377,7 @@ function TabsChrome({
         }}
       >
       <PlainButton
-        onClick={() => viewportRef.current?.scrollBy({ left: -shiftAmount, behavior: "smooth" })}
+        onClick={() => scrollTabsBy(-shiftAmount)}
         disabled={!canMoveLeft}
         style={getToolbarButtonStyle(ui, !canMoveLeft)}
         ariaLabel="?쇱そ 硫붾え 蹂닿린"
@@ -511,7 +526,7 @@ function TabsChrome({
         }}
       >
       <PlainButton
-        onClick={() => viewportRef.current?.scrollBy({ left: shiftAmount, behavior: "smooth" })}
+        onClick={() => scrollTabsBy(shiftAmount)}
         disabled={!canMoveRight}
         style={getToolbarButtonStyle(ui, !canMoveRight)}
         ariaLabel="?ㅻⅨ履?硫붾え 蹂닿린"

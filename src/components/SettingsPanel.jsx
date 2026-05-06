@@ -84,7 +84,7 @@ function FontSizeRow({
               transform: "translateY(-50%)",
               display: "inline-flex",
               flexDirection: "column",
-              gap: 0
+              gap: 1
             }}
           >
             <button
@@ -106,8 +106,8 @@ function FontSizeRow({
                 justifyContent: "center",
                 cursor: "pointer",
                 lineHeight: 0,
-                marginBottom: -2,
                 borderRadius: 5,
+                outline: "none",
                 transition: "background 120ms ease, color 120ms ease, opacity 120ms ease"
               }}
               title={`${label} 크게`}
@@ -135,8 +135,8 @@ function FontSizeRow({
                 justifyContent: "center",
                 cursor: "pointer",
                 lineHeight: 0,
-                marginTop: -2,
                 borderRadius: 5,
+                outline: "none",
                 transition: "background 120ms ease, color 120ms ease, opacity 120ms ease"
               }}
               title={`${label} 작게`}
@@ -227,6 +227,9 @@ export default function SettingsPanel({
           opacity: 1 !important;
           background: var(--settings-step-hover-bg) !important;
           color: var(--settings-step-hover-color) !important;
+        }
+        .settings-font-step:focus {
+          outline: none !important;
         }
         .settings-font-step:active {
           transform: translateY(0.5px);
