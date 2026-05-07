@@ -145,6 +145,7 @@ function App() {
   const USER_MEMO_PREFIX = "planner-user"
   const OFFLINE_MEMO_MIGRATION_KEY = "planner-offline-memo-migrated-v1"
   const SYNC_BACKUP_KEY_PREFIX = "planner-sync-backup-v1"
+  const PENDING_RIGHT_MEMO_WRITE_TTL_MS = 10 * 60 * 1000
   // Temporary safety mode: web reads plans from Supabase, but does not write plans from memo text.
   // Mobile remains the source of truth for schedule CRUD until web is migrated to row-based edits.
   const ENABLE_WEB_TEXT_PLAN_SYNC = false
@@ -1198,7 +1199,7 @@ function App() {
     )
   }
 
-  function suspendRemotePlansLoads(ms = 2500) {
+  function suspendRemotePlansLoads(ms = 10000) {
     remotePlansIgnoreLoadsUntilRef.current = Math.max(remotePlansIgnoreLoadsUntilRef.current, Date.now() + ms)
   }
 
@@ -3029,6 +3030,27 @@ function App() {
     })
   }
 
+  function getFreshPendingRightMemoWrite(windowId) {
+    const key = String(windowId ?? "").trim()
+    if (!key) return null
+    const pending = pendingRightMemoWritesRef.current?.[key] ?? null
+    if (!pending) return null
+    const expiresAt = Number(pending.expiresAt ?? 0)
+    if (expiresAt > Date.now()) return pending
+    delete pendingRightMemoWritesRef.current[key]
+    return null
+  }
+
+  function isRightMemoEditorBusy(windowId) {
+    const key = String(windowId ?? "").trim()
+    const focused =
+      typeof document !== "undefined" &&
+      rightTextareaRef.current &&
+      document.activeElement === rightTextareaRef.current
+    if (!focused && !rightMemoSyncTimerRef.current) return false
+    return activeWindowId === key || activeWindowId === "all"
+  }
+
   function getLeftMemoTextSync(year) {
     try {
       const key = getLeftMemoKey(memoKeyPrefix, year)
@@ -3225,6 +3247,11 @@ function App() {
       if (!supabase || !session?.user?.id) return
 
       try {
+        pendingRightMemoWritesRef.current[windowId] = {
+          text: nextRaw,
+          at: Date.now(),
+          expiresAt: Date.now() + PENDING_RIGHT_MEMO_WRITE_TTL_MS
+        }
         await saveRightMemoToSupabase(session.user.id, baseYear, windowId, nextRaw)
       } catch (error) {
         console.error("save integrated right memo doc", error)
@@ -3256,6 +3283,11 @@ function App() {
       if (!supabase || !session?.user?.id) return
 
       try {
+        pendingRightMemoWritesRef.current[windowId] = {
+          text: nextRaw,
+          at: Date.now(),
+          expiresAt: Date.now() + PENDING_RIGHT_MEMO_WRITE_TTL_MS
+        }
         await saveRightMemoToSupabase(session.user.id, baseYear, windowId, nextRaw)
       } catch (error) {
         console.error("save integrated right memo state", error)
@@ -4000,7 +4032,7 @@ function stripEmptyGroupLines(bodyText) {
       rightTextareaRef.current &&
       document.activeElement === rightTextareaRef.current
     const hasPendingSpecificSave = Boolean(rightMemoSyncTimerRef.current)
-    const pendingWrite = pendingRightMemoWritesRef.current?.[targetWindowId] ?? null
+    const pendingWrite = getFreshPendingRightMemoWrite(targetWindowId)
     if (pendingWrite && String(pendingWrite.text ?? "") === nextRaw) {
       delete pendingRightMemoWritesRef.current[targetWindowId]
     }
@@ -4041,9 +4073,19 @@ function stripEmptyGroupLines(bodyText) {
       loadAllRightMemosForYearFromSupabase(session.user.id, baseYear)
         .then((windowTexts) => {
           if (cancelled) return
+          if (isRightMemoEditorBusy("all")) {
+            fallbackAll()
+            return
+          }
           const normalizedWindowTexts = {}
           for (const w of editableWindows) {
-            const rawText = String(windowTexts?.[w.id] ?? "")
+            const remoteRawText = String(windowTexts?.[w.id] ?? "")
+            const localRawText = getRightWindowTextSync(baseYear, w.id)
+            const pending = getFreshPendingRightMemoWrite(w.id)
+            const rawText =
+              (pending && String(pending.text ?? "") !== remoteRawText) || isRightMemoEditorBusy(w.id)
+                ? localRawText
+                : remoteRawText
             normalizedWindowTexts[w.id] = buildRightMemoCombinedText(rawText)
             setRightWindowTextSync(baseYear, w.id, rawText)
           }
@@ -4088,6 +4130,18 @@ function stripEmptyGroupLines(bodyText) {
         if (cancelled) return
         if (remoteText != null) {
           const rawText = String(remoteText ?? "")
+          const localText = getRightWindowTextSync(baseYear, activeWindowId)
+          const pending = getFreshPendingRightMemoWrite(activeWindowId)
+          if ((pending && String(pending.text ?? "") !== rawText) || isRightMemoEditorBusy(activeWindowId)) {
+            setRightMemoText(localText)
+            scheduleRightSaveUnsuppress()
+            if (localText && localText !== rawText && supabase && session?.user?.id) {
+              saveRightMemoToSupabase(session.user.id, baseYear, activeWindowId, localText).catch((err) => {
+                console.error("restore pending right memo", err)
+              })
+            }
+            return
+          }
           setRightMemoText(rawText)
           try {
             localStorage.setItem(rightMemoKey, rawText)
@@ -4205,9 +4259,12 @@ function stripEmptyGroupLines(bodyText) {
       const latestText = savedWindowId === activeWindowId ? rightMemoTextRef.current : savedText
       pendingRightMemoWritesRef.current[savedWindowId] = {
         text: latestText,
-        at: Date.now()
+        at: Date.now(),
+        expiresAt: Date.now() + PENDING_RIGHT_MEMO_WRITE_TTL_MS
       }
-      saveRightMemoToSupabase(userId, savedYear, savedWindowId, latestText)
+      saveRightMemoToSupabase(userId, savedYear, savedWindowId, latestText).catch((error) => {
+        console.error("save right memo", error)
+      })
     }
 
     const t = setTimeout(flush, 350)
