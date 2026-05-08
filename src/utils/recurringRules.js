@@ -104,25 +104,42 @@ export function parseRecurringRawLine(rawLine, fallbackTitle = "") {
     }
   }
   const stripped = stripTaskSuffix(line)
-  const source = stripped.text || line
+  const source = String(stripped.text || line).trim().replace(
+    /^(\d{1,2}:\d{2}(?:(?:\s*[~-]\s*|\s+)\d{1,2}:\d{2})?)\s*@/,
+    "$1;@"
+  )
   const isTask = stripped.completed != null
   const completed = Boolean(stripped.completed)
 
   const semicolonParts = source.includes(";") ? source.split(";") : []
   const semicolonTime = semicolonParts.length > 1 ? normalizeTimeTokenOrRange(semicolonParts[0]) : ""
   if (semicolonTime) {
-    const title = String(fallbackTitle || "").trim()
-    const text = String(semicolonParts.slice(1).join(";") ?? "").trim()
+    const second = String(semicolonParts[1] ?? "").trim()
+    const inlineTitle = second.startsWith("@") ? second.slice(1).trim() : ""
+    const title = String(inlineTitle || fallbackTitle || "").trim()
+    const text = String((inlineTitle ? semicolonParts.slice(2) : semicolonParts.slice(1)).join(";") ?? "").trim()
     const time = String(semicolonTime ?? "").trim()
     const display = `${time ? `${time} ` : ""}${title ? `[${title}] ` : ""}${text}`.trim()
     return { time, title, text, display, isTask, completed, baseRaw: source }
   }
 
+  if (semicolonParts.length > 1 && String(semicolonParts[0] ?? "").trim().startsWith("@")) {
+    const title = String(semicolonParts[0] ?? "").trim().slice(1).trim() || String(fallbackTitle || "").trim()
+    const text = String(semicolonParts.slice(1).join(";") ?? "").trim()
+    const display = `${title ? `[${title}] ` : ""}${text}`.trim()
+    return { time: "", title, text, display, isTask, completed, baseRaw: source }
+  }
+
   const timed = parseTimePrefix(source)
   if (timed) {
     const time = String(timed.time ?? "").trim()
-    const title = String(fallbackTitle || "").trim()
-    const text = String(timed.text ?? "").trim()
+    let title = String(fallbackTitle || "").trim()
+    let text = String(timed.text ?? "").trim()
+    if (text.startsWith("@")) {
+      const parts = text.split(";")
+      title = String(parts[0] ?? "").slice(1).trim() || title
+      text = String(parts.slice(1).join(";") ?? "").trim()
+    }
     const display = `${time ? `${time} ` : ""}${title ? `[${title}] ` : ""}${text}`.trim()
     return { time, title, text, display, isTask, completed, baseRaw: source }
   }
