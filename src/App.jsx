@@ -2677,19 +2677,15 @@ function App() {
   const updateTabScrollState = useCallback(() => {
     const el = tabsScrollRef.current
     if (!el) return
-    const children = Array.from(el.children).filter((node) => node instanceof HTMLElement)
-    if (!children.length) {
+    const scrollMax = Math.max(0, el.scrollWidth - el.clientWidth)
+    const tolerance = 1
+    if (scrollMax <= tolerance) {
       setTabScrollState((prev) => (!prev.left && !prev.right ? prev : { left: false, right: false }))
       return
     }
-    const tolerance = 3
-    const viewportRect = el.getBoundingClientRect()
-    const firstRect = children[0].getBoundingClientRect()
-    const lastRect = children[children.length - 1].getBoundingClientRect()
-    const scrollMax = Math.max(0, el.scrollWidth - el.clientWidth)
-    const hasOverflow = scrollMax > tolerance
-    const left = hasOverflow && firstRect.left < viewportRect.left - tolerance
-    const right = hasOverflow && lastRect.right > viewportRect.right + tolerance
+    const scrollLeft = Math.max(0, Math.min(scrollMax, el.scrollLeft))
+    const left = scrollLeft > tolerance
+    const right = scrollLeft < scrollMax - tolerance
     setTabScrollState((prev) => (prev.left === left && prev.right === right ? prev : { left, right }))
   }, [])
 
@@ -2699,6 +2695,8 @@ function App() {
     const amount = Math.max(80, Math.floor(el.clientWidth * 0.6))
     el.scrollBy({ left: dir * amount, behavior: "smooth" })
     requestAnimationFrame(updateTabScrollState)
+    window.setTimeout(updateTabScrollState, 180)
+    window.setTimeout(updateTabScrollState, 360)
   }
 
   useEffect(() => {
