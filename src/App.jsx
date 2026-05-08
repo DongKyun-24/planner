@@ -8339,6 +8339,52 @@ function stripEmptyGroupLines(bodyText) {
         suspendRemotePlansLoads()
         const rows = buildRecurringPlanRows(userId, payload, { seriesIdOverride: genSeriesId() })
         if (rows.length === 0) return false
+
+        const sourceRow =
+          fields.editMode === "edit" && fields.sourceItem
+            ? fields.sourceItem?.rowId || fields.sourceItem?.row?.id
+              ? fields.sourceItem?.row ?? { id: fields.sourceItem?.rowId }
+              : findMatchingRemotePlanRow(fields.sourceItem)
+            : null
+        const sourceRowId = String(sourceRow?.id ?? "").trim()
+        if (sourceRowId) {
+          const [sourceReplacementRow, ...insertRows] = rows
+          const optimisticStamp = Date.now()
+          const optimisticSourceRow = {
+            ...(sourceRow ?? {}),
+            ...(sourceReplacementRow ?? {}),
+            id: sourceRowId,
+            updated_at: sourceReplacementRow?.updated_at ?? new Date(optimisticStamp).toISOString()
+          }
+          const optimisticInsertRows = insertRows.map((row, index) => ({
+            ...row,
+            id: row?.id ?? `optimistic-recurring-${optimisticStamp}-${index}`,
+            created_at: row?.created_at ?? new Date(optimisticStamp + index + 1).toISOString(),
+            updated_at: row?.updated_at ?? new Date(optimisticStamp + index + 1).toISOString()
+          }))
+          setRemotePlans((prev) => {
+            let replaced = false
+            const next = (prev ?? []).map((row) => {
+              if (String(row?.id ?? "").trim() !== sourceRowId) return row
+              replaced = true
+              return optimisticSourceRow
+            })
+            if (!replaced) next.push(optimisticSourceRow)
+            return [...next, ...optimisticInsertRows]
+          })
+          await updateRecurringPlanRowById(userId, sourceRowId, sourceReplacementRow)
+          await insertRecurringPlanRows(insertRows)
+          ensureWindowsForCategories(
+            new Set(
+              rows
+                .map((row) => normalizeCategoryId(String(row?.category_id ?? "").trim()))
+                .filter((title) => title && !isGeneralCategoryId(title))
+            )
+          )
+          await loadRemotePlans(userId, { force: true })
+          return true
+        }
+
         const optimisticStamp = Date.now()
         const optimisticRows = rows.map((row, index) => ({
           ...row,
